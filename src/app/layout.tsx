@@ -1,30 +1,44 @@
 import type { Metadata, Viewport } from "next";
-import { Plus_Jakarta_Sans } from "next/font/google";
+import { Libre_Franklin, Public_Sans } from "next/font/google";
 import "./globals.css";
-import { AuthProvider } from "@/lib/auth";
-import Header from "@/components/Header";
-import Footer from "@/components/Footer";
-import Assistant from "@/components/Assistant";
+import Providers from "./providers";
 
-const font = Plus_Jakarta_Sans({ subsets: ["latin"], variable: "--font-sans", display: "swap" });
+const display = Libre_Franklin({
+  subsets: ["latin"],
+  variable: "--font-display",
+  display: "swap",
+});
+const bodyFont = Public_Sans({
+  subsets: ["latin"],
+  variable: "--font-body",
+  display: "swap",
+});
 
 export const metadata: Metadata = {
-  title: { default: "eLiberia - Government services online", template: "%s · eLiberia" },
-  description: "Apply for IDs, passports, licenses, business registration and more - from home. Pay by mobile money, verify your identity remotely, and receive verifiable e-certificates.",
+  title: "PortaGov - Citizens. Services. Connected.",
+  description:
+    "Apply for birth certificates, passports, police clearance and more from home. Pay by mobile money, track every step, and collect at your county centre or a Liberian embassy.",
+  metadataBase: new URL("https://portagov-frontend.vercel.app"),
 };
-export const viewport: Viewport = { themeColor: "#002868", width: "device-width", initialScale: 1 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export const viewport: Viewport = {
+  themeColor: "#0a2a5e",
+  width: "device-width",
+  initialScale: 1,
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
-    <html lang="en" className={font.variable}>
-      <body className="flex min-h-screen flex-col font-sans">
-        <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-50 focus:rounded-lg focus:bg-white focus:px-3 focus:py-2">Skip to content</a>
-        <AuthProvider>
-          <Header />
-          <main id="main" className="flex-1">{children}</main>
-          <Footer />
-          <Assistant />
-        </AuthProvider>
+    <html
+      lang="en"
+      className={`${display.variable} ${bodyFont.variable}`}
+    >
+      <body>
+        <Providers>{children}</Providers>
       </body>
     </html>
   );

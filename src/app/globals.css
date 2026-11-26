@@ -2,68 +2,241 @@
 @tailwind components;
 @tailwind utilities;
 
+/* PortaGov theme, carried over from the PortaGov build. The colour
+   tokens are the brand: navy #0A2A5E, gold #D9A821, white. Light is
+   the primary mode, dark the secondary, both set from the header and
+   remembered on the device. */
+
+:root {
+  color-scheme: light;
+  --bg: #eef1f6;
+  --surface: #ffffff;
+  --surface-alt: #f6f8fb;
+  --text: #1d2a44;
+  --dim: #5a6a86;
+  --border: #d3dae6;
+  --accent: #0a2a5e;
+  --accent-ink: #ffffff;
+  --gold: #d9a821;
+  --gold-soft: #faf0d2;
+  --navy: #0a2a5e;
+  --navy-deep: #071f45;
+  --ok: #166534;
+  --warn: #92580a;
+  --radius: 10px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-alt);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0a1220;
+    --surface: #111c30;
+    --surface-alt: #16233c;
+    --text: #e8edf6;
+    --dim: #9fb0ca;
+    --border: #2a3a58;
+    --accent: #d9a821;
+    --accent-ink: #0a2a5e;
+    --gold-soft: #3a2f10;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+  }
+}
+
+body {
+  font-family: var(--font-body, "Public Sans", system-ui, sans-serif);
+}
+
+h1,
+h2,
+h3,
+.font-display {
+  font-family: var(--font-display, "Libre Franklin", "Public Sans", system-ui, sans-serif);
+}
+
+/* Phone tap targets: at least 36px tall for controls. */
 @layer base {
-  html { scroll-behavior: smooth; }
-  body { @apply bg-[#F6F8FC] text-ink-900 antialiased; }
-  h1, h2, h3 { @apply tracking-tight; text-wrap: balance; }
-  :focus-visible { @apply outline-none ring-2 ring-navy-400 ring-offset-2; }
-  ::selection { @apply bg-navy-100; }
-}
-
-@layer components {
-  .container-x { @apply mx-auto w-full max-w-6xl px-4 sm:px-6; }
-
-  .btn { @apply inline-flex items-center justify-center gap-2 rounded-xl bg-navy-800 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-navy-700 active:translate-y-px disabled:pointer-events-none disabled:opacity-50; }
-  .btn-red { @apply bg-flag-600 hover:bg-flag-700; }
-  .btn-ghost { @apply border border-ink-300 bg-white text-navy-800 shadow-none hover:border-navy-400 hover:bg-navy-50; }
-  .btn-soft { @apply bg-navy-50 text-navy-800 shadow-none hover:bg-navy-100; }
-  .btn-lg { @apply px-6 py-3 text-base; }
-
-  .input { @apply w-full rounded-xl border border-ink-300 bg-white px-3.5 py-2.5 text-sm text-ink-900 transition placeholder:text-ink-500/70 focus:border-navy-600 focus:outline-none focus:ring-4 focus:ring-navy-100 disabled:bg-ink-100 disabled:text-ink-500; }
-  .label { @apply mb-1.5 block text-sm font-medium text-ink-700; }
-
-  .card { @apply rounded-2xl border border-slate-200/80 bg-white p-5 shadow-card sm:p-6; }
-  .card-hover { @apply transition duration-200 hover:-translate-y-0.5 hover:border-navy-200 hover:shadow-lift; }
-
-  .eyebrow { @apply text-xs font-semibold uppercase tracking-[0.14em] text-flag-600; }
-  .muted { @apply text-sm text-ink-500; }
-  .chip { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-ink-300 bg-white px-3.5 py-1.5 text-sm font-medium text-ink-700 transition hover:border-navy-400 hover:text-navy-800; }
-  .chip-on { @apply border-navy-800 bg-navy-800 text-white hover:text-white; }
-
-  .alert { @apply flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-sm; }
-  .alert-error { @apply border-flag-100 bg-flag-50 text-flag-700; }
-  .alert-ok { @apply border-emerald-200 bg-emerald-50 text-emerald-800; }
-  .alert-warn { @apply border-amber-200 bg-amber-50 text-amber-900; }
-  .alert-info { @apply border-navy-100 bg-navy-50 text-navy-800; }
-
-  .skeleton { @apply relative overflow-hidden rounded-xl bg-slate-200/70; }
-  .skeleton::after { content: ""; @apply absolute inset-0 -translate-x-full animate-shimmer bg-gradient-to-r from-transparent via-white/60 to-transparent; }
-
-  .hero-bg {
-    background:
-      radial-gradient(900px 420px at 85% -10%, rgba(191,10,48,.35), transparent 60%),
-      radial-gradient(700px 380px at 0% 110%, rgba(75,116,196,.45), transparent 60%),
-      linear-gradient(135deg, #00112E 0%, #002868 55%, #0A3278 100%);
+  button,
+  [role="button"],
+  select,
+  summary,
+  input:not([type="checkbox"], [type="radio"]) {
+    min-height: 2.25rem;
   }
-  .hero-grid {
-    background-image: linear-gradient(rgba(255,255,255,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.06) 1px, transparent 1px);
-    background-size: 44px 44px;
-    mask-image: radial-gradient(ellipse at 50% 0%, black 30%, transparent 75%);
+
+  /* Every button and link shows the pointer hand on hover, so it is
+     always clear that it can be clicked, and every one has a visible
+     hover state. */
+  button:not(:disabled),
+  a[href],
+  select,
+  summary,
+  [role="button"],
+  label:has(> input[type="checkbox"]),
+  label:has(> input[type="radio"]) {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  /* Taps must land at once: manipulation removes the double-tap zoom
+     wait some phone browsers and webviews still put on a first tap. */
+  button,
+  a,
+  select,
+  summary,
+  input,
+  textarea,
+  label,
+  [role="button"] {
+    touch-action: manipulation;
+  }
+
+  /* Hover looks only where a pointer can truly hover. On touch screens
+     a hover style can swallow the first tap (the tap only applies the
+     hover look and the click needs a second tap), so no button or link
+     may depend on, or be delayed by, a hover state there. */
+  @media (hover: hover) and (pointer: fine) {
+    button:not(:disabled):hover,
+    [role="button"]:hover,
+    select:hover {
+      filter: brightness(0.95);
+    }
+    a[href]:hover {
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
   }
 }
 
-@media print {
-  .no-print { display: none !important; }
-  body { background: white; }
+/* Manual display options, set from the header and remembered. */
+html[data-large="true"] {
+  font-size: 18px;
+}
+html[data-hc="true"] {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-alt: #eef1f6;
+  --text: #000000;
+  --dim: #24304a;
+  --border: #0a2a5e;
+  --gold-soft: #fff3c4;
+  --warn: #7a4a00;
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0a1220;
+  --surface: #111c30;
+  --surface-alt: #16233c;
+  --text: #e8edf6;
+  --dim: #9fb0ca;
+  --border: #2a3a58;
+  --accent: #d9a821;
+  --accent-ink: #0a2a5e;
+  --gold-soft: #3a2f10;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+}
+html[data-theme="dark"][data-hc="true"] {
+  --bg: #000000;
+  --surface: #000000;
+  --surface-alt: #101418;
+  --text: #ffffff;
+  --dim: #d7dee9;
+  --border: #d9a821;
 }
 
+/* Manual light choice must win over a dark device setting. */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #eef1f6;
+  --surface: #ffffff;
+  --surface-alt: #f6f8fb;
+  --text: #1d2a44;
+  --dim: #5a6a86;
+  --border: #d3dae6;
+  --accent: #0a2a5e;
+  --accent-ink: #ffffff;
+  --gold-soft: #faf0d2;
+  --ok: #166534;
+  --warn: #92580a;
+}
+
+details > summary {
+  min-height: 2.25rem;
+}
+
+/* The hero flag waves gently; it stays still for people who prefer
+   reduced motion, and the dark overlay keeps the banner looking the
+   same. */
+.hero-flag-wave {
+  animation: flagWave 9s ease-in-out infinite;
+  transform-origin: left center;
+}
+@keyframes flagWave {
+  0%,
+  100% {
+    transform: skewY(0deg);
+  }
+  50% {
+    transform: skewY(1.4deg);
+  }
+}
 @media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  .hero-bg-video,
+  .hero-flag-wave {
+    animation: none;
+  }
+  .hero-bg-video {
+    display: none;
+  }
 }
 
-/* high-contrast reading mode (Reading settings menu) */
-html.hc body { background: #ffffff; }
-html.hc .muted, html.hc .text-ink-500, html.hc .text-ink-700 { color: #0E1726 !important; }
-html.hc .card, html.hc .input, html.hc .chip, html.hc .btn-ghost { border-color: #0E1726 !important; }
-html.hc main a { text-decoration: underline; }
-html.hc .bg-slate-50, html.hc .bg-navy-50 { background-color: #ffffff !important; }
+/* The PortaGov wordmark fades in letter by letter with a gentle
+   rise, and a thin gold line sweeps under the word once. */
+.logo-letter {
+  display: inline-block;
+  opacity: 0;
+  animation: letterRise 0.55s ease-out forwards;
+}
+@keyframes letterRise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.gold-sweep {
+  animation: goldSweep 1.1s ease-out 0.8s both;
+  transform-origin: left center;
+}
+@keyframes goldSweep {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .logo-letter,
+  .gold-sweep {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Safe-area top padding where the SDK's pt-safe used to sit. */
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
+}

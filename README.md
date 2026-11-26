@@ -1,94 +1,41 @@
-# eLiberia Frontend
+# PortaGov Frontend
 
-A modern, responsive frontend application for the eLiberia project built with **Next.js** and **TypeScript**.
+The PortaGov citizen services platform: government services online for Liberia and Liberians abroad. Citizens apply from home, pay by mobile money, track every step, and collect at a county centre or a Liberian embassy.
 
-## Tech Stack
+Mantra: Citizens. Services. Connected.
 
-- **Framework**: Next.js 14+
-- **Language**: TypeScript
-- **Styling**: PostCSS (with Tailwind CSS support)
-- **Linting**: ESLint
-- **Package Manager**: npm/yarn
+## What is in here
 
-## Project Structure
+One routed app in `src/portagov/App.tsx`, with:
 
-```
-src/
-├── components/    # Reusable React components
-├── pages/        # Next.js pages/routes
-├── hooks/        # Custom React hooks
-├── utils/        # Utility functions
-├── styles/       # Global styles
-└── types/        # TypeScript type definitions
+- Public landing, ministries and their services, service guides with fees in USD and LRD, and a 154 currency fee converter
+- Citizen portal: applications, document wallet, appointments, payments, receipts, family applications, complaints and appeals
+- Institution portal: inbox and work list for released applications
+- Platform portal: release queue with automatic or manual release, staff and help desk, feature toggles, institution onboarding
+- Business and NGO portal, county agents, diaspora and embassy pickup
+- Sign in with "I'm new here" first time profile and "I'm not new here" returning sign in, phone country pickers, county, district and community cascades for all 73 Liberian districts, 12 character passwords with uppercase, lowercase, number and symbol, review and exact signature match
+- Floating assistant that answers from the real service catalogue and knowledge base, in Liberian English on request, and routes unanswered questions to the right desk as a ticket
 
-public/           # Static assets (images, fonts, etc.)
-```
+## Tech stack
 
-## Getting Started
+- Next.js 14, React 18, TypeScript, Tailwind CSS 3
+- Data lives in the browser (localStorage, key `portagov-db-v1`), with an in memory copy when storage is unavailable. There is no server database on the free tier. Every citizen's data stays on their own device.
+- The live API base is set by `NEXT_PUBLIC_API_URL` (currently the Render backend at `https://eliberia-backend.onrender.com`). The assistant, rewrite and ticket summary run locally from the service catalogue, never from a model.
 
-### Prerequisites
-- Node.js 18+ 
-- npm or yarn
-
-### Installation
+## Getting started
 
 ```bash
-# Install dependencies
 npm install
-
-# Create .env.local file with required environment variables
-cp .env.example .env.local
-```
-
-### Development
-
-```bash
-# Start development server
 npm run dev
 ```
 
-The application will be available at `http://localhost:3000`
-
-### Build
+Production build:
 
 ```bash
-# Create production build
 npm run build
-
-# Start production server
 npm start
 ```
 
-### Linting
+## Branding
 
-```bash
-# Run ESLint
-npm run lint
-
-# Fix linting issues
-npm run lint --fix
-```
-
-## Environment Variables
-
-Create a `.env.local` file in the root directory:
-
-```
-NEXT_PUBLIC_API_URL=http://localhost:5000
-NEXT_PUBLIC_APP_NAME=eLiberia
-```
-
-## Contributing
-
-1. Create a feature branch (`git checkout -b feature/amazing-feature`)
-2. Commit your changes (`git commit -m 'Add amazing feature'`)
-3. Push to the branch (`git push origin feature/amazing-feature`)
-4. Open a Pull Request
-
-## License
-
-This project is part of Global Impact Innovators Ltd (GIIN)
-
-## Support
-
-For issues and questions, please open an issue in the repository.
+PortaGov, navy `#0A2A5E`, gold `#D9A821`, white. The logo artwork in `src/portagov/assets.ts` is the exact chosen PortaGov badge. Do not redraw it.

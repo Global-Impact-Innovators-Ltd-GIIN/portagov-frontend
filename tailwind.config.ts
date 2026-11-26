@@ -4,7 +4,10 @@ const config: Config = {
   content: ["./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
-      fontFamily: { sans: ["var(--font-sans)", "system-ui", "sans-serif"] },
+      fontFamily: {
+        sans: ["var(--font-body)", "Public Sans", "system-ui", "sans-serif"],
+        display: ["var(--font-display)", "Libre Franklin", "Public Sans", "system-ui", "sans-serif"],
+      },
       colors: {
         navy: { 50: "#EEF3FB", 100: "#D9E4F6", 200: "#B3C8EC", 400: "#4B74C4", 600: "#12408F", 700: "#0A3278", 800: "#002868", 900: "#001B47", 950: "#00112E" },
         flag: { 50: "#FDF0F2", 100: "#FAD9DF", 500: "#D81B43", 600: "#BF0A30", 700: "#9C0827" },
