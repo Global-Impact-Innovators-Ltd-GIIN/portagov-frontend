@@ -653,10 +653,15 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     // notification or affidavit", the National ID as "Parent's ID",
     // and the third document, the hospital birth record, was dropped
     // entirely because the backend only requires two documents.
-    // The backend accepts any doc_type it is sent (it stores a
-    // non-required name as given), so documents that do not match a
-    // required name are still uploaded under their own wallet name
-    // and are never silently dropped.
+    // The backend only accepts documents whose doc_type is one of
+    // the service's required names: anything else is rejected with
+    // 400 "Choose which required document this file is" (verified
+    // live). So a picked document that does not match a required
+    // name, for example the Passport photograph on a Birth
+    // Certificate, is NOT uploaded to the backend at all: it stays
+    // in the citizen's wallet and is listed on the application page
+    // from there, under its own correct name, instead of being
+    // mislabelled as a required document or dropped silently.
     const required: any[] = svc.required_documents || [];
     let uploaded = 0;
     let uploadedRequired = 0;
@@ -720,11 +725,14 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
         }
         if (await uploadDoc(doc, req.name)) uploadedRequired += 1;
       }
-      // Every remaining picked document goes up under its own wallet
-      // name (for example "Passport photograph"), never dropped.
+      // Every remaining picked document stays in the wallet and is
+      // listed on the application from there, under its own correct
+      // name (for example "Passport photograph"). It is not sent to
+      // the backend, which would reject it as not a required
+      // document for this service.
       for (const doc of picked) {
         if (used.has(doc.id)) continue;
-        await uploadDoc(doc, doc.title || doc.doc_type || "Supporting document");
+        docIds.push(doc.id);
       }
     } catch (e: any) {
       // A document that will not upload must stop the application with a
@@ -880,7 +888,19 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
           validity: "Valid",
           has_file: true,
           file_url: fileUrl,
-          content_type: "application/pdf",
+          // The backend stores a file name, not a content type, so
+          // derive it from the extension. Labelling every document
+          // "application/pdf" made a passport photograph open as a PDF
+          // instead of as a photo in the viewer.
+          content_type: /\.jpe?g$/i.test(d.filename || "")
+            ? "image/jpeg"
+            : /\.png$/i.test(d.filename || "")
+              ? "image/png"
+              : /\.gif$/i.test(d.filename || "")
+                ? "image/gif"
+                : /\.webp$/i.test(d.filename || "")
+                  ? "image/webp"
+                  : "application/pdf",
         });
       }
       return { documents: docs };

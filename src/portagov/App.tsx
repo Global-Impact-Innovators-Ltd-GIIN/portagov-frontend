@@ -5483,9 +5483,20 @@ function WalletPage({ profile }: { profile: ProfileT }) {
   for (const d of liveDocs) {
     if (!savedByType.has(d.doc_type)) savedByType.set(d.doc_type, d);
   }
-  const otherDocs = liveDocs.filter(
-    (d: DocumentT) => !DOC_TYPES.includes(d.doc_type),
-  );
+  /* Documents that have no row of their own: any type outside the
+     standard list, plus a second (or third) "Other document" with a
+     different title. The rows above show only the first document of
+     each type, so without this an extra Other document, for example
+     a second birth record, would be saved but invisible and could
+     never be opened in the viewer. */
+  const seenOther = new Set<string>();
+  const otherDocs = liveDocs.filter((d: DocumentT) => {
+    if (!DOC_TYPES.includes(d.doc_type)) return true;
+    if (d.doc_type !== "Other document") return false;
+    if (seenOther.has(d.doc_type)) return true;
+    seenOther.add(d.doc_type);
+    return false;
+  });
   const savedCount = DOC_TYPES.filter((t) => savedByType.has(t)).length;
   const stagedCount = Object.keys(staged).length;
   const warnedDocs = Object.entries(staged).flatMap(([docType, s]) =>
