@@ -459,17 +459,19 @@ function GoldButton({
   children,
   onClick,
   disabled,
+  className,
 }: {
   children: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
+  className?: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="rounded-lg px-5 py-2.5 font-bold text-[#0a2a5e] disabled:opacity-50"
+      className={`rounded-lg px-5 py-2.5 font-bold text-[#0a2a5e] disabled:opacity-50 ${className ?? ""}`}
       style={{ backgroundColor: "#d9a821" }}
     >
       {children}
@@ -808,7 +810,7 @@ function HomePage({
             />
           </>
         )}
-        <div className="relative mx-auto grid max-w-6xl gap-8 px-4 py-10 md:grid-cols-[1fr_auto] md:items-center">
+        <div className="relative mx-auto grid max-w-6xl grid-cols-[1fr_auto] items-start gap-3 px-4 py-10 md:gap-8">
           <div>
             <p className="text-sm font-bold uppercase tracking-widest" style={{ color: "#d9a821" }}>
               Citizens. Services. Connected.
@@ -824,27 +826,27 @@ function HomePage({
               Liberia, and to Liberians living abroad in any country.
             </p>
             {profile ? (
-              <div className="mt-5 flex flex-wrap gap-3">
-                <GoldButton onClick={() => nav("#/applications")}>
+              <div className="mt-5 flex flex-nowrap gap-2 sm:gap-3">
+                <GoldButton onClick={() => nav("#/applications")} className="min-w-0 flex-1 px-3 py-2 text-sm sm:px-5 sm:py-2.5 sm:text-base">
                   My applications
                 </GoldButton>
                 <button
                   type="button"
                   onClick={() => nav("#/account")}
-                  className="rounded-lg border border-white/50 px-5 py-2.5 font-semibold text-white"
+                  className="min-w-0 flex-1 rounded-lg border border-white/50 px-3 py-2 text-sm font-semibold text-white sm:px-5 sm:py-2.5 sm:text-base"
                 >
                   Welcome back, {profile.full_name.split(" ")[0]}: my account
                 </button>
               </div>
             ) : (
-              <div className="mt-5 flex flex-wrap gap-3">
-                <GoldButton onClick={() => nav("#/signin")}>
+              <div className="mt-5 flex flex-nowrap gap-2 sm:gap-3">
+                <GoldButton onClick={() => nav("#/signin")} className="min-w-0 flex-1 px-3 py-2 text-sm sm:px-5 sm:py-2.5 sm:text-base">
                   Sign in or create your account
                 </GoldButton>
                 <button
                   type="button"
                   onClick={() => nav("#/track")}
-                  className="rounded-lg border border-white/50 px-5 py-2.5 font-semibold text-white"
+                  className="min-w-0 flex-1 rounded-lg border border-white/50 px-3 py-2 text-sm font-semibold text-white sm:px-5 sm:py-2.5 sm:text-base"
                 >
                   Track an application
                 </button>
@@ -852,7 +854,7 @@ function HomePage({
             )}
           </div>
           {lowData ? null : (
-          <div className="mx-auto w-56 shrink-0 overflow-hidden rounded-2xl bg-white p-3 md:w-64">
+          <div className="w-20 shrink-0 overflow-hidden rounded-xl bg-white p-1.5 md:w-64 md:rounded-2xl md:p-3">
             <img
               src={logoMain}
               alt="PortaGov logo: a white G with a gold gate bar in a navy circle, portagov written underneath"
@@ -5672,7 +5674,7 @@ export function App() {
                 aria-expanded={accessOpen}
                 aria-label="Accessibility options"
                 onClick={() => setAccessOpen((o) => !o)}
-                className="flex h-9 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-xs font-bold"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border"
                 style={{
                   color: "var(--text)",
                   borderColor: "var(--border)",
@@ -5695,7 +5697,6 @@ export function App() {
                   <path d="m12 14-3 7" />
                   <path d="m12 14 3 7" />
                 </svg>
-                Accessibility
               </button>
               {accessOpen ? (
                 <div
