@@ -5,6 +5,9 @@ export interface ServiceField {
   key: string;
   label: string;
   placeholder: string;
+  /** "date" renders a date picker and validates the value as a real
+      calendar date, so typed digits can never be stored as text. */
+  kind?: "date";
 }
 
 export interface Service {
@@ -148,7 +151,7 @@ export const SERVICES: Service[] = [
       "Come in only to collect, unless the passport office asks for fresh biometrics, in which case PortaGov books you a time.",
     fields: [
       { key: "currentPassportNumber", label: "Current passport number", placeholder: "PP0000000" },
-      { key: "expiryDate", label: "Current passport expiry date", placeholder: "2030-05-01" },
+      { key: "expiryDate", label: "Current passport expiry date", placeholder: "2030-05-01", kind: "date" },
     ],
   },
   {
@@ -187,7 +190,7 @@ export const SERVICES: Service[] = [
     fields: [
       { key: "personName", label: "Name on the certificate", placeholder: "Full name" },
       { key: "relationship", label: "Your relationship to that person", placeholder: "Self, Mother, Father" },
-      { key: "dob", label: "Date of birth", placeholder: "2026-01-15" },
+      { key: "dob", label: "Date of birth", placeholder: "2026-01-15", kind: "date" },
       { key: "placeOfBirth", label: "Place of birth", placeholder: "Monrovia, Montserrado County" },
       { key: "motherName", label: "Mother's name", placeholder: "Full name of the mother" },
       { key: "fatherName", label: "Father's name", placeholder: "Full name of the father, if known" },
@@ -209,7 +212,7 @@ export const SERVICES: Service[] = [
     visitNote: "Come in only to collect the printed certificate.",
     fields: [
       { key: "deceasedName", label: "Name of the deceased", placeholder: "Full name" },
-      { key: "dateOfDeath", label: "Date of death", placeholder: "2026-01-15" },
+      { key: "dateOfDeath", label: "Date of death", placeholder: "2026-01-15", kind: "date" },
     ],
   },
   {
@@ -247,7 +250,7 @@ export const SERVICES: Service[] = [
       "Most reports complete online. If an officer needs a statement, PortaGov books you a time instead of you queueing.",
     fields: [
       { key: "incidentType", label: "Type of incident", placeholder: "Lost passport, Theft, Other" },
-      { key: "incidentDate", label: "Date of the incident", placeholder: "2026-01-15" },
+      { key: "incidentDate", label: "Date of the incident", placeholder: "2026-01-15", kind: "date" },
       { key: "incidentPlace", label: "Where it happened", placeholder: "Town, county" },
     ],
   },
@@ -439,7 +442,7 @@ export const SERVICES: Service[] = [
     visitNote: "Both partners come in once, together, to sign and collect.",
     fields: [
       { key: "partnerName", label: "Partner's full name", placeholder: "Full name" },
-      { key: "marriageDate", label: "Date of marriage", placeholder: "2026-01-15" },
+      { key: "marriageDate", label: "Date of marriage", placeholder: "2026-01-15", kind: "date" },
       { key: "marriagePlace", label: "Place of marriage", placeholder: "Town, county" },
     ],
   },

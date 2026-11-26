@@ -278,6 +278,42 @@ function normLabel(s: string): string {
   return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+/** Last guard before a date reaches the backend: the backend rejects
+    a bad date of birth at submit (and at payment, after the money
+    step), so normalise typed digits here and refuse anything that
+    still is not a real YYYY-MM-DD date, naming the field. */
+function normalizeRemoteDate(raw: string): string {
+  const v = String(raw ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  const digits = v.replace(/\D/g, "");
+  if (digits.length === 8) {
+    const y1 = digits.slice(0, 4);
+    if (y1.startsWith("19") || y1.startsWith("20")) {
+      return `${y1}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+    }
+    const a = Number(digits.slice(0, 2));
+    const b = Number(digits.slice(2, 4));
+    if (a >= 1 && a <= 12 && b >= 1 && b <= 31) {
+      return `${digits.slice(4, 8)}-${digits.slice(0, 2)}-${digits.slice(2, 4)}`;
+    }
+    if (a >= 1 && a <= 31 && b >= 1 && b <= 12) {
+      return `${digits.slice(4, 8)}-${digits.slice(2, 4)}-${digits.slice(0, 2)}`;
+    }
+  }
+  return v;
+}
+
+function isRemoteRealDate(iso: string): boolean {
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return false;
+  const dt = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return (
+    dt.getUTCFullYear() === Number(m[1]) &&
+    dt.getUTCMonth() === Number(m[2]) - 1 &&
+    dt.getUTCDate() === Number(m[3])
+  );
+}
+
 /** Build the backend `data` object from the wizard's label/value details
     plus the saved profile, matching backend form fields by label. */
 function buildApplicationData(svc: any, details: { label: string; value: string }[], profile: any): Record<string, string> {
@@ -636,8 +672,25 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     if (!code) return (Actions as any).submitApplication(args);
     const profile = cachedProfile();
     if (!profile) throw new Error("Sign in before starting an application.");
+    /* Guard every date detail before it reaches the backend: a value
+       like 03141995 typed into a date box must become 1995-03-14, and
+       anything that still is not a real date is refused here, with
+       the field's label, instead of failing later at payment time. */
+    const checkedDetails = (args.details || []).map((d: any) => {
+      const label = String(d.label || "");
+      if (/date/i.test(label) && String(d.value || "").trim()) {
+        const fixed = normalizeRemoteDate(String(d.value));
+        if (!isRemoteRealDate(fixed)) {
+          throw new Error(
+            `${label} must be a valid date. Pick it from the calendar, for example 1995-03-14.`,
+          );
+        }
+        return { ...d, value: fixed };
+      }
+      return d;
+    });
     const svc = await getServiceDetail(code);
-    const data = buildApplicationData(svc, args.details || [], profile);
+    const data = buildApplicationData(svc, checkedDetails, profile);
     const created = await apiCall("/api/applications", {
       method: "POST",
       body: {
@@ -759,7 +812,7 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       diaspora_country: args.diasporaCountry || "",
       agent_name: args.agentName || "",
       notes: args.notes || "",
-      details: JSON.stringify(args.details || []),
+      details: JSON.stringify(checkedDetails || []),
       document_ids: JSON.stringify(docIds),
       status_note:
         uploadedRequired < required.length

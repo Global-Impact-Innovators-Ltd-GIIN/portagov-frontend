@@ -1277,7 +1277,10 @@ export const Actions = {
       method: z.enum(["MTN MoMo", "Orange Money"]),
       amount: z.number().int().min(0).max(2000).default(0),
       payerPhone: z.string().trim().min(7).max(20),
-      transactionRef: z.string().trim().min(3).max(60),
+      /* Optional: the reference the citizen's phone already gave them.
+         It must never block a payment when empty, so it is optional
+         with no minimum length. */
+      transactionRef: z.string().trim().max(60).optional().default(""),
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {

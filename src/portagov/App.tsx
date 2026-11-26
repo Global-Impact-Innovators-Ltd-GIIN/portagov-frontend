@@ -559,6 +559,79 @@ function parseIds(json: string): number[] {
   }
 }
 
+/* ---------- wizard date fields ---------- */
+
+/* A date field must hold a real calendar date in YYYY-MM-DD form,
+   never typed digits stored as text. A plain text box let a citizen
+   type 03141995, which was saved literally as the date of birth and
+   only failed later, at payment time, with "Date of birth must be a
+   valid date." These helpers are used by every form that renders a
+   service date field: the field is a date picker, its value is
+   normalised on entry, and Step 3 and submit both refuse a bad date
+   with the field's own label, before anything is sent. */
+function normalizeDateValue(raw: string): string {
+  const v = (raw ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  const m = v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) {
+    return `${m[1]}-${m[2]!.padStart(2, "0")}-${m[3]!.padStart(2, "0")}`;
+  }
+  const digits = v.replace(/\D/g, "");
+  if (digits.length === 8) {
+    const y1 = digits.slice(0, 4);
+    if (y1.startsWith("19") || y1.startsWith("20")) {
+      return `${y1}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+    }
+    const a = Number(digits.slice(0, 2));
+    const b = Number(digits.slice(2, 4));
+    if (a >= 1 && a <= 12 && b >= 1 && b <= 31) {
+      return `${digits.slice(4, 8)}-${digits.slice(0, 2)}-${digits.slice(2, 4)}`;
+    }
+    if (a >= 1 && a <= 31 && b >= 1 && b <= 12) {
+      return `${digits.slice(4, 8)}-${digits.slice(2, 4)}-${digits.slice(0, 2)}`;
+    }
+  }
+  return v;
+}
+
+function isRealDate(iso: string): boolean {
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return false;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return (
+    dt.getUTCFullYear() === y &&
+    dt.getUTCMonth() === mo - 1 &&
+    dt.getUTCDate() === d
+  );
+}
+
+/** Null when the value is a usable date, otherwise a plain message
+    naming the field. Past dates only (birth, death, incident,
+    marriage) must not be in the future; an expiry date may be past
+    when the document is expired, so it is only checked as a date. */
+function dateFieldError(
+  field: { key: string; label: string; kind?: string },
+  raw: string,
+): string | null {
+  if (field.kind !== "date") return null;
+  const v = normalizeDateValue(raw);
+  if (!isRealDate(v)) {
+    return `${field.label} must be a valid date. Pick it from the calendar, for example 1995-03-14.`;
+  }
+  if (field.key !== "expiryDate") {
+    const today = new Date();
+    const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    if (v > todayIso) {
+      return `${field.label} cannot be in the future. Pick the real date.`;
+    }
+  }
+  return null;
+}
+
 /* ---------- shared UI ---------- */
 
 function Chip({ children, tone }: { children: ReactNode; tone?: "gold" | "plain" }) {
@@ -3490,6 +3563,18 @@ function ApplyPage({
   const submit = useMutation({
     mutationFn: async () => {
       if (!service || !details) throw new Error("Service not found.");
+      /* Never submit a date field that is not a real date: normalise
+         typed digits (03141995 becomes 1995-03-14) and refuse anything
+         that still is not a date, with the field's own label. */
+      for (const f of service.fields) {
+        const err = dateFieldError(f, fieldValues[f.key] ?? "");
+        if (err) throw new Error(err);
+      }
+      const normalisedValues: Record<string, string> = {};
+      for (const [k, v] of Object.entries(fieldValues)) {
+        const f = service.fields.find((x) => x.key === k);
+        normalisedValues[k] = f?.kind === "date" ? normalizeDateValue(v) : v;
+      }
       return await api.submitApplication({
         profileId: profile.id,
         serviceId: service.id,
@@ -3517,7 +3602,7 @@ function ApplyPage({
           ...service.fields
             .map((f) => ({
               label: f.label,
-              value: (fieldValues[f.key] ?? "").trim(),
+              value: (normalisedValues[f.key] ?? "").trim(),
             }))
             .filter((d) => d.value.length > 0),
           ...(fastLane
@@ -3613,6 +3698,15 @@ function ApplyPage({
     if (step === 3 && !fieldsFilled) {
       setError("Answer every box in the Details section first. Empty boxes keep the checklist red.");
       return;
+    }
+    if (step === 3) {
+      for (const f of service.fields) {
+        const err = dateFieldError(f, fieldValues[f.key] ?? "");
+        if (err) {
+          setError(err);
+          return;
+        }
+      }
     }
     if (step === 4 && !docsAttached) {
       setError("Attach at least one document from your wallet first. Your draft is saved on this device, so you can add the document and come back.");
@@ -4016,12 +4110,20 @@ function ApplyPage({
                   <FieldLabel htmlFor={`ap-${f.key}`}>{f.label}</FieldLabel>
                   <input
                     id={`ap-${f.key}`}
+                    type={f.kind === "date" ? "date" : undefined}
                     className={inputCls}
                     value={fieldValues[f.key] ?? ""}
                     placeholder={f.placeholder}
                     onChange={(e) =>
                       setFieldValues((v) => ({ ...v, [f.key]: e.target.value }))
                     }
+                    onBlur={(e) => {
+                      if (f.kind !== "date") return;
+                      const fixed = normalizeDateValue(e.target.value);
+                      if (fixed !== e.target.value) {
+                        setFieldValues((v) => ({ ...v, [f.key]: fixed }));
+                      }
+                    }}
                   />
                 </div>
               ))}
@@ -4385,13 +4487,66 @@ function ApplicationDetailPage({
   const [payUssdStep, setPayUssdStep] = useState<1 | 2>(1);
   const [payStarted, setPayStarted] = useState<any>(null);
   const [payDone, setPayDone] = useState<any>(null);
-  const refreshAfterPayment = () => {
-    // Refresh the application too, not only the payments list: the
-    // amount paid and billing status live on the application, and
-    // without this the page kept showing $0 / "Not confirmed paid
-    // yet" until a manual reload after a confirmed payment.
+  const refreshAfterPayment = (done?: any) => {
+    /* Refresh the application too, not only the payments list: the
+       amount paid and billing status live on the application, and
+       without this the page kept showing $0 / "Not confirmed paid
+       yet" until a manual reload after a confirmed payment.
+       Update the cached application and payments at once, so the
+       paid amount shows immediately in this same view even if the
+       refetch is slow or a flaky connection drops it, then refetch
+       both lists from the backend to confirm. */
+    if (done) {
+      const amount = Number(done.amount ?? 0);
+      queryClient.setQueryData(
+        ["applications", profile.id],
+        (old: any) =>
+          old?.applications
+            ? {
+                ...old,
+                applications: old.applications.map((a: any) =>
+                  a.id === id
+                    ? {
+                        ...a,
+                        amount_paid: Math.max(Number(a.amount_paid ?? 0), amount),
+                        billing_status: "Paid",
+                        released: true,
+                        status_note: "Paid and released to the institution.",
+                      }
+                    : a,
+                ),
+              }
+            : old,
+      );
+      queryClient.setQueryData(["payments"], (old: any) => {
+        const list = old?.payments ?? [];
+        if (list.some((p: any) => p.transaction_ref === done.txn_ref && done.txn_ref)) return old;
+        return {
+          ...old,
+          payments: [
+            {
+              id: done.id || 0,
+              application_id: id,
+              application_ref: app?.reference || "",
+              billing_number: done.billing_number || "",
+              service_name: app?.service_name || "",
+              method: done.method || method,
+              amount,
+              payer_phone: done.payer_phone || payerPhone,
+              transaction_ref: done.txn_ref || "",
+              status: "Confirmed",
+              refund_reason: "",
+              created_at: new Date().toISOString(),
+            },
+            ...list,
+          ],
+        };
+      });
+    }
     void queryClient.invalidateQueries({ queryKey: ["payments"] });
     void queryClient.invalidateQueries({ queryKey: ["applications"] });
+    void queryClient.refetchQueries({ queryKey: ["payments"] });
+    void queryClient.refetchQueries({ queryKey: ["applications"] });
   };
   const startPay = useMutation({
     mutationFn: async () =>
@@ -4406,7 +4561,7 @@ function ApplicationDetailPage({
         // Free service, or already paid: nothing to confirm on a phone.
         setPayDone({ ...r, status: "Confirmed" });
         setPayStep("done");
-        refreshAfterPayment();
+        refreshAfterPayment(r);
         return;
       }
       setPayStarted(r);
@@ -4425,7 +4580,7 @@ function ApplicationDetailPage({
     onSuccess: (r: any) => {
       setPayDone(r);
       setPayStep("done");
-      refreshAfterPayment();
+      refreshAfterPayment(r);
     },
     onError: (e) => {
       setPayStep("ussd");
@@ -4463,7 +4618,38 @@ function ApplicationDetailPage({
     onSuccess: (r) => {
       setApptDone(true);
       setTicket(r.ticket);
+      /* Show the new appointment on the Appointments page at once:
+         add it to the cached list now, so the page never shows "No
+         appointments yet" until a reload, then refetch to confirm. */
+      queryClient.setQueryData(
+        ["appointments", profile.id],
+        (old: any) => {
+          const list = old?.appointments ?? [];
+          if (r.ticket && list.some((a: any) => a.ticket === r.ticket)) return old;
+          return {
+            ...old,
+            appointments: [
+              {
+                id: 0,
+                profile_id: profile.id,
+                application_id: id,
+                application_ref: app?.reference || "",
+                kind,
+                group_size: groupSize,
+                ticket: r.ticket,
+                office,
+                date,
+                time_slot: slot,
+                status: "Booked",
+                created_at: new Date().toISOString(),
+              },
+              ...list,
+            ],
+          };
+        },
+      );
       void queryClient.invalidateQueries({ queryKey: ["appointments"] });
+      void queryClient.refetchQueries({ queryKey: ["appointments"] });
     },
     onError: (e) =>
       setApptError(e instanceof Error ? e.message : "Booking failed. Try again."),
@@ -4717,7 +4903,7 @@ function ApplicationDetailPage({
                 </div>
                 <div>
                   <FieldLabel htmlFor="pay-ref">Your reference from your phone (optional)</FieldLabel>
-                  <input id="pay-ref" {...FIELDS.recordPayment.transactionRef} className={inputCls} value={txnRef}
+                  <input id="pay-ref" {...FIELDS.recordPayment.transactionRef} required={false} className={inputCls} value={txnRef}
                     onChange={(e) => setTxnRef(e.target.value)}
                     placeholder="Only if your MoMo message already gave you one" />
                   <p className="mt-1 text-xs text-[var(--dim)]">
@@ -4954,6 +5140,41 @@ function DocumentViewer({
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(
     null,
   );
+  /* Saved wallet files arrive as data: URLs, and Chrome blocks a
+     data: URL inside an iframe ("This content is blocked"), and
+     opening one in a new tab shows a blank page, so a PDF could
+     never be previewed even though Download worked. Turn a data:
+     URL into a blob: URL first: the same file, served in a way the
+     browser's PDF viewer accepts. Blob: URLs already work as they
+     are, and are left alone. */
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const docUrl = doc?.url ?? "";
+
+  useEffect(() => {
+    let cancelled = false;
+    let created: string | null = null;
+    setBlobUrl(null);
+    if (docUrl.startsWith("data:")) {
+      void fetch(docUrl)
+        .then((r) => r.blob())
+        .then((b) => {
+          if (cancelled) return;
+          created = URL.createObjectURL(b);
+          setBlobUrl(created);
+        })
+        .catch(() => {
+          /* Keep the data: URL as a fallback: Download still works. */
+        });
+    }
+    return () => {
+      cancelled = true;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [docUrl]);
+
+  /* The address the viewer actually shows: the blob: URL when one
+     was made, otherwise the file's own address. */
+  const displayUrl = blobUrl ?? docUrl;
 
   useEffect(() => {
     setZoom(1);
@@ -5084,7 +5305,7 @@ function DocumentViewer({
             Fit to screen
           </button>
           <a
-            href={doc.url}
+            href={displayUrl}
             download={doc.fileName || undefined}
             className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-bold text-[var(--text)]"
           >
@@ -5095,7 +5316,7 @@ function DocumentViewer({
           {isImage ? (
             <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto p-3">
               <img
-                src={doc.url}
+                src={displayUrl}
                 alt={doc.title}
                 onLoad={(e) => {
                   const t = e.currentTarget;
@@ -5129,7 +5350,7 @@ function DocumentViewer({
                 }
               >
                 <iframe
-                  src={doc.url}
+                  src={displayUrl}
                   title={doc.title}
                   className="h-full w-full rounded-lg border border-[var(--border)] bg-white"
                 />
@@ -5137,7 +5358,7 @@ function DocumentViewer({
               <p className="mt-2 text-center text-sm text-[var(--dim)]">
                 If the PDF does not show here, use Download above, or{" "}
                 <a
-                  href={doc.url}
+                  href={displayUrl}
                   target="_blank"
                   rel="noreferrer"
                   className="font-semibold underline"
@@ -5162,7 +5383,7 @@ function DocumentViewer({
               </p>
               <div className="mt-4 flex flex-wrap justify-center gap-2">
                 <a
-                  href={doc.url}
+                  href={displayUrl}
                   download={doc.fileName || undefined}
                   className="inline-flex min-h-[44px] items-center rounded-lg bg-[var(--navy)] px-4 py-2 text-sm font-bold text-white"
                   style={{ backgroundColor: "#0a2a5e" }}
@@ -5170,7 +5391,7 @@ function DocumentViewer({
                   Download the file
                 </a>
                 <a
-                  href={doc.url}
+                  href={displayUrl}
                   target="_blank"
                   rel="noreferrer"
                   className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-bold text-[var(--text)]"
@@ -5191,6 +5412,7 @@ function DocumentViewer({
 
 function WalletDocRow({
   docType,
+  label,
   saved,
   staged,
   onPick,
@@ -5201,6 +5423,9 @@ function WalletDocRow({
   onView,
 }: {
   docType: string;
+  /** Shown heading for the row; extra "Other document" slots use
+      "Other document (another one)" instead of their staging key. */
+  label?: string;
   saved: DocumentT | undefined;
   staged: StagedDoc | undefined;
   onPick: (docType: string, f: File | null) => void;
@@ -5236,13 +5461,13 @@ function WalletDocRow({
             <button
               type="button"
               onClick={() => onView(savedViewer)}
-              aria-label={`View ${docType}`}
+              aria-label={`View ${label ?? docType}`}
               className="text-left font-display font-bold text-[var(--text)] underline decoration-dotted underline-offset-4"
             >
-              {docType}
+              {label ?? docType}
             </button>
           ) : (
-            <p className="font-display font-bold text-[var(--text)]">{docType}</p>
+            <p className="font-display font-bold text-[var(--text)]">{label ?? docType}</p>
           )}
           {saved ? (
             <p className="text-sm text-[var(--dim)]">
@@ -5387,7 +5612,7 @@ function WalletDocRow({
               </button>
             </div>
           ) : null}
-          {docType === "Other document" ? (
+          {docType === "Other document" || docType.startsWith("Other document#") ? (
             <div>
               <FieldLabel htmlFor={`${inputId}-title`}>Name for this document</FieldLabel>
               <input
@@ -5459,6 +5684,13 @@ function WalletPage({ profile }: { profile: ProfileT }) {
   const [viewing, setViewing] = useState<ViewerDoc | null>(null);
   const [warnShown, setWarnShown] = useState(false);
   const [warnAcked, setWarnAcked] = useState("");
+  /* Extra "Other document" slots, so a second (or third) Other
+     document can be added without replacing the first. The main
+     "Other document" row holds one document; each extra slot is
+     staged under its own key, "Other document#2", "#3", ..., and is
+     saved as a new "Other document" that never replaces another. */
+  const [extraOtherKeys, setExtraOtherKeys] = useState<string[]>([]);
+  const [extraOtherSeq, setExtraOtherSeq] = useState(2);
 
   const liveDocs = (docs.data?.documents ?? []).filter(
     (d: DocumentT) => d.status !== "Superseded",
@@ -5520,19 +5752,26 @@ function WalletPage({ profile }: { profile: ProfileT }) {
       const entries = Object.entries(staged);
       let saved = 0;
       for (const [docType, s] of entries) {
-        if (docType === "Other document" && s.customTitle.trim().length < 2) {
+        /* An extra Other slot ("Other document#2", ...) is a new
+           document, never an update: it is saved as "Other document"
+           with no replacesDocumentId, so the first Other document
+           stays in the wallet. Only the main row updates the saved
+           document of its type. */
+        const isExtraOther = docType.startsWith("Other document#");
+        const realDocType = isExtraOther ? "Other document" : docType;
+        if (realDocType === "Other document" && s.customTitle.trim().length < 2) {
           throw new Error(
             "Give the other document a name of at least 2 letters before saving.",
           );
         }
-        const existing = savedByType.get(docType);
+        const existing = isExtraOther ? undefined : savedByType.get(realDocType);
         const payload: Parameters<typeof api.addDocument>[0] = {
           profileId: profile.id,
-          docType,
+          docType: realDocType,
           title:
-            docType === "Other document"
+            realDocType === "Other document"
               ? s.customTitle.trim()
-              : docType,
+              : realDocType,
           docNumber: s.docNumber,
           issuedOn: s.issuedOn,
           expiresOn: s.expiresOn,
@@ -5555,6 +5794,7 @@ function WalletPage({ profile }: { profile: ProfileT }) {
         }
         return {};
       });
+      setExtraOtherKeys([]);
       setSavedMsg(
         `Saved ${n} document${n === 1 ? "" : "s"} to your wallet.`,
       );
@@ -5677,6 +5917,48 @@ function WalletPage({ profile }: { profile: ProfileT }) {
                 onView={setViewing}
               />
             ))}
+          </div>
+          {/* A second Other document: its own row, its own title and
+              View button, saved as a new document that never replaces
+              the first Other document. */}
+          {extraOtherKeys.length > 0 ? (
+            <div className="mt-3 space-y-3">
+              {extraOtherKeys.map((k) => (
+                <WalletDocRow
+                  key={k}
+                  docType={k}
+                  label="Other document (another one)"
+                  saved={undefined}
+                  staged={staged[k]}
+                  onPick={onPickFile}
+                  onUpdate={updateStaged}
+                  onClear={clearStaged}
+                  onRemove={() => {
+                    setExtraOtherKeys((prev) => prev.filter((x) => x !== k));
+                    clearStaged(k);
+                  }}
+                  removing={false}
+                  onView={setViewing}
+                />
+              ))}
+            </div>
+          ) : null}
+          <div className="mt-3">
+            <GhostButton
+              onClick={() => {
+                const key = `Other document#${extraOtherSeq}`;
+                setExtraOtherSeq((n) => n + 1);
+                setExtraOtherKeys((prev) => [...prev, key]);
+              }}
+            >
+              Add another Other document
+            </GhostButton>
+            <p className="mt-1 text-sm text-[var(--dim)]">
+              For a second document that does not fit the list above, for
+              example a clinic letter as well as a birth record. Each one
+              keeps its own name and View button, and adding one never
+              replaces the first.
+            </p>
           </div>
           {otherDocs.length > 0 ? (
             <div className="mt-5">
@@ -9282,6 +9564,10 @@ function CentrePage() {
   const submit = useMutation({
     mutationFn: async () => {
       if (!citizen || !service) throw new Error("Pick the citizen and the service first.");
+      for (const f of service.fields) {
+        const err = dateFieldError(f, fieldValues[f.key] ?? "");
+        if (err) throw new Error(err);
+      }
       const d = serviceDetails(service.id);
       return await api.submitApplication({
         profileId: citizen.id,
@@ -9292,7 +9578,13 @@ function CentrePage() {
         agentName: `${agent?.full_name ?? "County agent"}, ${centre}`,
         notes: "Applied at a County Service Centre, officer assisted, walk-in.",
         details: service.fields
-          .map((f) => ({ label: f.label, value: (fieldValues[f.key] ?? "").trim() }))
+          .map((f) => ({
+            label: f.label,
+            value: (f.kind === "date"
+              ? normalizeDateValue(fieldValues[f.key] ?? "")
+              : (fieldValues[f.key] ?? "")
+            ).trim(),
+          }))
           .filter((x) => x.value.length > 0),
         documentIds: [],
         serviceFee: d.feeUsd,
@@ -9464,10 +9756,18 @@ function CentrePage() {
                 <div key={f.key}>
                   <FieldLabel htmlFor={`ctr-${f.key}`}>{f.label}</FieldLabel>
                   <input id={`ctr-${f.key}`} className={inputCls}
+                    type={f.kind === "date" ? "date" : undefined}
                     value={fieldValues[f.key] ?? ""} placeholder={f.placeholder}
                     onChange={(e) =>
                       setFieldValues((v) => ({ ...v, [f.key]: e.target.value }))
-                    } />
+                    }
+                    onBlur={(e) => {
+                      if (f.kind !== "date") return;
+                      const fixed = normalizeDateValue(e.target.value);
+                      if (fixed !== e.target.value) {
+                        setFieldValues((v) => ({ ...v, [f.key]: fixed }));
+                      }
+                    }} />
                 </div>
               ))}
             </div>
