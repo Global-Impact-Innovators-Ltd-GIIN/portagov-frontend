@@ -19,6 +19,7 @@ SERVICES,
 STATUS_STEPS,
 TIMEZONES,
 TIME_SLOTS,
+applicationStatusPlain,
 USD_TO_LRD_RATE_LABEL,
 communitiesForDistrict,
 feeInLrd,
@@ -386,6 +387,149 @@ function fmtDateTime(iso: string): string {
       });
 }
 
+/** The clock time when a lockout ends, so a locked-out person knows
+    exactly when to try again instead of guessing. */
+function retryTime(minutesLeft: number): string {
+  return new Date(Date.now() + minutesLeft * 60000).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Plain-words lockout message, shared by the citizen code step, the
+    sign-up code step, and the staff second step. */
+function lockMessage(minutesLeft: number): string {
+  return `Too many wrong codes. This account is locked for about ${minutesLeft} minute${minutesLeft === 1 ? "" : "s"}. Try again after ${retryTime(minutesLeft)}.`;
+}
+
+/** How long an application has waited since it was submitted, in plain
+    words, computed from its real submitted time. */
+function waitLabel(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms) || ms < 0) return "just arrived";
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return "just arrived";
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"}`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 48) return `${hrs} hour${hrs === 1 ? "" : "s"}`;
+  const days = Math.floor(hrs / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+/** Real sharpness check for a photo, run in the browser before submit.
+    The image is shrunk to a small size and the variance of its Laplacian
+    is measured: a sharp photo has strong edges and a high variance, a
+    blurry photo has soft edges and a low one. Returns null when the
+    check could not run, so no warning is shown on a guess. A low score
+    is a warning, never proof on its own, and the person can still
+    submit if they choose to. */
+function measureSharpness(file: File): Promise<number | null> {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const w = 160;
+        const h = Math.max(1, Math.round((img.naturalHeight * w) / img.naturalWidth));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx2d = canvas.getContext("2d");
+        if (!ctx2d) {
+          URL.revokeObjectURL(url);
+          resolve(null);
+          return;
+        }
+        ctx2d.drawImage(img, 0, 0, w, h);
+        const data = ctx2d.getImageData(0, 0, w, h).data;
+        const grey: number[] = [];
+        for (let i = 0; i < data.length; i += 4) {
+          grey.push(0.2126 * (data[i] ?? 0) + 0.7152 * (data[i + 1] ?? 0) + 0.0722 * (data[i + 2] ?? 0));
+        }
+        let sum = 0;
+        let count = 0;
+        for (let y = 1; y < h - 1; y += 1) {
+          for (let x = 1; x < w - 1; x += 1) {
+            const c = grey[y * w + x] ?? 0;
+            const lap =
+              (grey[(y - 1) * w + x] ?? 0) +
+              (grey[(y + 1) * w + x] ?? 0) +
+              (grey[y * w + x - 1] ?? 0) +
+              (grey[y * w + x + 1] ?? 0) -
+              4 * c;
+            sum += lap * lap;
+            count += 1;
+          }
+        }
+        URL.revokeObjectURL(url);
+        resolve(count > 0 ? sum / count : null);
+      } catch {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
+
+/** Real checks on a staged wallet file, run before it is saved. Each
+    check uses the file itself: its type, its size, its pixel size, and
+    its measured sharpness. Returns one plain warning per problem found,
+    or an empty list when nothing is wrong. */
+function checkStagedDoc(
+  docType: string,
+  staged: StagedDoc,
+): string[] {
+  const warnings: string[] = [];
+  const f = staged.file;
+  const isImage = f.type.startsWith("image/");
+  const isPdf = f.type === "application/pdf";
+  if (!isImage && !isPdf) {
+    warnings.push(
+      `This file is a ${f.type || "unknown type"}, not a photo or a PDF. Check that you picked the right file for ${docType}.`,
+    );
+  }
+  if (docType === "Passport photograph" && isPdf) {
+    warnings.push(
+      "A passport photograph must be a photo, not a PDF. Replace this file with a photo.",
+    );
+  }
+  if (docType === "Passport photograph" && isImage && f.size < 20 * 1024) {
+    warnings.push(
+      `This photo is only ${formatFileSize(f.size)}, which is very small for a passport photograph. A small file is often a compressed or low quality copy. Use the original full quality photo.`,
+    );
+  }
+  if (
+    docType === "Passport photograph" &&
+    staged.dims &&
+    (staged.dims.w < 600 || staged.dims.h < 600)
+  ) {
+    warnings.push(
+      `This photo is ${staged.dims.w} by ${staged.dims.h} pixels, smaller than the 600 by 600 pixels a passport photograph needs. Use a sharper, full quality photo, because this is the photo printed in your passport.`,
+    );
+  }
+  if (
+    isImage &&
+    staged.dims &&
+    docType !== "Passport photograph" &&
+    (staged.dims.w < 400 || staged.dims.h < 400)
+  ) {
+    warnings.push(
+      `This image is only ${staged.dims.w} by ${staged.dims.h} pixels, which is small and may be hard for an officer to read. Use a clearer copy if you have one.`,
+    );
+  }
+  if (staged.sharpness !== null && staged.sharpness < 15) {
+    warnings.push(
+      "This photo looks blurry. Take a new one in good light, hold the phone still, and check that the writing or face is sharp before you save it.",
+    );
+  }
+  return warnings;
+}
+
 function parseDetails(json: string): { label: string; value: string }[] {
   try {
     const v: unknown = JSON.parse(json);
@@ -506,6 +650,52 @@ function GhostButton({
     >
       {children}
     </button>
+  );
+}
+
+/** First letter of the first name, plus the first letter of the last
+    name when there is one, for the avatar shown when no photo is saved. */
+function profileInitials(fullName: string): string {
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "P";
+  if (parts.length === 1) return (parts[0]?.[0] ?? "P").toUpperCase();
+  return `${parts[0]?.[0] ?? ""}${parts[parts.length - 1]?.[0] ?? ""}`.toUpperCase();
+}
+
+/** Circular citizen avatar: the saved profile photo when there is one,
+    otherwise the person's initials on a navy circle. */
+function ProfileAvatar({
+  profile,
+  size = 36,
+}: {
+  profile: ProfileT;
+  size?: number;
+}) {
+  if (profile.photo) {
+    return (
+      <img
+        src={profile.photo}
+        alt=""
+        width={size}
+        height={size}
+        className="rounded-full object-cover"
+        style={{ width: size, height: size }}
+      />
+    );
+  }
+  return (
+    <span
+      aria-hidden
+      className="flex items-center justify-center rounded-full font-bold text-white"
+      style={{
+        width: size,
+        height: size,
+        backgroundColor: "#0a2a5e",
+        fontSize: size * 0.4,
+      }}
+    >
+      {profileInitials(profile.full_name)}
+    </span>
   );
 }
 
@@ -753,6 +943,7 @@ function ApplicationCard({
   app: ApplicationT;
   onOpen: () => void;
 }) {
+  const plain = applicationStatusPlain(app.status);
   return (
     <button
       type="button"
@@ -766,8 +957,11 @@ function ApplicationCard({
           </p>
           <p className="text-sm text-[var(--dim)]">{app.institution}</p>
         </div>
-        <Chip tone="gold">{app.status}</Chip>
+        <Chip tone="gold">{plain.short}</Chip>
       </div>
+      <p className="mt-2 text-sm text-[var(--text)]">
+        Status: {app.status}. {plain.meaning}
+      </p>
       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-[var(--dim)]">
         <span>
           Reference <strong className="text-[var(--text)]">{app.reference}</strong>
@@ -776,6 +970,258 @@ function ApplicationCard({
         <span>{app.channel}</span>
       </div>
     </button>
+  );
+}
+
+/* ---------- signed-in home: one home screen per person ----------
+   Added for the organised batch. This is the one combined view: the
+   next thing to do at the top, computed from real data, then the
+   person's applications, appointments and wallet documents in one
+   place. It is used on the signed-in home page and in My account, so
+   there is one home screen, not two different ones. Expiry reminders
+   are included here, so they appear on the home screen as well as in
+   the wallet. Data is the person's own browser data until shared
+   backend storage lands. */
+
+function daysUntil(dateStr: string): number {
+  const t = new Date(`${dateStr}T00:00:00`).getTime();
+  if (Number.isNaN(t)) return Number.POSITIVE_INFINITY;
+  return Math.ceil((t - Date.now()) / 86400000);
+}
+
+function SignedInHome({ profile }: { profile: ProfileT }) {
+  const apps = useQuery({
+    queryKey: ["applications", profile.id],
+    queryFn: () => api.listApplications({ profileId: profile.id }),
+  });
+  const appts = useQuery({
+    queryKey: ["appointments", profile.id],
+    queryFn: () => api.listAppointments({ profileId: profile.id }),
+  });
+  const docs = useQuery({
+    queryKey: ["documents", profile.id],
+    queryFn: () => api.listDocuments({ profileId: profile.id }),
+  });
+  const applications = apps.data?.applications ?? [];
+  const appointments = appts.data?.appointments ?? [];
+  const documents = (docs.data?.documents ?? []).filter(
+    (d: DocumentT) => d.status !== "Superseded",
+  );
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const upcoming = appointments
+    .filter((a: AppointmentT) => a.status === "Booked" && a.date >= todayStr)
+    .sort((a: AppointmentT, b: AppointmentT) =>
+      `${a.date} ${a.time_slot}`.localeCompare(`${b.date} ${b.time_slot}`),
+    );
+  const nextAppt = upcoming[0];
+  const expiring = documents
+    .filter((d: DocumentT) => d.expires_on)
+    .map((d: DocumentT) => ({ doc: d, days: daysUntil(d.expires_on) }))
+    .sort((a, b) => a.days - b.days);
+  const expiredDoc = expiring.find((x) => x.days < 0);
+  const soonDoc = expiring.find((x) => x.days >= 0 && x.days <= 30);
+  const openApps = applications.filter(
+    (a: ApplicationT) => a.status !== "Completed",
+  );
+  const readyApp = applications.find(
+    (a: ApplicationT) => a.status === "Ready for collection",
+  );
+  const needsInfoApp = applications.find(
+    (a: ApplicationT) => a.status === "More information needed",
+  );
+  const unpaidApp = applications.find(
+    (a: ApplicationT) =>
+      a.billing_status !== "Paid" && a.total_due > 0 && a.status !== "Completed",
+  );
+
+  type NextAction = { title: string; detail: string; href: string; label: string };
+  let next: NextAction | null = null;
+  if (needsInfoApp) {
+    next = {
+      title: "One more thing is needed for your application",
+      detail: `${needsInfoApp.service_name}, ${needsInfoApp.reference}. ${needsInfoApp.status_note || "Open the application and read the note from PortaGov."}`,
+      href: `#/application/${needsInfoApp.id}`,
+      label: "Open the application",
+    };
+  } else if (readyApp) {
+    next = {
+      title: "Your document is ready to collect",
+      detail: `${readyApp.service_name}, ${readyApp.reference}. Bring your pickup code${readyApp.pickup_code ? ` ${readyApp.pickup_code}` : ""} and your ID.`,
+      href: `#/application/${readyApp.id}`,
+      label: "See pickup details",
+    };
+  } else if (expiredDoc) {
+    next = {
+      title: `Your ${expiredDoc.doc.title} has expired`,
+      detail: `It expired on ${fmtDate(expiredDoc.doc.expires_on)}. Renew it, then update it in your wallet so no application is refused.`,
+      href: "#/wallet",
+      label: "Update it in my wallet",
+    };
+  } else if (unpaidApp) {
+    next = {
+      title: "A payment is due",
+      detail: `${unpaidApp.service_name}, billing number ${unpaidApp.billing_number}. $${unpaidApp.total_due - unpaidApp.amount_paid} is still to pay. PortaGov releases the application only when the billing number is confirmed paid.`,
+      href: `#/application/${unpaidApp.id}`,
+      label: "Pay with mobile money",
+    };
+  } else if (nextAppt) {
+    const days = daysUntil(nextAppt.date);
+    next = {
+      title: `Your visit is ${days <= 0 ? "today" : days === 1 ? "tomorrow" : `in ${days} days`}`,
+      detail: `${nextAppt.kind}, ${fmtDate(nextAppt.date)}, ${nextAppt.time_slot}, at ${nextAppt.office}. Bring your ID${nextAppt.ticket ? ` and ticket ${nextAppt.ticket}` : ""}.`,
+      href: "#/appointments",
+      label: "See my appointments",
+    };
+  } else if (soonDoc) {
+    next = {
+      title: `Your ${soonDoc.doc.title} expires soon`,
+      detail: `It expires on ${fmtDate(soonDoc.doc.expires_on)}, in ${soonDoc.days} days. Renew it in good time, then update it in your wallet.`,
+      href: "#/wallet",
+      label: "Update it in my wallet",
+    };
+  } else if (openApps.length > 0) {
+    const first = openApps[0]!;
+    const plain = applicationStatusPlain(first.status);
+    next = {
+      title: "Follow your application",
+      detail: `${first.service_name}, ${first.reference}. Status: ${plain.short}. ${plain.meaning}`,
+      href: `#/application/${first.id}`,
+      label: "Open the application",
+    };
+  }
+
+  const loading = apps.isPending || appts.isPending || docs.isPending;
+  return (
+    <section aria-label="My PortaGov home" className="mx-auto max-w-6xl px-4 pt-6">
+      <SectionTitle sub="Your applications, appointments and wallet documents in one place.">
+        My PortaGov home
+      </SectionTitle>
+      {loading ? (
+        <p className="text-[var(--dim)]">Loading your home screen...</p>
+      ) : (
+        <div className="space-y-5">
+          {next ? (
+            <div className="rounded-xl p-5 text-white" style={{ backgroundColor: "#0a2a5e" }}>
+              <p className="text-sm font-bold uppercase tracking-widest" style={{ color: "#d9a821" }}>
+                Next thing to do
+              </p>
+              <h3 className="mt-1 font-display text-xl font-extrabold">{next.title}</h3>
+              <p className="mt-1 text-sm text-white/85">{next.detail}</p>
+              <div className="mt-3">
+                <GoldButton onClick={() => nav(next.href)}>{next.label}</GoldButton>
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+              <h3 className="font-display text-lg font-bold text-[var(--text)]">
+                Nothing needs you right now
+              </h3>
+              <p className="mt-1 text-sm text-[var(--dim)]">
+                No application is waiting on you, no payment is due, no visit
+                is booked, and no document is about to expire. When you start
+                a service, your next step will appear here.
+              </p>
+              <div className="mt-3">
+                <PrimaryButton onClick={() => nav("#/")}>Browse services</PrimaryButton>
+              </div>
+            </div>
+          )}
+
+          <div className="grid gap-4 md:grid-cols-3">
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+              <h3 className="font-display text-lg font-bold text-[var(--text)]">My applications</h3>
+              {applications.length === 0 ? (
+                <p className="mt-2 text-sm text-[var(--dim)]">No applications yet.</p>
+              ) : (
+                <ul className="mt-2 space-y-3">
+                  {applications.slice(0, 3).map((a: ApplicationT) => {
+                    const plain = applicationStatusPlain(a.status);
+                    return (
+                      <li key={a.id}>
+                        <a href={`#/application/${a.id}`} className="block">
+                          <span className="text-sm font-bold text-[var(--text)]">{a.service_name}</span>
+                          <span className="mt-1 block text-sm text-[var(--dim)]">
+                            {a.reference} <Chip tone="gold">{plain.short}</Chip>
+                          </span>
+                          <span className="mt-1 block text-sm text-[var(--dim)]">{plain.meaning}</span>
+                        </a>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+              <p className="mt-3 text-sm font-semibold">
+                <a href="#/applications" className="underline" style={{ color: "var(--accent)" }}>
+                  See all my applications ({applications.length})
+                </a>
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+              <h3 className="font-display text-lg font-bold text-[var(--text)]">My appointments</h3>
+              {upcoming.length === 0 ? (
+                <p className="mt-2 text-sm text-[var(--dim)]">
+                  No visits booked yet. When a service needs you in person, you book the visit from that application.
+                </p>
+              ) : (
+                <ul className="mt-2 space-y-3">
+                  {upcoming.slice(0, 2).map((a: AppointmentT) => (
+                    <li key={a.id} className="text-sm text-[var(--text)]">
+                      <strong>{a.kind}</strong>, {fmtDate(a.date)}, {a.time_slot}
+                      <span className="block text-[var(--dim)]">
+                        {a.office}
+                        {a.application_ref ? `, for ${a.application_ref}` : ""}
+                        {a.ticket ? `, ticket ${a.ticket}` : ""}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <p className="mt-3 text-sm font-semibold">
+                <a href="#/appointments" className="underline" style={{ color: "var(--accent)" }}>
+                  See all my appointments ({upcoming.length} coming up)
+                </a>
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+              <h3 className="font-display text-lg font-bold text-[var(--text)]">My wallet documents</h3>
+              {documents.length === 0 ? (
+                <p className="mt-2 text-sm text-[var(--dim)]">No documents saved yet.</p>
+              ) : (
+                <ul className="mt-2 space-y-3">
+                  {expiring.slice(0, 3).map(({ doc, days }) => (
+                    <li key={doc.id} className="text-sm text-[var(--text)]">
+                      <strong>{doc.title}</strong> ({doc.doc_type})
+                      <span className="block text-[var(--dim)]">
+                        Expires {fmtDate(doc.expires_on)}
+                        {days < 0
+                          ? `, expired ${Math.abs(days)} days ago`
+                          : days === 0
+                            ? ", expires today"
+                            : `, ${days} days left`}
+                      </span>
+                    </li>
+                  ))}
+                  {expiring.length === 0 ? (
+                    <li className="text-sm text-[var(--dim)]">
+                      {documents.length} document{documents.length === 1 ? "" : "s"} saved, none with an expiry date.
+                    </li>
+                  ) : null}
+                </ul>
+              )}
+              <p className="mt-3 text-sm font-semibold">
+                <a href="#/wallet" className="underline" style={{ color: "var(--accent)" }}>
+                  Open my document wallet ({documents.length} saved)
+                </a>
+              </p>
+            </div>
+          </div>
+
+          <ExpiryReminders profile={profile} />
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -877,6 +1323,8 @@ function HomePage({
           className="relative h-1.5"
         />
       </section>
+
+      {profile ? <SignedInHome profile={profile} /> : null}
 
       <section className="mx-auto max-w-6xl px-4 pt-8">
         <FinderSection />
@@ -2116,7 +2564,7 @@ function SignInPage({
   onSignedIn,
 }: {
   after: string;
-  onSignedIn: (p: ProfileT) => void;
+  onSignedIn: (p: ProfileT, alert?: string) => void;
 }) {
   const [mode, setMode] = useState<"choose" | "new" | "returning">("choose");
   const [regInfo, setRegInfo] = useState<{
@@ -2137,7 +2585,13 @@ function SignInPage({
       }),
     onSuccess: (r) => {
       if (!r.ok || !r.profile) {
-        setVerifyError("That code is not correct, or it has expired. Check and try again.");
+        setVerifyError(
+          r.locked
+            ? lockMessage(r.minutes_left)
+            : r.attempts_left > 0 && r.attempts_left < 5
+              ? `That code is not correct, or it has expired. You have ${r.attempts_left} ${r.attempts_left === 1 ? "try" : "tries"} left before the account locks for 15 minutes.`
+              : "That code is not correct, or it has expired. Check and try again.",
+        );
         return;
       }
       if (r.email_code) {
@@ -2158,7 +2612,13 @@ function SignInPage({
       }),
     onSuccess: (r) => {
       if (!r.ok || !r.profile) {
-        setVerifyError("That email code is not correct, or it has expired.");
+        setVerifyError(
+          r.locked
+            ? lockMessage(r.minutes_left)
+            : r.attempts_left > 0 && r.attempts_left < 5
+              ? `That email code is not correct, or it has expired. You have ${r.attempts_left} ${r.attempts_left === 1 ? "try" : "tries"} left before the account locks for 15 minutes.`
+              : "That email code is not correct, or it has expired.",
+        );
         return;
       }
       onSignedIn(r.profile);
@@ -2239,6 +2699,7 @@ function SignInPage({
               ) : null}
             </div>
           ) : mode === "choose" ? (
+            <>
             <div className="grid gap-4 sm:grid-cols-2">
               <button
                 type="button"
@@ -2268,6 +2729,13 @@ function SignInPage({
                 </p>
               </button>
             </div>
+            <p className="mt-4 text-center text-sm text-[var(--dim)]">
+              Are you a PortaGov agent helping someone apply?{" "}
+              <a href="#/centre" className="font-semibold underline">
+                Open the county agent desk
+              </a>
+            </p>
+            </>
           ) : mode === "returning" ? (
             <LoginForm
               onSignedIn={onSignedIn}
@@ -2307,7 +2775,7 @@ function LoginForm({
   after,
   onBack,
 }: {
-  onSignedIn: (p: ProfileT) => void;
+  onSignedIn: (p: ProfileT, alert?: string) => void;
   after: string;
   onBack: () => void;
 }) {
@@ -2320,7 +2788,6 @@ function LoginForm({
   const [code, setCode] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [error, setError] = useState("");
-  const [warning, setWarning] = useState("");
 
   const start = useMutation({
     mutationFn: async () => {
@@ -2390,15 +2857,22 @@ function LoginForm({
     },
     onSuccess: (r) => {
       if (!r.ok || !r.profile) {
-        setError("That code is not correct, or it has expired. Go back and sign in again for a fresh code.");
+        setError(
+          r.locked
+            ? `${lockMessage(r.minutes_left)} Go back and sign in again for a fresh code after that time.`
+            : r.attempts_left > 0 && r.attempts_left < 5
+              ? `That code is not correct, or it has expired. You have ${r.attempts_left} ${r.attempts_left === 1 ? "try" : "tries"} left before the account locks for 15 minutes.`
+              : "That code is not correct, or it has expired. Go back and sign in again for a fresh code.",
+        );
         return;
       }
-      if (r.new_device_warning) {
-        setWarning(
-          "Warning: you signed in from a new device. If this was not you, change your password at once in My account and tell PortaGov on the Help page.",
-        );
-      }
-      onSignedIn(r.profile);
+      /* The new-device warning used to be set here and then lost, because
+         the page moved on at once. It now travels with the sign-in, so
+         the person sees it on screen after signing in. */
+      const alert = r.new_device_warning
+        ? `You signed in from a new device (${deviceInfo().label}, ${new Date().toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}). If this was not you, change your password at once in My account and tell PortaGov on the Help page.`
+        : undefined;
+      onSignedIn(r.profile, alert);
       nav(after || "#/account");
     },
     onError: (e) =>
@@ -2478,11 +2952,6 @@ function LoginForm({
           onChange={(e) => setPassword(e.target.value)} autoComplete="current-password"
           placeholder="Leave empty only if an officer made your account and you have no password yet" />
       </div>
-      {warning ? (
-        <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
-          {warning}
-        </p>
-      ) : null}
       {error ? (
         <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
           {error}
@@ -2495,10 +2964,169 @@ function LoginForm({
         <GhostButton onClick={onBack}>Back</GhostButton>
       </div>
       <p className="text-sm text-[var(--dim)]">
-        Five wrong passwords lock the account for 15 minutes. A new device
-        always needs a code, and you are warned when one signs in.
+        Five wrong passwords, or five wrong codes, lock the account for 15
+        minutes. A new device always needs a code, and you are warned when
+        one signs in.
       </p>
     </form>
+  );
+}
+
+/* ---------- profile photo (account settings) ---------- */
+
+/** Upload, square-crop and save a profile photo. Reuses the same
+    canvas crop approach as the passport photo fix tool: move and zoom
+    until the face sits in the square, then save. The saved photo is a
+    small square JPEG stored with the profile, so the navbar avatar
+    updates at once and the photo is still there after sign out and
+    sign in on the same device. */
+function ProfilePhotoSection({
+  profile,
+  onProfileChange,
+}: {
+  profile: ProfileT;
+  onProfileChange: (p: ProfileT) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const [src, setSrc] = useState("");
+  const [scale, setScale] = useState(1);
+  const [offX, setOffX] = useState(0);
+  const [offY, setOffY] = useState(0);
+  const [saved, setSaved] = useState("");
+  const [error, setError] = useState("");
+
+  const draw = () => {
+    const canvas = canvasRef.current;
+    const img = imgRef.current;
+    if (!canvas || !img || !src) return;
+    const ctx2d = canvas.getContext("2d");
+    if (!ctx2d) return;
+    const size = 256;
+    ctx2d.fillStyle = "#ffffff";
+    ctx2d.fillRect(0, 0, size, size);
+    const base = Math.max(size / img.naturalWidth, size / img.naturalHeight);
+    const w = img.naturalWidth * base * scale;
+    const h = img.naturalHeight * base * scale;
+    const x = (size - w) / 2 + offX;
+    const y = (size - h) / 2 + offY;
+    ctx2d.drawImage(img, x, y, w, h);
+  };
+  useEffect(draw, [src, scale, offX, offY]);
+
+  const save = useMutation({
+    mutationFn: async () => {
+      const canvas = canvasRef.current;
+      if (!canvas) throw new Error("Choose a photo first.");
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+      return await api.updateProfilePhoto({ id: profile.id, photo: dataUrl });
+    },
+    onSuccess: (r) => {
+      setSaved("Saved. Your photo is now your avatar at the top of every page.");
+      setSrc("");
+      onProfileChange(r.profile);
+    },
+    onError: (e) =>
+      setError(e instanceof Error ? e.message : "The photo could not be saved."),
+  });
+
+  const remove = useMutation({
+    mutationFn: async () => await api.updateProfilePhoto({ id: profile.id, photo: "" }),
+    onSuccess: (r) => {
+      setSaved("Photo removed. Your initials show in the top corner again.");
+      onProfileChange(r.profile);
+    },
+    onError: (e) =>
+      setError(e instanceof Error ? e.message : "The photo could not be removed."),
+  });
+
+  return (
+    <div className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-xl font-bold text-[var(--text)]">Profile photo</h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        This photo shows in the top corner when you are signed in. If you
+        have no photo, your initials show instead.
+      </p>
+      <div className="mt-4 flex items-center gap-4">
+        <ProfileAvatar profile={profile} size={64} />
+        <div className="flex flex-wrap gap-3">
+          <label className="inline-block cursor-pointer rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold text-[var(--text)]">
+            {profile.photo ? "Change photo" : "Upload a photo"}
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              aria-label="Choose a profile photo"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) {
+                  setSaved("");
+                  setError("");
+                  setScale(1);
+                  setOffX(0);
+                  setOffY(0);
+                  setSrc(URL.createObjectURL(f));
+                }
+                e.target.value = "";
+              }}
+            />
+          </label>
+          {profile.photo ? (
+            <GhostButton onClick={() => remove.mutate()} disabled={remove.isPending}>
+              {remove.isPending ? "Removing..." : "Remove photo"}
+            </GhostButton>
+          ) : null}
+        </div>
+      </div>
+      {src ? (
+        <div className="mt-4 grid gap-4 sm:grid-cols-[256px_1fr]">
+          <div>
+            <img ref={imgRef} src={src} alt="" className="hidden" onLoad={draw} />
+            <canvas
+              ref={canvasRef}
+              width={256}
+              height={256}
+              className="w-full max-w-64 rounded-lg border"
+              style={{ borderColor: "var(--border)" }}
+              aria-label="Preview of your cropped profile photo"
+            />
+          </div>
+          <div className="space-y-3">
+            <div>
+              <FieldLabel htmlFor="avatar-zoom">Zoom</FieldLabel>
+              <input id="avatar-zoom" type="range" min={1} max={3} step={0.05}
+                className="w-full" value={scale}
+                onChange={(e) => setScale(Number(e.target.value))} />
+            </div>
+            <div>
+              <FieldLabel htmlFor="avatar-x">Move left or right</FieldLabel>
+              <input id="avatar-x" type="range" min={-100} max={100} step={1}
+                className="w-full" value={offX}
+                onChange={(e) => setOffX(Number(e.target.value))} />
+            </div>
+            <div>
+              <FieldLabel htmlFor="avatar-y">Move up or down</FieldLabel>
+              <input id="avatar-y" type="range" min={-100} max={100} step={1}
+                className="w-full" value={offY}
+                onChange={(e) => setOffY(Number(e.target.value))} />
+            </div>
+            <PrimaryButton onClick={() => save.mutate()} disabled={save.isPending}>
+              {save.isPending ? "Saving..." : "Save this photo"}
+            </PrimaryButton>
+            <p className="text-sm text-[var(--dim)]">
+              The photo is cropped to a square and saved at a small size, so
+              it loads fast and stays saved on this device.
+            </p>
+          </div>
+        </div>
+      ) : null}
+      {saved ? (
+        <p className="mt-3 text-sm font-semibold text-[var(--text)]">{saved}</p>
+      ) : null}
+      {error ? (
+        <p role="alert" className="mt-3 text-sm font-semibold text-[var(--warn)]">{error}</p>
+      ) : null}
+    </div>
   );
 }
 
@@ -2507,11 +3135,11 @@ function LoginForm({
 function AccountPage({
   profile,
   onProfileChange,
-  onSignOut,
+  onSignOutEverywhere,
 }: {
   profile: ProfileT;
   onProfileChange: (p: ProfileT) => void;
-  onSignOut: () => void;
+  onSignOutEverywhere: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const rows: [string, string][] = [
@@ -2545,8 +3173,9 @@ function AccountPage({
             can change anything here at any time.
           </p>
         </div>
-        <GhostButton onClick={onSignOut}>Sign out</GhostButton>
       </div>
+
+      <ProfilePhotoSection profile={profile} onProfileChange={onProfileChange} />
 
       <div className="mt-5 grid gap-3 sm:grid-cols-3">
         {[
@@ -2598,12 +3227,9 @@ function AccountPage({
       </div>
 
       <div className="mt-6">
-        <SectionTitle sub="Your applications, wallet, messages, and appointments in one place.">
-          My PortaGov home
-        </SectionTitle>
         <div className="space-y-5">
+          <SignedInHome profile={profile} />
           <QrCard profile={profile} />
-          <ExpiryReminders profile={profile} />
           <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
             <h2 className="font-display text-lg font-bold text-[var(--text)]">
               My updates (SMS and WhatsApp)
@@ -2622,7 +3248,7 @@ function AccountPage({
           Security, agents, favourites, my year, and my support tickets
         </summary>
         <div className="space-y-5 border-t border-[var(--border)] p-4">
-          <SecurityPanel profile={profile} onProfileChange={onProfileChange} />
+          <SecurityPanel profile={profile} onProfileChange={onProfileChange} onSignOutEverywhere={onSignOutEverywhere} />
           <AgentPermissionsPanel profile={profile} />
           <ConsentCodeMaker profile={profile} />
           <FavouritesSection profile={profile} />
@@ -2638,7 +3264,88 @@ function AccountPage({
   );
 }
 
+/* ---------- application drafts: save now, finish later, on this device ---------- */
+
+type ApplicationDraft = {
+  serviceId: string;
+  fieldValues: Record<string, string>;
+  notes: string;
+  channel: "Self service" | "Agent assisted" | "Diaspora";
+  priority: "Standard" | "Fast-track" | "Emergency";
+  checkedReqs: number[];
+  pickedDocs: number[];
+  diasporaCountry: string;
+  agentName: string;
+  onBehalf: string;
+  pickup: "Monrovia" | "Embassy";
+  lane: "Parent or self" | "School" | "Hospital";
+  embassy: string;
+  businessId: number;
+  paymentPlan: boolean;
+  savedAt: string;
+};
+
+function draftKeyFor(serviceId: string, profileId: number): string {
+  return `portagov-draft-${serviceId}-${profileId}`;
+}
+
+function readApplicationDraft(key: string, serviceIdFromKey: string): ApplicationDraft | null {
+  try {
+    const raw = storage.get(key);
+    if (!raw) return null;
+    const d = JSON.parse(raw) as Partial<ApplicationDraft>;
+    return {
+      serviceId:
+        typeof d.serviceId === "string" && d.serviceId ? d.serviceId : serviceIdFromKey,
+      fieldValues: d.fieldValues ?? {},
+      notes: d.notes ?? "",
+      channel: d.channel ?? "Self service",
+      priority: d.priority ?? "Standard",
+      checkedReqs: d.checkedReqs ?? [],
+      pickedDocs: d.pickedDocs ?? [],
+      diasporaCountry: d.diasporaCountry ?? "",
+      agentName: d.agentName ?? "",
+      onBehalf: d.onBehalf ?? "",
+      pickup: d.pickup ?? "Monrovia",
+      lane: d.lane ?? "Parent or self",
+      embassy: d.embassy ?? "",
+      businessId: d.businessId ?? 0,
+      paymentPlan: d.paymentPlan ?? false,
+      savedAt: d.savedAt ?? "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/* Every unfinished application draft saved on this device, newest first.
+   Drafts live in this device's storage only until the shared backend
+   lands, so this list shows this device's drafts and says so. */
+function listApplicationDrafts(profileId: number): ApplicationDraft[] {
+  const prefix = "portagov-draft-";
+  const suffix = `-${profileId}`;
+  const out: ApplicationDraft[] = [];
+  for (const key of storage.keys()) {
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+    const serviceId = key.slice(prefix.length, key.length - suffix.length);
+    if (!serviceId) continue;
+    const d = readApplicationDraft(key, serviceId);
+    if (d) out.push(d);
+  }
+  return out.sort((a, b) => (b.savedAt || "").localeCompare(a.savedAt || ""));
+}
+
 /* ---------- apply page ---------- */
+
+/* The application form is one clear step at a time, with a small
+   progress bar that says which step the person is on. */
+const APPLY_STEPS = [
+  "Who is applying",
+  "Requirements checklist",
+  "Details for this service",
+  "Documents",
+  "Speed and payment",
+];
 
 function fixInstruction(requirement: string): string {
   const r = requirement.toLowerCase();
@@ -2683,6 +3390,7 @@ function ApplyPage({
   const [error, setError] = useState("");
   const [draftLoaded, setDraftLoaded] = useState(false);
   const [draftSaved, setDraftSaved] = useState(false);
+  const [step, setStep] = useState(1);
 
   const docs = useQuery({
     queryKey: ["documents", profile.id],
@@ -2701,49 +3409,68 @@ function ApplyPage({
     queryFn: () => api.listBusinesses({ profileId: profile.id }),
   });
 
-  const draftKey = service ? `portagov-draft-${service.id}-${profile.id}` : "";
+  const draftKey = service ? draftKeyFor(service.id, profile.id) : "";
+
+  /* Everything on this form is part of the draft, so resuming brings
+     back the whole form, not just the first fields. */
+  const draftPayload = (): ApplicationDraft => ({
+    serviceId: service?.id ?? "",
+    fieldValues,
+    notes,
+    channel,
+    priority,
+    checkedReqs,
+    pickedDocs,
+    diasporaCountry,
+    agentName,
+    onBehalf,
+    pickup,
+    lane,
+    embassy,
+    businessId,
+    paymentPlan,
+    savedAt: new Date().toISOString(),
+  });
+
+  const saveDraftNow = () => {
+    if (!draftKey) return;
+    try {
+      storage.set(draftKey, JSON.stringify(draftPayload()));
+      setDraftSaved(true);
+    } catch {
+      // Storage full or blocked: the form still works.
+    }
+  };
 
   useEffect(() => {
-    if (!draftKey || draftLoaded) return;
-    try {
-      const raw = storage.get(draftKey);
-      if (raw) {
-        const d = JSON.parse(raw) as {
-          fieldValues?: Record<string, string>;
-          notes?: string;
-          channel?: "Self service" | "Agent assisted" | "Diaspora";
-          priority?: "Standard" | "Fast-track" | "Emergency";
-          checkedReqs?: number[];
-          pickedDocs?: number[];
-        };
-        if (d.fieldValues) setFieldValues(d.fieldValues);
-        if (d.notes) setNotes(d.notes);
-        if (d.channel) setChannel(d.channel);
-        if (d.priority) setPriority(d.priority);
-        if (d.checkedReqs) setCheckedReqs(d.checkedReqs);
-        if (d.pickedDocs) setPickedDocs(d.pickedDocs);
-      }
-    } catch {
-      // A broken draft is ignored; the form starts fresh.
+    if (!draftKey || draftLoaded || !service) return;
+    const d = readApplicationDraft(draftKey, service.id);
+    if (d) {
+      setFieldValues(d.fieldValues);
+      setNotes(d.notes);
+      setChannel(d.channel);
+      setPriority(d.priority);
+      setCheckedReqs(d.checkedReqs);
+      setPickedDocs(d.pickedDocs);
+      setDiasporaCountry(d.diasporaCountry);
+      setAgentName(d.agentName);
+      setOnBehalf(d.onBehalf);
+      setPickup(d.pickup);
+      setLane(d.lane);
+      setEmbassy(d.embassy);
+      setBusinessId(d.businessId);
+      setPaymentPlan(d.paymentPlan);
     }
     setDraftLoaded(true);
-  }, [draftKey, draftLoaded]);
+  }, [draftKey, draftLoaded, service]);
 
   useEffect(() => {
     if (!draftKey || !draftLoaded) return;
     const t = window.setTimeout(() => {
-      try {
-        storage.set(
-          draftKey,
-          JSON.stringify({ fieldValues, notes, channel, priority, checkedReqs, pickedDocs }),
-        );
-        setDraftSaved(true);
-      } catch {
-        // Storage full or blocked: the form still works.
-      }
+      saveDraftNow();
     }, 400);
     return () => window.clearTimeout(t);
-  }, [draftKey, draftLoaded, fieldValues, notes, channel, priority, checkedReqs, pickedDocs]);
+  }, [draftKey, draftLoaded, fieldValues, notes, channel, priority, checkedReqs, pickedDocs, diasporaCountry, agentName, onBehalf, pickup, lane, embassy, businessId, paymentPlan]);
 
   const details = service ? serviceDetails(service.id) : null;
   const fastLane =
@@ -2864,6 +3591,42 @@ function ApplyPage({
     },
   ];
   const allGreen = checklist.every((c) => c.ok);
+  const reqsDone = service.requirements.every((_, i) => checkedReqs.includes(i));
+
+  /* Move to the next step only when this step is done. The form submit
+     uses the same checks, so pressing Enter behaves like Continue. */
+  const goNext = () => {
+    if (step === 1) {
+      if (channel === "Diaspora" && !diasporaCountry.trim()) {
+        setError("Tell us which country you are applying from.");
+        return;
+      }
+      if (channel === "Agent assisted" && !agentName.trim()) {
+        setError("Choose or write the name of the agent helping you.");
+        return;
+      }
+    }
+    if (step === 2 && !reqsDone) {
+      setError("Tick every requirement in the checklist first. Each red item tells you how to fix it.");
+      return;
+    }
+    if (step === 3 && !fieldsFilled) {
+      setError("Answer every box in the Details section first. Empty boxes keep the checklist red.");
+      return;
+    }
+    if (step === 4 && !docsAttached) {
+      setError("Attach at least one document from your wallet first. Your draft is saved on this device, so you can add the document and come back.");
+      return;
+    }
+    setError("");
+    setStep((s) => Math.min(5, s + 1));
+    window.scrollTo(0, 0);
+  };
+  const goBack = () => {
+    setError("");
+    setStep((s) => Math.max(1, s - 1));
+    window.scrollTo(0, 0);
+  };
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-8">
@@ -2883,12 +3646,70 @@ function ApplyPage({
         if anything is wrong.
         {draftSaved ? (
           <span className="mt-1 block font-semibold text-[var(--text)]">
-            Draft saved on this phone. If your connection cuts or your battery
-            dies, come back and your work is still here.
+            Draft saved on this device. If your connection cuts or your
+            battery dies, come back on this same device and your work is
+            still here, listed under Drafts in My applications. Finishing
+            the same draft on another device comes with the shared backend.
           </span>
         ) : null}
       </div>
 
+      <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+        <p className="text-sm font-bold text-[var(--text)]">
+          Fee for {service.name}: ${details.feeUsd} USD
+          {details.feeUsd === 0
+            ? ", free, nothing to pay"
+            : `, about L$${feeInLrd(details.feeUsd).toLocaleString()} LRD`}
+        </p>
+        <p className="mt-1 text-xs text-[var(--dim)]">
+          Rate used: {USD_TO_LRD_RATE_LABEL}. You see the fee in dollars and
+          Liberian dollars before you start. You pay only after you submit,
+          when PortaGov gives you a billing number.
+        </p>
+      </div>
+
+      <div className="mt-4" aria-label={`Step ${step} of 5`}>
+        <p className="text-sm font-bold text-[var(--text)]">
+          Step {step} of 5: {APPLY_STEPS[step - 1]}
+        </p>
+        <div
+          className="mt-2 h-2 overflow-hidden rounded-full bg-[var(--surface-alt)]"
+          role="progressbar"
+          aria-valuenow={step}
+          aria-valuemin={1}
+          aria-valuemax={5}
+          aria-label={`Step ${step} of 5`}
+        >
+          <div
+            className="h-full rounded-full"
+            style={{ width: `${(step / 5) * 100}%`, backgroundColor: "#0a2a5e" }}
+          />
+        </div>
+        <p className="mt-1 text-xs text-[var(--dim)]">
+          One step at a time. Your work is saved as a draft on this device as
+          you go.
+        </p>
+      </div>
+      <div className="mt-2">
+        <button
+          type="button"
+          onClick={() => {
+            saveDraftNow();
+            nav("#/applications");
+          }}
+          className="text-sm font-semibold underline text-[var(--dim)]"
+        >
+          Save draft and finish later
+        </button>
+      </div>
+
+      {error ? (
+        <p role="alert" className="mt-4 rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+          {error}
+        </p>
+      ) : null}
+
+      {step === 2 ? (
       <div className="mt-5 rounded-xl border-2 bg-[var(--surface)] p-4" style={{ borderColor: allGreen ? "#166534" : "#d9a821" }}>
         <h2 className="font-display text-lg font-bold text-[var(--text)]">
           Checklist: everything must be green before you can submit
@@ -2941,12 +3762,25 @@ function ApplyPage({
             </li>
           ))}
         </ul>
+        <p className="mt-3 text-sm text-[var(--dim)]">
+          The last two items turn green as you finish the next steps. Tick
+          every requirement above to continue.
+        </p>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <GhostButton onClick={goBack}>Back</GhostButton>
+          <PrimaryButton type="button" onClick={goNext}>Continue</PrimaryButton>
+        </div>
       </div>
+      ) : null}
 
       <form
         className="mt-5 space-y-5"
         onSubmit={(e: FormEvent) => {
           e.preventDefault();
+          if (step !== 5) {
+            goNext();
+            return;
+          }
           setError("");
           if (!allGreen) {
             setError("The checklist is not all green yet. Fix the red items first: each one tells you in plain words how to fix it.");
@@ -2963,6 +3797,8 @@ function ApplyPage({
           submit.mutate();
         }}
       >
+        {step === 1 ? (
+          <>
         <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
           <legend className="px-1 font-display font-bold text-[var(--text)]">
             Who is this application for?
@@ -3129,36 +3965,14 @@ function ApplyPage({
             ) : null}
           </fieldset>
         ) : null}
+            <div className="flex flex-wrap gap-2">
+              <PrimaryButton type="button" onClick={goNext}>Continue</PrimaryButton>
+            </div>
+          </>
+        ) : null}
 
-        <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-          <legend className="px-1 font-display font-bold text-[var(--text)]">
-            How fast do you need it?
-          </legend>
-          <div className="space-y-2">
-            {(
-              [
-                ["Standard", `Normal time: ${details.processingTime}. No extra fee.`],
-                ["Fast-track", `Moved ahead in the queue. Extra $${FAST_TRACK_FEE_USD}, shown here, no hidden fee.`],
-                ["Emergency", `Urgent cases, for example travel for medical care or a death in the family. Extra $${EMERGENCY_FEE_USD}, shown here, no hidden fee.`],
-              ] as const
-            ).map(([value, label]) => (
-              <label key={value} className="flex items-start gap-2 text-sm text-[var(--text)]">
-                <input
-                  type="radio"
-                  name="priority"
-                  aria-label={value}
-                  checked={priority === value}
-                  onChange={() => setPriority(value)}
-                  className="mt-1 h-4 w-4"
-                />
-                <span>
-                  <strong>{value}.</strong> {label}
-                </span>
-              </label>
-            ))}
-          </div>
-        </fieldset>
-
+        {step === 3 ? (
+          <>
         {service.fields.length > 0 ? (
           <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
             <legend className="px-1 font-display font-bold text-[var(--text)]">
@@ -3213,8 +4027,21 @@ function ApplyPage({
               ))}
             </div>
           </fieldset>
+        ) : (
+          <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 text-sm text-[var(--dim)]">
+            No extra details are needed for this service. Continue to the
+            next step.
+          </p>
+        )}
+            <div className="flex flex-wrap gap-2">
+              <GhostButton onClick={goBack}>Back</GhostButton>
+              <PrimaryButton type="button" onClick={goNext}>Continue</PrimaryButton>
+            </div>
+          </>
         ) : null}
 
+        {step === 4 ? (
+          <>
         <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
           <legend className="px-1 font-display font-bold text-[var(--text)]">
             Attach documents from your wallet
@@ -3251,7 +4078,7 @@ function ApplyPage({
               <a href="#/wallet" className="font-semibold underline">
                 Add your documents to the wallet first
               </a>
-              . Your draft on this page is saved on this phone, so you will not
+              . Your draft is saved on this device, so you will not
               lose your work.
             </p>
           )}
@@ -3262,31 +4089,96 @@ function ApplyPage({
           <textarea id="ap-notes" {...FIELDS.submitApplication.notes} className={inputCls} rows={3} value={notes}
             onChange={(e) => setNotes(e.target.value)} />
         </div>
+            <div className="flex flex-wrap gap-2">
+              <GhostButton onClick={goBack}>Back</GhostButton>
+              <PrimaryButton type="button" onClick={goNext}>Continue</PrimaryButton>
+            </div>
+          </>
+        ) : null}
+
+        {step === 5 ? (
+          <>
+        <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+          <legend className="px-1 font-display font-bold text-[var(--text)]">
+            How fast do you need it?
+          </legend>
+          <div className="space-y-2">
+            {(
+              [
+                ["Standard", `Normal time: ${details.processingTime}. No extra fee.`],
+                ["Fast-track", `Moved ahead in the queue. Extra $${FAST_TRACK_FEE_USD}, shown here, no hidden fee.`],
+                ["Emergency", `Urgent cases, for example travel for medical care or a death in the family. Extra $${EMERGENCY_FEE_USD}, shown here, no hidden fee.`],
+              ] as const
+            ).map(([value, label]) => (
+              <label key={value} className="flex items-start gap-2 text-sm text-[var(--text)]">
+                <input
+                  type="radio"
+                  name="priority"
+                  aria-label={value}
+                  checked={priority === value}
+                  onChange={() => setPriority(value)}
+                  className="mt-1 h-4 w-4"
+                />
+                <span>
+                  <strong>{value}.</strong> {label}
+                </span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
 
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
           <h2 className="font-display font-bold text-[var(--text)]">What you will pay</h2>
           <dl className="mt-2 space-y-1 text-sm">
-            <div className="flex justify-between">
+            <div className="flex justify-between gap-3">
               <dt className="text-[var(--dim)]">{service.name} fee</dt>
-              <dd className="font-semibold text-[var(--text)]">${details.feeUsd}</dd>
+              <dd className="text-right font-semibold text-[var(--text)]">
+                ${details.feeUsd} USD
+                <span className="block text-xs font-normal text-[var(--dim)]">
+                  {details.feeUsd === 0
+                    ? "Free, nothing to pay"
+                    : `About L$${feeInLrd(details.feeUsd).toLocaleString()} LRD`}
+                </span>
+              </dd>
             </div>
             {priorityFee > 0 ? (
-              <div className="flex justify-between">
+              <div className="flex justify-between gap-3">
                 <dt className="text-[var(--dim)]">{priority} fee</dt>
-                <dd className="font-semibold text-[var(--text)]">${priorityFee}</dd>
+                <dd className="text-right font-semibold text-[var(--text)]">
+                  ${priorityFee} USD
+                  <span className="block text-xs font-normal text-[var(--dim)]">
+                    About L${feeInLrd(priorityFee).toLocaleString()} LRD
+                  </span>
+                </dd>
               </div>
             ) : null}
             {deliveryFee > 0 ? (
-              <div className="flex justify-between">
+              <div className="flex justify-between gap-3">
                 <dt className="text-[var(--dim)]">Embassy delivery fee</dt>
-                <dd className="font-semibold text-[var(--text)]">${deliveryFee}</dd>
+                <dd className="text-right font-semibold text-[var(--text)]">
+                  ${deliveryFee} USD
+                  <span className="block text-xs font-normal text-[var(--dim)]">
+                    About L${feeInLrd(deliveryFee).toLocaleString()} LRD
+                  </span>
+                </dd>
               </div>
             ) : null}
-            <div className="flex justify-between border-t border-[var(--border)] pt-2">
+            <div className="flex justify-between gap-3 border-t border-[var(--border)] pt-2">
               <dt className="font-bold text-[var(--text)]">Total</dt>
-              <dd className="font-bold text-[var(--text)]">${total}</dd>
+              <dd className="text-right font-bold text-[var(--text)]">
+                ${total} USD
+                <span className="block text-xs font-normal text-[var(--dim)]">
+                  {total === 0
+                    ? "Free, nothing to pay"
+                    : `About L$${feeInLrd(total).toLocaleString()} LRD`}
+                </span>
+              </dd>
             </div>
           </dl>
+          <p className="mt-2 text-xs text-[var(--dim)]">
+            Rate used: {USD_TO_LRD_RATE_LABEL}. The Liberian dollar amounts
+            are a guide at this rate.
+          </p>
           <p className="mt-2 text-sm text-[var(--dim)]">
             No hidden fee. After you submit, PortaGov gives you a billing
             number. You pay that billing number from any phone with MTN MoMo
@@ -3321,11 +4213,9 @@ function ApplyPage({
           </div>
         </div>
 
-        {error ? (
-          <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
-            {error}
-          </p>
-        ) : null}
+        <div className="flex flex-wrap gap-2">
+          <GhostButton onClick={goBack}>Back</GhostButton>
+        </div>
         <PrimaryButton type="submit" disabled={submit.isPending || !allGreen}>
           {submit.isPending
             ? "Submitting..."
@@ -3333,12 +4223,29 @@ function ApplyPage({
               ? "Submit to PortaGov"
               : "Submit is locked until the checklist is all green"}
         </PrimaryButton>
+        <div className="mt-3">
+          <GhostButton
+            onClick={() => {
+              saveDraftNow();
+              nav("#/applications");
+            }}
+          >
+            Save draft and finish later
+          </GhostButton>
+          <p className="mt-2 text-sm text-[var(--dim)]">
+            Your draft is kept on this device and listed under Drafts in My
+            applications, so you can come back and finish it here any time.
+            Finishing it on another device comes with the shared backend.
+          </p>
+        </div>
         <p className="text-sm text-[var(--dim)]">
           You get a tracking number and a billing number at once. PortaGov
           checks your documents, confirms your payment against the billing
           number, and only then releases your application to {m.name} and
           tells you it was submitted.
         </p>
+          </>
+        ) : null}
       </form>
     </div>
   );
@@ -3352,12 +4259,59 @@ function ApplicationsPage({ profile }: { profile: ProfileT }) {
     queryKey: ["applications", profile.id],
     queryFn: () => api.listApplications({ profileId: profile.id }),
   });
+  const [drafts, setDrafts] = useState<ApplicationDraft[]>(() =>
+    listApplicationDrafts(profile.id),
+  );
+  const discardDraft = (d: ApplicationDraft) => {
+    try {
+      storage.remove(draftKeyFor(d.serviceId, profile.id));
+    } catch {
+      /* Storage unavailable; the list still refreshes below. */
+    }
+    setDrafts(listApplicationDrafts(profile.id));
+  };
   return (
     <div className="mx-auto max-w-4xl px-4 py-8">
       <h1 className="font-display text-3xl font-extrabold text-[var(--text)]">My applications</h1>
       <p className="mt-1 text-[var(--dim)]">
         Every application you have sent to PortaGov, with its live status.
       </p>
+      {drafts.length > 0 ? (
+        <div className="mt-5">
+          <SectionTitle sub="Unfinished applications saved on this device. Pick one up where you left off. Drafts stay on this device until the shared backend lets you finish on any device.">
+            Drafts, finish later
+          </SectionTitle>
+          <div className="mt-3 space-y-3">
+            {drafts.map((d) => {
+              const s = serviceById(d.serviceId);
+              return (
+                <div
+                  key={d.serviceId}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4"
+                >
+                  <div>
+                    <p className="font-display font-bold text-[var(--text)]">
+                      Draft: {s?.name ?? d.serviceId}
+                    </p>
+                    <p className="text-sm text-[var(--dim)]">
+                      {d.savedAt ? `Last saved ${fmtDateTime(d.savedAt)}` : "Saved on this device"}
+                      {s ? `, ${ministryById(s.ministryId).name}` : ""}.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <PrimaryButton onClick={() => nav(`#/apply/${d.serviceId}`)}>
+                      Resume draft
+                    </PrimaryButton>
+                    <GhostButton onClick={() => discardDraft(d)}>
+                      Discard draft
+                    </GhostButton>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
       <div className="mt-5 space-y-3">
         {apps.isPending ? (
           <p className="text-[var(--dim)]">Loading your applications...</p>
@@ -3516,6 +4470,12 @@ function ApplicationDetailPage({
       <div className="mt-5 grid gap-5 md:grid-cols-2">
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
           <h2 className="font-display text-lg font-bold text-[var(--text)]">Progress</h2>
+          <p className="mt-2 text-sm text-[var(--text)]">
+            <Chip tone="gold">{applicationStatusPlain(app.status).short}</Chip>
+          </p>
+          <p className="mt-2 text-sm text-[var(--text)]">
+            Status: {app.status}. {applicationStatusPlain(app.status).meaning}
+          </p>
           <div className="mt-3">
             <TimelineWithDates applicationId={app.id} status={app.status} />
           </div>
@@ -3586,8 +4546,10 @@ function ApplicationDetailPage({
               <ul className="mt-3 space-y-2">
                 {myPayments.map((p: PaymentT) => (
                   <li key={p.id} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-                    <strong>{p.method}</strong>, ${p.amount}, ref {p.transaction_ref}, from{" "}
+                    <strong>{paymentMethodLabel(p)}</strong>, ${p.amount}, billing{" "}
+                    {p.billing_number}, ref {p.transaction_ref}, from{" "}
                     {p.payer_phone}. Status: {p.status}. Recorded {fmtDate(p.created_at)}.
+                    {p.status === "Confirmed" ? " Receipt saved in your wallet." : ""}
                   </li>
                 ))}
               </ul>
@@ -3657,8 +4619,11 @@ function ApplicationDetailPage({
             </p>
             {apptDone ? (
               <p className="mt-3 rounded-lg bg-[var(--surface-alt)] p-3 text-sm font-semibold text-[var(--text)]">
-                Appointment booked. Your ticket number is <strong>{ticket}</strong>. Bring it with you. See it under{" "}
-                <a href="#/appointments" className="underline">Appointments</a>.
+                Appointment booked. Your ticket number is <strong>{ticket}</strong>. Bring it with you. PortaGov
+                will remind you the day before, on {date ? fmtDate(dayBefore(date)) : "the day before your visit"},
+                and the reminder is saved under{" "}
+                <a href="#/appointments" className="underline">Appointments</a>. The SMS itself will be sent once
+                the SMS sender is live.
               </p>
             ) : (
               <form
@@ -3736,6 +4701,7 @@ function ApplicationDetailPage({
           </div>
         </div>
       </div>
+      <ApplicationActivity app={app} />
       <ApplicationExtras app={app} profile={profile} />
       <div className="mt-5 space-y-5">
         <FraudWarning billingNumber={app.billing_number} />
@@ -3781,52 +4747,625 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+type StagedDoc = {
+  file: File;
+  previewUrl: string | null;
+  dims: { w: number; h: number } | null;
+  /** Laplacian variance from measureSharpness, null when not measured yet. */
+  sharpness: number | null;
+  docNumber: string;
+  issuedOn: string;
+  expiresOn: string;
+  customTitle: string;
+};
+
+/* ---------- document viewer (wallet) ---------- */
+
+/** One document to show in the viewer: a saved wallet file, or a file
+    staged for saving. The size comes from the file itself when it is
+    known, or from the length of the stored data URL when it is not. */
+type ViewerDoc = {
+  title: string;
+  fileName: string;
+  contentType: string;
+  url: string;
+  sizeBytes: number | null;
+  detail?: string;
+};
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function dataUrlSize(url: string): number | null {
+  const marker = ";base64,";
+  const at = url.indexOf(marker);
+  if (!url.startsWith("data:") || at < 0) return null;
+  const b64 = url.slice(at + marker.length).replace(/\s/g, "");
+  if (!b64) return null;
+  const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
+}
+
+function viewerDocFromSaved(d: DocumentT): ViewerDoc {
+  return {
+    title: d.title || d.doc_type,
+    fileName: d.file_name,
+    contentType: d.content_type,
+    url: d.file_url,
+    sizeBytes: dataUrlSize(d.file_url),
+    detail: [
+      d.doc_number ? `Number ${d.doc_number}` : "",
+      d.expires_on ? `Expires ${d.expires_on}` : "",
+    ]
+      .filter(Boolean)
+      .join(", "),
+  };
+}
+
+/** Full screen viewer for one wallet document. Images show at their
+    actual uploaded size (100%), PDFs show in an embedded viewer, and
+    any other file shows its name, type and size with a download and an
+    open link, so no document is ever a dead click. Zoom in, zoom out,
+    reset to actual size, fit to screen, and close are all here. Close
+    works from the Close button, the Escape key, and tapping outside
+    the viewer. On a phone the toolbar wraps and the content scrolls,
+    so nothing overflows the screen. */
+function DocumentViewer({
+  doc,
+  onClose,
+}: {
+  doc: ViewerDoc | null;
+  onClose: () => void;
+}) {
+  const [zoom, setZoom] = useState(1);
+  const [fit, setFit] = useState(false);
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(
+    null,
+  );
+
+  useEffect(() => {
+    setZoom(1);
+    setFit(false);
+    setNatural(null);
+  }, [doc?.url]);
+
+  useEffect(() => {
+    if (!doc) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [doc, onClose]);
+
+  if (!doc) return null;
+
+  const isImage = doc.contentType.startsWith("image/");
+  const isPdf = doc.contentType === "application/pdf";
+  const canZoom = isImage || isPdf;
+  const zoomLabel = fit
+    ? "Fit to screen"
+    : `${Math.round(zoom * 100)}% of actual size`;
+  const zoomIn = () => {
+    setFit(false);
+    setZoom((z) => Math.min(4, Math.round(z * 1.25 * 100) / 100));
+  };
+  const zoomOut = () => {
+    setFit(false);
+    setZoom((z) => Math.max(0.25, Math.round((z / 1.25) * 100) / 100));
+  };
+  const resetZoom = () => {
+    setFit(false);
+    setZoom(1);
+  };
+  const fitToScreen = () => {
+    setFit(true);
+    setZoom(1);
+  };
+  const viewerBtn =
+    "min-h-[44px] rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-bold text-[var(--text)] disabled:opacity-50";
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Viewing ${doc.title}`}
+      className="fixed inset-0 z-50 flex flex-col bg-black/80 p-2 sm:p-4"
+      onClick={onClose}
+    >
+      <div
+        className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col overflow-hidden rounded-xl bg-[var(--surface)] shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-2 border-b border-[var(--border)] p-3">
+          <div className="min-w-0">
+            <p className="truncate font-display font-bold text-[var(--text)]">
+              {doc.title}
+            </p>
+            <p className="break-words text-sm text-[var(--dim)]">
+              {doc.fileName}
+              {doc.contentType ? `, ${doc.contentType}` : ""}
+              {doc.sizeBytes !== null
+                ? `, ${formatFileSize(doc.sizeBytes)}`
+                : ""}
+              {doc.detail ? `, ${doc.detail}` : ""}
+              {isImage && natural
+                ? `, ${natural.w} by ${natural.h} pixels`
+                : ""}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close the document viewer"
+            className="min-h-[44px] min-w-[44px] shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+          >
+            Close
+          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border)] bg-[var(--surface-alt)] p-2">
+          <button
+            type="button"
+            onClick={zoomOut}
+            disabled={!canZoom || zoom <= 0.25}
+            aria-label="Zoom out"
+            className={viewerBtn}
+          >
+            Zoom out
+          </button>
+          <span
+            className="min-w-[7rem] text-center text-sm font-bold text-[var(--text)]"
+            aria-live="polite"
+          >
+            {canZoom ? zoomLabel : "No zoom for this file type"}
+          </span>
+          <button
+            type="button"
+            onClick={zoomIn}
+            disabled={!canZoom || zoom >= 4}
+            aria-label="Zoom in"
+            className={viewerBtn}
+          >
+            Zoom in
+          </button>
+          <button
+            type="button"
+            onClick={resetZoom}
+            disabled={!canZoom}
+            aria-label="Reset to actual size, 100 percent"
+            className={viewerBtn}
+          >
+            Actual size (100%)
+          </button>
+          <button
+            type="button"
+            onClick={fitToScreen}
+            disabled={!canZoom}
+            aria-label="Fit to screen"
+            className={viewerBtn}
+          >
+            Fit to screen
+          </button>
+          <a
+            href={doc.url}
+            download={doc.fileName || undefined}
+            className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-bold text-[var(--text)]"
+          >
+            Download
+          </a>
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col overflow-auto bg-[var(--surface-alt)]">
+          {isImage ? (
+            <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto p-3">
+              <img
+                src={doc.url}
+                alt={doc.title}
+                onLoad={(e) => {
+                  const t = e.currentTarget;
+                  setNatural({
+                    w: t.naturalWidth,
+                    h: t.naturalHeight,
+                  });
+                }}
+                style={
+                  fit
+                    ? { maxWidth: "100%", maxHeight: "100%" }
+                    : natural
+                      ? {
+                          width: natural.w * zoom,
+                          height: "auto",
+                          maxWidth: "none",
+                        }
+                      : { width: "auto", maxWidth: "none" }
+                }
+                className="shrink-0 rounded-lg border border-[var(--border)] bg-white"
+              />
+            </div>
+          ) : isPdf ? (
+            <div className="min-h-0 flex-1 overflow-auto p-3">
+              <div
+                className="mx-auto"
+                style={
+                  fit
+                    ? { width: "100%", height: "62vh" }
+                    : { width: `${zoom * 100}%`, height: `${62 * zoom}vh` }
+                }
+              >
+                <iframe
+                  src={doc.url}
+                  title={doc.title}
+                  className="h-full w-full rounded-lg border border-[var(--border)] bg-white"
+                />
+              </div>
+              <p className="mt-2 text-center text-sm text-[var(--dim)]">
+                If the PDF does not show here, use Download above, or{" "}
+                <a
+                  href={doc.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-semibold underline"
+                >
+                  open it in a new tab
+                </a>
+                .
+              </p>
+            </div>
+          ) : (
+            <div className="m-auto max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-center">
+              <p className="font-display text-lg font-bold text-[var(--text)]">
+                {doc.fileName || doc.title}
+              </p>
+              <p className="mt-2 text-sm text-[var(--dim)]">
+                This file type cannot be shown inside PortaGov
+                {doc.contentType ? ` (${doc.contentType})` : ""}
+                {doc.sizeBytes !== null
+                  ? `, size ${formatFileSize(doc.sizeBytes)}`
+                  : ""}
+                . Download it or open it to see it.
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                <a
+                  href={doc.url}
+                  download={doc.fileName || undefined}
+                  className="inline-flex min-h-[44px] items-center rounded-lg bg-[var(--navy)] px-4 py-2 text-sm font-bold text-white"
+                  style={{ backgroundColor: "#0a2a5e" }}
+                >
+                  Download the file
+                </a>
+                <a
+                  href={doc.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+                >
+                  Open in a new tab
+                </a>
+              </div>
+            </div>
+          )}
+        </div>
+        <p className="border-t border-[var(--border)] p-2 text-center text-xs text-[var(--dim)]">
+          Tap outside the viewer, or press Escape, to close it.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function WalletDocRow({
+  docType,
+  saved,
+  staged,
+  onPick,
+  onUpdate,
+  onClear,
+  onRemove,
+  removing,
+  onView,
+}: {
+  docType: string;
+  saved: DocumentT | undefined;
+  staged: StagedDoc | undefined;
+  onPick: (docType: string, f: File | null) => void;
+  onUpdate: (docType: string, patch: Partial<StagedDoc>) => void;
+  onClear: (docType: string) => void;
+  onRemove: () => void;
+  removing: boolean;
+  onView: (doc: ViewerDoc) => void;
+}) {
+  const isPhoto = docType === "Passport photograph";
+  const savedViewer: ViewerDoc | null =
+    saved?.has_file && saved.file_url ? viewerDocFromSaved(saved) : null;
+  const stagedViewer: ViewerDoc | null = staged?.previewUrl
+    ? {
+        title: staged.file.name,
+        fileName: staged.file.name,
+        contentType: staged.file.type || "application/octet-stream",
+        url: staged.previewUrl,
+        sizeBytes: staged.file.size,
+      }
+    : null;
+  const photoTooSmall =
+    isPhoto &&
+    staged?.dims != null &&
+    (staged.dims.w < 600 || staged.dims.h < 600);
+  const stagedWarnings = staged ? checkStagedDoc(docType, staged) : [];
+  const inputId = `wallet-file-${docType.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          {savedViewer ? (
+            <button
+              type="button"
+              onClick={() => onView(savedViewer)}
+              aria-label={`View ${docType}`}
+              className="text-left font-display font-bold text-[var(--text)] underline decoration-dotted underline-offset-4"
+            >
+              {docType}
+            </button>
+          ) : (
+            <p className="font-display font-bold text-[var(--text)]">{docType}</p>
+          )}
+          {saved ? (
+            <p className="text-sm text-[var(--dim)]">
+              {saved.has_file
+                ? `Saved file: ${saved.file_name}`
+                : "Record only, no file uploaded yet."}
+              {saved.doc_number ? `, number ${saved.doc_number}` : ""}
+              {saved.expires_on ? `, expires ${saved.expires_on}` : ""}
+            </p>
+          ) : (
+            <p className="text-sm text-[var(--dim)]">Not added yet.</p>
+          )}
+        </div>
+        <Chip tone={saved ? "gold" : "plain"}>
+          {saved ? (saved.has_file ? "Saved" : "Record only") : "Missing"}
+        </Chip>
+      </div>
+      {savedViewer && savedViewer.contentType.startsWith("image/") ? (
+        <button
+          type="button"
+          onClick={() => onView(savedViewer)}
+          aria-label={`View ${docType}`}
+          className="mt-3 block rounded-lg"
+        >
+          <img
+            src={savedViewer.url}
+            alt={savedViewer.title}
+            className="max-h-40 w-auto rounded-lg border border-[var(--border)]"
+          />
+        </button>
+      ) : savedViewer ? (
+        <p className="mt-2 text-sm text-[var(--dim)]">
+          Tap View below to open this document.
+        </p>
+      ) : null}
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {savedViewer ? (
+          <button
+            type="button"
+            onClick={() => onView(savedViewer)}
+            className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+          >
+            View
+          </button>
+        ) : null}
+        <label
+          htmlFor={inputId}
+          className="cursor-pointer rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+        >
+          {saved ? "Update file" : "Upload file"}
+        </label>
+        <input
+          id={inputId}
+          type="file"
+          accept="image/*,application/pdf"
+          className="hidden"
+          aria-label={`${saved ? "Update" : "Upload"} ${docType}`}
+          onChange={(e) => {
+            onPick(docType, e.target.files?.[0] ?? null);
+            e.target.value = "";
+          }}
+        />
+        {saved ? (
+          <GhostButton onClick={onRemove} disabled={removing}>
+            Remove
+          </GhostButton>
+        ) : null}
+        {isPhoto ? (
+          <a href="#photo-fix" className="text-sm font-semibold underline">
+            Crop and fix a photo below
+          </a>
+        ) : null}
+      </div>
+      {staged ? (
+        <div className="mt-3 space-y-2 rounded-lg bg-[var(--surface-alt)] p-3">
+          <p className="text-sm text-[var(--text)]">
+            <strong>Ready to save:</strong> {staged.file.name}
+          </p>
+          {stagedViewer && staged.file.type.startsWith("image/") ? (
+            <button
+              type="button"
+              onClick={() => onView(stagedViewer)}
+              aria-label={`View ${staged.file.name}`}
+              className="block rounded-lg"
+            >
+              <img
+                src={stagedViewer.url}
+                alt={`Preview of ${staged.file.name}`}
+                className="max-h-40 w-auto rounded-lg border border-[var(--border)]"
+              />
+            </button>
+          ) : stagedViewer ? (
+            <p className="text-sm text-[var(--dim)]">
+              {staged.file.name} is ready to view. Tap View below to open it.
+            </p>
+          ) : null}
+          {stagedViewer ? (
+            <button
+              type="button"
+              onClick={() => onView(stagedViewer)}
+              className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+            >
+              View
+            </button>
+          ) : null}
+          {isPhoto && staged.dims ? (
+            <p className="text-sm text-[var(--text)]">
+              Photograph size: {staged.dims.w} by {staged.dims.h} pixels.
+              {photoTooSmall ? (
+                <strong className="text-[var(--warn)]">
+                  {" "}
+                  Warning: this looks low quality or blurry for a passport
+                  photograph. Use a sharper, full quality photo, because this
+                  is the photo printed in your passport.
+                </strong>
+              ) : (
+                " That is a good size for a passport photograph."
+              )}
+            </p>
+          ) : null}
+          {stagedWarnings.length > 0 ? (
+            <div role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3">
+              <p className="text-sm font-bold text-[var(--warn)]">
+                Check this file before you save it
+              </p>
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-[var(--text)]">
+                {stagedWarnings.map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+              <p className="mt-2 text-sm text-[var(--text)]">
+                You can replace the file with a better one, or save it anyway
+                from the Save button below. Saving a blurry photo or the wrong
+                document can delay your application.
+              </p>
+              <button
+                type="button"
+                onClick={() => onClear(docType)}
+                className="mt-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+              >
+                Replace this file
+              </button>
+            </div>
+          ) : null}
+          {docType === "Other document" ? (
+            <div>
+              <FieldLabel htmlFor={`${inputId}-title`}>Name for this document</FieldLabel>
+              <input
+                id={`${inputId}-title`}
+                {...FIELDS.addDocument.title}
+                className={inputCls}
+                value={staged.customTitle}
+                onChange={(e) => onUpdate(docType, { customTitle: e.target.value })}
+                placeholder="My document"
+              />
+            </div>
+          ) : null}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <FieldLabel htmlFor={`${inputId}-number`}>Document number, if it has one</FieldLabel>
+              <input
+                id={`${inputId}-number`}
+                {...FIELDS.addDocument.docNumber}
+                className={inputCls}
+                value={staged.docNumber}
+                onChange={(e) => onUpdate(docType, { docNumber: e.target.value })}
+              />
+            </div>
+            <div>
+              <FieldLabel htmlFor={`${inputId}-issued`}>Issued on</FieldLabel>
+              <input
+                id={`${inputId}-issued`}
+                {...FIELDS.addDocument.issuedOn}
+                type="date"
+                className={inputCls}
+                value={staged.issuedOn}
+                onChange={(e) => onUpdate(docType, { issuedOn: e.target.value })}
+              />
+            </div>
+            <div>
+              <FieldLabel htmlFor={`${inputId}-expires`}>Expires on</FieldLabel>
+              <input
+                id={`${inputId}-expires`}
+                {...FIELDS.addDocument.expiresOn}
+                type="date"
+                className={inputCls}
+                value={staged.expiresOn}
+                onChange={(e) => onUpdate(docType, { expiresOn: e.target.value })}
+              />
+            </div>
+          </div>
+          <button
+            type="button"
+            className="text-sm font-semibold underline"
+            onClick={() => onClear(docType)}
+          >
+            Remove this file, do not save it
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function WalletPage({ profile }: { profile: ProfileT }) {
   const queryClient = useQueryClient();
   const docs = useQuery({
     queryKey: ["documents", profile.id],
     queryFn: () => api.listDocuments({ profileId: profile.id }),
   });
-  const [docType, setDocType] = useState(DOC_TYPES[0] ?? "Other document");
-  const [title, setTitle] = useState("");
-  const [docNumber, setDocNumber] = useState("");
-  const [issuedOn, setIssuedOn] = useState("");
-  const [expiresOn, setExpiresOn] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  const [photoDims, setPhotoDims] = useState<{ w: number; h: number } | null>(null);
+  const [staged, setStaged] = useState<Record<string, StagedDoc>>({});
   const [error, setError] = useState("");
+  const [savedMsg, setSavedMsg] = useState("");
+  const [viewing, setViewing] = useState<ViewerDoc | null>(null);
+  const [warnShown, setWarnShown] = useState(false);
+  const [warnAcked, setWarnAcked] = useState("");
 
-  const add = useMutation({
-    mutationFn: async () => {
-      const payload: Parameters<typeof api.addDocument>[0] = {
-        profileId: profile.id,
-        docType,
-        title: title.trim(),
-        docNumber,
-        issuedOn,
-        expiresOn,
-      };
-      if (file) {
-        payload.file = {
-          dataBase64: await fileToBase64(file),
-          fileName: file.name,
-          contentType: file.type || "application/octet-stream",
-        };
-      }
-      return await api.addDocument(payload);
-    },
-    onSuccess: () => {
-      setTitle("");
-      setDocNumber("");
-      setIssuedOn("");
-      setExpiresOn("");
-      setFile(null);
-      setPhotoDims(null);
-      void queryClient.invalidateQueries({ queryKey: ["documents"] });
-    },
-    onError: (e) =>
-      setError(e instanceof Error ? e.message : "Document could not be saved."),
+  const liveDocs = (docs.data?.documents ?? []).filter(
+    (d: DocumentT) => d.status !== "Superseded",
+  );
+  /* Receipts in the wallet: every confirmed payment, with its billing
+     number, amount, date, service and method, downloadable here. */
+  const walletPayments = useQuery({
+    queryKey: ["payments"],
+    queryFn: () => api.listPayments({ limit: 100 }),
   });
+  const walletApps = useQuery({
+    queryKey: ["applications", profile.id],
+    queryFn: () => api.listApplications({ profileId: profile.id }),
+  });
+  const myWalletAppIds = new Set(
+    (walletApps.data?.applications ?? []).map((a: ApplicationT) => a.id),
+  );
+  const myWalletPayments = (walletPayments.data?.payments ?? []).filter(
+    (p: PaymentT) => myWalletAppIds.has(p.application_id),
+  );
+  const savedByType = new Map<string, DocumentT>();
+  for (const d of liveDocs) {
+    if (!savedByType.has(d.doc_type)) savedByType.set(d.doc_type, d);
+  }
+  const otherDocs = liveDocs.filter(
+    (d: DocumentT) => !DOC_TYPES.includes(d.doc_type),
+  );
+  const savedCount = DOC_TYPES.filter((t) => savedByType.has(t)).length;
+  const stagedCount = Object.keys(staged).length;
+  const warnedDocs = Object.entries(staged).flatMap(([docType, s]) =>
+    checkStagedDoc(docType, s).map((warning) => ({ docType, warning })),
+  );
+  const warnKey = warnedDocs
+    .map((d) => `${d.docType}: ${d.warning}`)
+    .join(" | ");
+  const needsAck = warnedDocs.length > 0 && warnAcked !== warnKey;
 
   const remove = useMutation({
     mutationFn: async (docId: number) => await api.deleteDocument({ id: docId }),
@@ -3836,183 +5375,323 @@ function WalletPage({ profile }: { profile: ProfileT }) {
       setError(e instanceof Error ? e.message : "Document could not be removed."),
   });
 
-  const onPickFile = (f: File | null) => {
-    setFile(f);
-    setPhotoDims(null);
+  const saveAll = useMutation({
+    mutationFn: async () => {
+      const entries = Object.entries(staged);
+      let saved = 0;
+      for (const [docType, s] of entries) {
+        if (docType === "Other document" && s.customTitle.trim().length < 2) {
+          throw new Error(
+            "Give the other document a name of at least 2 letters before saving.",
+          );
+        }
+        const existing = savedByType.get(docType);
+        const payload: Parameters<typeof api.addDocument>[0] = {
+          profileId: profile.id,
+          docType,
+          title:
+            docType === "Other document"
+              ? s.customTitle.trim()
+              : docType,
+          docNumber: s.docNumber,
+          issuedOn: s.issuedOn,
+          expiresOn: s.expiresOn,
+          file: {
+            dataBase64: await fileToBase64(s.file),
+            fileName: s.file.name,
+            contentType: s.file.type || "application/octet-stream",
+          },
+          replacesDocumentId: existing ? existing.id : 0,
+        };
+        await api.addDocument(payload);
+        saved += 1;
+      }
+      return saved;
+    },
+    onSuccess: (n) => {
+      setStaged((prev) => {
+        for (const s of Object.values(prev)) {
+          if (s.previewUrl) URL.revokeObjectURL(s.previewUrl);
+        }
+        return {};
+      });
+      setSavedMsg(
+        `Saved ${n} document${n === 1 ? "" : "s"} to your wallet.`,
+      );
+      setError("");
+      void queryClient.invalidateQueries({ queryKey: ["documents"] });
+    },
+    onError: (e) =>
+      setError(e instanceof Error ? e.message : "Documents could not be saved."),
+  });
+
+  const onPickFile = (docType: string, f: File | null) => {
+    setSavedMsg("");
+    setError("");
+    setStaged((prev) => {
+      const next = { ...prev };
+      const old = next[docType];
+      if (old?.previewUrl) URL.revokeObjectURL(old.previewUrl);
+      delete next[docType];
+      if (!f) return next;
+      const entry: StagedDoc = {
+        file: f,
+        previewUrl:
+          f.type.startsWith("image/") || f.type === "application/pdf"
+            ? URL.createObjectURL(f)
+            : null,
+        dims: null,
+        sharpness: null,
+        docNumber: "",
+        issuedOn: "",
+        expiresOn: "",
+        customTitle: "",
+      };
+      next[docType] = entry;
+      return next;
+    });
     if (f && f.type.startsWith("image/")) {
       const url = URL.createObjectURL(f);
       const img = new Image();
       img.onload = () => {
-        setPhotoDims({ w: img.naturalWidth, h: img.naturalHeight });
+        setStaged((prev) => {
+          const cur = prev[docType];
+          if (!cur || cur.file !== f) return prev;
+          return {
+            ...prev,
+            [docType]: {
+              ...cur,
+              dims: { w: img.naturalWidth, h: img.naturalHeight },
+            },
+          };
+        });
         URL.revokeObjectURL(url);
+        void measureSharpness(f).then((score) => {
+          setStaged((prev) => {
+            const cur = prev[docType];
+            if (!cur || cur.file !== f) return prev;
+            return { ...prev, [docType]: { ...cur, sharpness: score } };
+          });
+        });
       };
       img.src = url;
     }
   };
 
-  const isPhoto = docType === "Passport photograph";
-  const photoTooSmall =
-    isPhoto && photoDims !== null && (photoDims.w < 600 || photoDims.h < 600);
+  const updateStaged = (docType: string, patch: Partial<StagedDoc>) => {
+    setStaged((prev) => {
+      const cur = prev[docType];
+      if (!cur) return prev;
+      return { ...prev, [docType]: { ...cur, ...patch } };
+    });
+  };
+
+  const clearStaged = (docType: string) => {
+    setStaged((prev) => {
+      const next = { ...prev };
+      const old = next[docType];
+      if (old?.previewUrl) URL.revokeObjectURL(old.previewUrl);
+      delete next[docType];
+      return next;
+    });
+  };
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8">
+      <DocumentViewer doc={viewing} onClose={() => setViewing(null)} />
       <h1 className="font-display text-3xl font-extrabold text-[var(--text)]">Document wallet</h1>
       <p className="mt-1 max-w-2xl text-[var(--dim)]">
         One wallet for every document. Upload once, at full quality, and reuse
         the same documents across every ministry and agency on PortaGov.
       </p>
-
-      <div className="mt-5 grid gap-5 lg:grid-cols-[1fr_360px]">
-        <div className="space-y-3">
-          {docs.isPending ? (
-            <p className="text-[var(--dim)]">Loading your wallet...</p>
-          ) : docs.data && docs.data.documents.length > 0 ? (
-            docs.data.documents.map((d: DocumentT) => (
-              <div key={d.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <p className="font-display font-bold text-[var(--text)]">{d.title}</p>
-                    <p className="text-sm text-[var(--dim)]">
-                      {d.doc_type}
-                      {d.doc_number ? `, number ${d.doc_number}` : ""}
-                      {d.issued_on ? `, issued ${d.issued_on}` : ""}
-                      {d.expires_on ? `, expires ${d.expires_on}` : ""}
-                    </p>
-                    <p className="text-sm text-[var(--dim)]">
-                      {d.has_file
-                        ? `File saved: ${d.file_name}`
-                        : "Record only, no file uploaded yet."}
-                    </p>
-                  </div>
-                  <GhostButton
-                    onClick={() => remove.mutate(d.id)}
-                    disabled={remove.isPending}
-                  >
-                    Remove
-                  </GhostButton>
-                </div>
-                {d.has_file && d.content_type === "application/pdf" ? (
-                  <div className="mt-3">
-                    <PdfViewer src={d.file_url} ariaLabel={`Preview of ${d.title}`} />
-                  </div>
-                ) : d.has_file && d.content_type.startsWith("image/") ? (
-                  <img
-                    src={d.file_url}
-                    alt={d.title}
-                    className="mt-3 max-h-64 w-auto rounded-lg border border-[var(--border)]"
-                  />
-                ) : d.has_file ? (
-                  <a
-                    href={d.file_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-2 inline-block text-sm font-semibold underline"
-                  >
-                    Open the saved file
-                  </a>
-                ) : null}
-              </div>
-            ))
-          ) : (
-            <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 text-center">
-              <p className="font-display text-lg font-bold text-[var(--text)]">Your wallet is empty</p>
-              <p className="mx-auto mt-1 max-w-md text-sm text-[var(--dim)]">
-                Add your birth certificate, ID, passport photograph and other
-                documents once. They stay here, saved to your profile, ready
-                for every application.
-              </p>
-            </div>
-          )}
-        </div>
-
-        <form
-          className="h-fit rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
-          onSubmit={(e: FormEvent) => {
-            e.preventDefault();
-            setError("");
-            if (title.trim().length < 2) {
-              setError("Give the document a name, for example My birth certificate.");
-              return;
-            }
-            add.mutate();
-          }}
-        >
-          <h2 className="font-display text-lg font-bold text-[var(--text)]">Add a document</h2>
+      <p className="mt-2 max-w-2xl text-[var(--dim)]">
+        Add your documents one by one below. Choose a file for each one, then
+        press Save all documents once and they are all saved. Files are stored
+        exactly as you upload them, never compressed by PortaGov.
+      </p>
+      {docs.isPending ? (
+        <p className="mt-5 text-[var(--dim)]">Loading your wallet...</p>
+      ) : (
+        <>
+          <p className="mt-5 font-display text-lg font-bold text-[var(--text)]" role="status">
+            {savedCount} of {DOC_TYPES.length} documents saved
+            {savedCount < DOC_TYPES.length
+              ? `, ${DOC_TYPES.length - savedCount} still missing`
+              : ""}
+          </p>
           <div className="mt-3 space-y-3">
-            <div>
-              <FieldLabel htmlFor="doc-type">Document type</FieldLabel>
-              <select id="doc-type" {...FIELDS.addDocument.docType} className={inputCls} value={docType}
-                onChange={(e) => setDocType(e.target.value)}>
-                {DOC_TYPES.map((t) => (
-                  <option key={t} value={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <FieldLabel htmlFor="doc-title">Name for this document</FieldLabel>
-              <input id="doc-title" {...FIELDS.addDocument.title} className={inputCls} value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="My birth certificate" />
-            </div>
-            <div>
-              <FieldLabel htmlFor="doc-number">Document number, if it has one</FieldLabel>
-              <input id="doc-number" {...FIELDS.addDocument.docNumber} className={inputCls} value={docNumber}
-                onChange={(e) => setDocNumber(e.target.value)} />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <FieldLabel htmlFor="doc-issued">Issued on</FieldLabel>
-                <input id="doc-issued" {...FIELDS.addDocument.issuedOn} type="date" className={inputCls} value={issuedOn}
-                  onChange={(e) => setIssuedOn(e.target.value)} />
-              </div>
-              <div>
-                <FieldLabel htmlFor="doc-expires">Expires on</FieldLabel>
-                <input id="doc-expires" {...FIELDS.addDocument.expiresOn} type="date" className={inputCls} value={expiresOn}
-                  onChange={(e) => setExpiresOn(e.target.value)} />
-              </div>
-            </div>
-            <div>
-              <FieldLabel htmlFor="doc-file">Upload the file (optional)</FieldLabel>
-              <input
-                id="doc-file"
-                type="file"
-                accept="image/*,application/pdf"
-                className="w-full text-sm text-[var(--dim)]"
-                onChange={(e) => onPickFile(e.target.files?.[0] ?? null)}
+            {DOC_TYPES.map((t) => (
+              <WalletDocRow
+                key={t}
+                docType={t}
+                saved={savedByType.get(t)}
+                staged={staged[t]}
+                onPick={onPickFile}
+                onUpdate={updateStaged}
+                onClear={clearStaged}
+                onRemove={() => {
+                  const s = savedByType.get(t);
+                  if (s) remove.mutate(s.id);
+                }}
+                removing={remove.isPending}
+                onView={setViewing}
               />
-              <p className="mt-1 text-xs text-[var(--dim)]">
-                Files are stored exactly as you upload them, never compressed by
-                PortaGov.
-              </p>
+            ))}
+          </div>
+          {otherDocs.length > 0 ? (
+            <div className="mt-5">
+              <h2 className="font-display text-lg font-bold text-[var(--text)]">
+                Other saved documents
+              </h2>
+              <div className="mt-3 space-y-3">
+                {otherDocs.map((d: DocumentT) => {
+                  const otherViewer: ViewerDoc | null =
+                    d.has_file && d.file_url ? viewerDocFromSaved(d) : null;
+                  return (
+                    <div
+                      key={d.id}
+                      className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          {otherViewer ? (
+                            <button
+                              type="button"
+                              onClick={() => setViewing(otherViewer)}
+                              aria-label={`View ${d.title}`}
+                              className="text-left font-display font-bold text-[var(--text)] underline decoration-dotted underline-offset-4"
+                            >
+                              {d.title}
+                            </button>
+                          ) : (
+                            <p className="font-display font-bold text-[var(--text)]">
+                              {d.title}
+                            </p>
+                          )}
+                          <p className="text-sm text-[var(--dim)]">
+                            {d.doc_type}
+                            {d.has_file ? `, file saved: ${d.file_name}` : ", record only, no file uploaded yet."}
+                          </p>
+                        </div>
+                        <Chip tone="gold">Saved</Chip>
+                      </div>
+                      {otherViewer && d.content_type.startsWith("image/") ? (
+                        <button
+                          type="button"
+                          onClick={() => setViewing(otherViewer)}
+                          aria-label={`View ${d.title}`}
+                          className="mt-3 block rounded-lg"
+                        >
+                          <img
+                            src={d.file_url}
+                            alt={d.title}
+                            className="max-h-40 w-auto rounded-lg border border-[var(--border)]"
+                          />
+                        </button>
+                      ) : otherViewer ? (
+                        <p className="mt-2 text-sm text-[var(--dim)]">
+                          Tap View below to open this document.
+                        </p>
+                      ) : null}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {otherViewer ? (
+                          <button
+                            type="button"
+                            onClick={() => setViewing(otherViewer)}
+                            className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+                          >
+                            View
+                          </button>
+                        ) : null}
+                        <GhostButton
+                          onClick={() => remove.mutate(d.id)}
+                          disabled={remove.isPending}
+                        >
+                          Remove
+                        </GhostButton>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-            {isPhoto && photoDims ? (
-              <p className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-                Photograph size: {photoDims.w} by {photoDims.h} pixels.
-                {photoTooSmall ? (
-                  <strong className="text-[var(--warn)]">
-                    {" "}
-                    Warning: this looks low quality or blurry for a passport
-                    photograph. Use a sharper, full quality photo, because this
-                    is the photo printed in your passport.
-                  </strong>
-                ) : (
-                  " That is a good size for a passport photograph."
-                )}
-              </p>
-            ) : null}
+          ) : null}
+          <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
             {error ? (
-              <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+              <p role="alert" className="mb-3 rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
                 {error}
               </p>
             ) : null}
-            <PrimaryButton type="submit" disabled={add.isPending}>
-              {add.isPending ? "Saving..." : "Save to wallet"}
+            {savedMsg ? (
+              <p role="status" className="mb-3 text-sm font-semibold text-[var(--text)]">
+                {savedMsg}
+              </p>
+            ) : null}
+            {warnedDocs.length > 0 && warnShown ? (
+              <div role="alert" className="mb-3 rounded-lg bg-[var(--gold-soft)] p-3">
+                <p className="text-sm font-bold text-[var(--warn)]">
+                  Check these files before you save
+                </p>
+                <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-[var(--text)]">
+                  {warnedDocs.map((d) => (
+                    <li key={`${d.docType}: ${d.warning}`}>
+                      <strong>{d.docType}:</strong> {d.warning}
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-2 text-sm text-[var(--text)]">
+                  Replace a file above with a better one, or save anyway if
+                  you are sure this is the right file. A blurry photo or the
+                  wrong document can delay your application.
+                </p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <PrimaryButton
+                    type="button"
+                    onClick={() => {
+                      setWarnAcked(warnKey);
+                      setWarnShown(false);
+                      saveAll.mutate();
+                    }}
+                    disabled={saveAll.isPending}
+                  >
+                    Save anyway
+                  </PrimaryButton>
+                  <GhostButton onClick={() => setWarnShown(false)}>
+                    Go back and replace a file
+                  </GhostButton>
+                </div>
+              </div>
+            ) : null}
+            <PrimaryButton
+              type="button"
+              onClick={() => {
+                if (needsAck) {
+                  setWarnShown(true);
+                  return;
+                }
+                saveAll.mutate();
+              }}
+              disabled={saveAll.isPending || stagedCount === 0}
+            >
+              {saveAll.isPending
+                ? "Saving..."
+                : stagedCount > 0
+                  ? `Save all documents (${stagedCount})`
+                  : "Save all documents"}
             </PrimaryButton>
+            <p className="mt-2 text-sm text-[var(--dim)]">
+              {stagedCount > 0
+                ? `${stagedCount} document${stagedCount === 1 ? "" : "s"} ready to save. Nothing is saved until you press this button.`
+                : "Choose a file above to get started. Saved documents stay in your wallet until you remove them."}
+            </p>
           </div>
-        </form>
-      </div>
+        </>
+      )}
 
       <div className="mt-6 space-y-5">
+        {myWalletPayments.length > 0 ? (
+          <ReceiptDownloads payments={myWalletPayments} />
+        ) : null}
         <ExpiryReminders profile={profile} />
         <ExpiryWalletList profile={profile} />
         <PhotoFixTool profile={profile} />
@@ -4031,6 +5710,20 @@ function AppointmentsPage({ profile }: { profile: ProfileT }) {
     queryKey: ["appointments", profile.id],
     queryFn: () => api.listAppointments({ profileId: profile.id }),
   });
+  const apps = useQuery({
+    queryKey: ["applications", profile.id],
+    queryFn: () => api.listApplications({ profileId: profile.id }),
+  });
+  /* The service an appointment is for, from the application it was
+     booked from, so the reminder lists that service's real
+     requirements. */
+  const serviceFor = (a: AppointmentT) => {
+    const app = (apps.data?.applications ?? []).find(
+      (x: ApplicationT) =>
+        a.application_ref !== "" && x.reference === a.application_ref,
+    );
+    return app ? serviceById(app.service_id) : undefined;
+  };
   const setStatus = useMutation({
     mutationFn: async (args: { id: number; status: "Attended" | "Missed" | "Cancelled" | "Booked" }) =>
       await api.updateAppointmentStatus(args),
@@ -4066,18 +5759,12 @@ function AppointmentsPage({ profile }: { profile: ProfileT }) {
                       For application {a.application_ref}
                     </p>
                   ) : null}
-                  {a.status === "Booked" ? (
-                    <p className="mt-1 text-sm text-[var(--dim)]">
-                      PortaGov reminds you the day before, and again on the
-                      morning of your visit, by SMS and WhatsApp.
-                    </p>
-                  ) : null}
                 </div>
                 <Chip tone={a.status === "Booked" ? "gold" : "plain"}>{a.status}</Chip>
               </div>
               {a.status === "Booked" ? (
                 <div className="mt-3">
-                  <BringList appt={a} />
+                  <DayBeforeReminder appt={a} service={serviceFor(a)} />
                 </div>
               ) : null}
               {a.status === "Booked" ? (
@@ -4096,9 +5783,25 @@ function AppointmentsPage({ profile }: { profile: ProfileT }) {
           <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 text-center">
             <p className="font-display text-lg font-bold text-[var(--text)]">No appointments yet</p>
             <p className="mx-auto mt-1 max-w-md text-sm text-[var(--dim)]">
-              When a service needs you in person, you book the visit from that
-              application's page, at a time you choose.
+              You have no appointments booked yet. That is normal if you have
+              not booked one. When a service needs you in person, you book
+              the visit from that application&apos;s page, at a time you choose.
             </p>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <a
+                href="#/applications"
+                className="rounded-lg px-5 py-2.5 font-semibold text-white"
+                style={{ backgroundColor: "#0a2a5e" }}
+              >
+                Book a visit from an application
+              </a>
+              <a
+                href="#/"
+                className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] px-5 py-2.5 font-semibold text-[var(--text)]"
+              >
+                Browse services
+              </a>
+            </div>
           </div>
         )}
       </div>
@@ -4155,10 +5858,10 @@ function PaymentsPage({ profile }: { profile: ProfileT }) {
               className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 text-left"
             >
               <p className="font-display font-bold text-[var(--text)]">
-                {p.method}, application {p.application_ref}
+                {paymentMethodLabel(p)}, ${p.amount}, application {p.application_ref}
               </p>
               <p className="text-sm text-[var(--dim)]">
-                Transaction {p.transaction_ref}, paid from {p.payer_phone},{" "}
+                {p.service_name}, billing {p.billing_number}. Transaction {p.transaction_ref}, paid from {p.payer_phone},{" "}
                 {fmtDate(p.created_at)}. Status: {p.status}.
               </p>
             </button>
@@ -4408,8 +6111,11 @@ function TrackPage({ profile }: { profile: ProfileT | null }) {
                 {app.institution}, reference {app.reference}, submitted {fmtDate(app.created_at)}
               </p>
             </div>
-            <Chip tone="gold">{app.status}</Chip>
+            <Chip tone="gold">{applicationStatusPlain(app.status).short}</Chip>
           </div>
+          <p className="mt-2 text-sm text-[var(--dim)]">
+            Status: {app.status}. {applicationStatusPlain(app.status).meaning}
+          </p>
           <p className="mt-2 text-sm text-[var(--dim)]">
             {app.released
               ? "PortaGov has released this application to the institution."
@@ -4505,7 +6211,7 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
               : ""}
           </p>
         </div>
-        <Chip tone="gold">{app.status}</Chip>
+        <Chip tone="gold">{applicationStatusPlain(app.status).short}</Chip>
       </div>
       {details.length > 0 ? (
         <p className="mt-2 text-sm text-[var(--dim)]">
@@ -4605,6 +6311,12 @@ function InstitutionPage() {
             onChange={(e) => setSearch(e.target.value)} placeholder="PG-2026-00001" />
         </div>
       </div>
+      {ministry !== "All institutions" ? (
+        <div className="mt-5 space-y-5">
+          <OfficerWorkList institution={ministry} />
+          <InstitutionDailySummary institution={ministry} />
+        </div>
+      ) : null}
       <div className="mt-5 space-y-3">
         {apps.isPending ? (
           <p className="text-[var(--dim)]">Loading released applications...</p>
@@ -4698,7 +6410,7 @@ function PlatformRow({ app }: { app: ApplicationT }) {
               })()}
             </Chip>
           ) : null}
-          <Chip>{app.status}</Chip>
+          <Chip>{applicationStatusPlain(app.status).short}</Chip>
         </div>
       </div>
       <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
@@ -5323,6 +7035,10 @@ export function App() {
   const [profile, setProfile] = useState<ProfileT | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [afterSignIn, setAfterSignIn] = useState("#/account");
+  /* Alert shown on screen after a sign-in, for example when the sign-in
+     came from a new device. It stays until the person closes it, so it
+     is never lost by moving to the next page. */
+  const [securityAlert, setSecurityAlert] = useState("");
 
   useEffect(() => {
     const phone = storage.get("portagov-phone");
@@ -5331,10 +7047,15 @@ export function App() {
       return;
     }
     let live = true;
+    /* A saved session is only restored when it is still valid on this
+       device. After sign out everywhere, this device must sign in
+       again like every other device. */
     api
-      .findProfileByPhone({ phone })
+      .checkCitizenSession({ phone, deviceId: deviceInfo().deviceId })
       .then((r) => {
-        if (live && r.profile) setProfile(r.profile);
+        if (!live) return;
+        if (r.valid && r.profile) setProfile(r.profile);
+        else storage.remove("portagov-phone");
       })
       .catch(() => undefined)
       .finally(() => {
@@ -5345,9 +7066,10 @@ export function App() {
     };
   }, []);
 
-  const onSignedIn = (p: ProfileT) => {
+  const onSignedIn = (p: ProfileT, alert?: string) => {
     setProfile(p);
     storage.set("portagov-phone", p.phone);
+    if (alert) setSecurityAlert(alert);
   };
   const onProfileChange = (p: ProfileT) => {
     setProfile(p);
@@ -5355,8 +7077,24 @@ export function App() {
   };
   const signOut = () => {
     setProfile(null);
+    setSecurityAlert("");
     storage.remove("portagov-phone");
     nav("#/");
+  };
+  /* Sign out everywhere, in one tap: the account record marks every
+     device signed out, then this device signs out too. Today the data
+     lives on this device only, so this signs out this device and the
+     sessions recorded here; on the shared backend the same record
+     signs out every device at once. */
+  const signOutEverywhere = async () => {
+    if (profile) {
+      try {
+        await api.signOutAll({ profileId: profile.id });
+      } catch {
+        /* The local sign-out below still runs. */
+      }
+    }
+    signOut();
   };
 
   const goApply = (service: Service) => {
@@ -5408,6 +7146,28 @@ export function App() {
   });
   const [accessOpen, setAccessOpen] = useState(false);
   const accessRef = useRef<HTMLDivElement | null>(null);
+  const [avatarOpen, setAvatarOpen] = useState(false);
+  const avatarRef = useRef<HTMLDivElement | null>(null);
+  /* Close the profile avatar menu when the person taps or clicks
+     anywhere outside it, or presses Escape, the same way the
+     Accessibility dropdown closes. */
+  useEffect(() => {
+    if (!avatarOpen) return;
+    const onPointerDown = (e: MouseEvent | TouchEvent) => {
+      if (avatarRef.current && !avatarRef.current.contains(e.target as Node)) setAvatarOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setAvatarOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("touchstart", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("touchstart", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [avatarOpen]);
   /* Close the Accessibility dropdown when the person taps or clicks
      anywhere outside it, or presses Escape, so it never stays open
      after they have moved on. */
@@ -5479,7 +7239,6 @@ export function App() {
             </h1>
             <div className="mt-4 flex flex-wrap justify-center gap-3">
               <PrimaryButton onClick={() => nav("#/account")}>Go to my account</PrimaryButton>
-              <GhostButton onClick={signOut}>Sign out</GhostButton>
             </div>
           </div>
         ) : (
@@ -5491,7 +7250,7 @@ export function App() {
           <AccountPage
             profile={profile}
             onProfileChange={onProfileChange}
-            onSignOut={signOut}
+            onSignOutEverywhere={() => void signOutEverywhere()}
           />
         ) : null;
         break;
@@ -5764,16 +7523,70 @@ export function App() {
                 </div>
               ) : null}
             </div>
+            {portal === "citizen" ? (
+              <PageHelpButton route={route} profile={profile} />
+            ) : null}
             {profile ? (
-              <>
-                <a
-                  href="#/account"
-                  className="hidden max-w-[160px] truncate text-sm font-bold text-[var(--text)] sm:block"
+              <div className="relative shrink-0" ref={avatarRef}>
+                <button
+                  type="button"
+                  aria-expanded={avatarOpen}
+                  aria-label={`Account menu for ${profile.full_name}`}
+                  onClick={() => setAvatarOpen((o) => !o)}
+                  className="flex items-center justify-center rounded-full border-2"
+                  style={{
+                    borderColor: avatarOpen ? "#d9a821" : "var(--border)",
+                    backgroundColor: "var(--surface-alt)",
+                  }}
                 >
-                  {profile.full_name}
-                </a>
-                <GhostButton onClick={signOut}>Sign out</GhostButton>
-              </>
+                  <ProfileAvatar profile={profile} size={36} />
+                </button>
+                {avatarOpen ? (
+                  <div
+                    role="menu"
+                    aria-label="Account menu"
+                    className="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border p-2 shadow-lg"
+                    style={{
+                      borderColor: "var(--border)",
+                      backgroundColor: "var(--surface)",
+                    }}
+                  >
+                    <p className="max-w-full truncate px-3 pb-1 pt-2 text-sm font-bold text-[var(--text)]">
+                      {profile.full_name}
+                    </p>
+                    <a
+                      href="#/account"
+                      role="menuitem"
+                      onClick={() => setAvatarOpen(false)}
+                      className="block rounded-lg px-3 py-2 text-sm font-semibold text-[var(--text)]"
+                    >
+                      Account settings
+                    </a>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAvatarOpen(false);
+                        signOut();
+                      }}
+                      className="block w-full rounded-lg px-3 py-2 text-left text-sm font-semibold text-[var(--text)]"
+                    >
+                      Sign out
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAvatarOpen(false);
+                        void signOutEverywhere();
+                      }}
+                      className="block w-full rounded-lg px-3 py-2 text-left text-sm font-semibold text-[var(--text)]"
+                    >
+                      Sign out everywhere
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             ) : (
               <PrimaryButton onClick={() => nav("#/signin")}>Sign in</PrimaryButton>
             )}
@@ -5813,6 +7626,27 @@ export function App() {
           ))}
         </nav>
       </header>
+
+      {profile && securityAlert ? (
+        <div className="mx-auto max-w-6xl px-4 pt-3" role="alert">
+          <div className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--gold-soft)] p-4">
+            <p className="flex-1 text-sm font-semibold text-[var(--warn)]">
+              {securityAlert}{" "}
+              <a href="#/account" className="underline" onClick={() => setSecurityAlert("")}>
+                Change your password in My account
+              </a>
+            </p>
+            <button
+              type="button"
+              onClick={() => setSecurityAlert("")}
+              aria-label="Close this warning"
+              className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1 text-sm font-bold text-[var(--text)]"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <main>
         {route.name !== "home" ? (
@@ -6115,6 +7949,66 @@ function TimelineWithDates({
   );
 }
 
+/* ---------- full activity record for one application ---------- */
+
+type ActivityEntryT = ApiResponse<
+  typeof api,
+  "listApplicationActivity"
+>["entries"][number];
+
+function ApplicationActivity({ app }: { app: ApplicationT }) {
+  const activity = useQuery({
+    queryKey: ["application-activity", app.id],
+    queryFn: () => api.listApplicationActivity({ applicationId: app.id }),
+  });
+  const entries = activity.data?.entries ?? [];
+  return (
+    <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-lg font-bold text-[var(--text)]">
+        Activity record for {app.reference}
+      </h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        Every touch on this application, in order, with who did it and when.
+        Nothing here is guessed: each line comes from a real stored event.
+      </p>
+      {activity.isPending ? (
+        <p className="mt-3 text-sm text-[var(--dim)]">Loading the record...</p>
+      ) : entries.length === 0 ? (
+        <p className="mt-3 text-sm text-[var(--dim)]">
+          No activity recorded yet for this application.
+        </p>
+      ) : (
+        <ol className="mt-4 space-y-3">
+          {entries.map((e, i) => (
+            <li key={`${e.created_at}-${i}`} className="flex gap-3">
+              <span
+                className="mt-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white"
+                style={{ backgroundColor: "#0a2a5e" }}
+                aria-hidden="true"
+              >
+                {i + 1}
+              </span>
+              <div className="min-w-0">
+                <p className="text-sm font-bold text-[var(--text)]">
+                  {e.title}
+                </p>
+                <p className="text-xs text-[var(--dim)]">
+                  {e.actor} {e.actor ? "· " : ""}
+                  {fmtDateTime(e.created_at)}
+                  {e.kind !== "Status" ? ` · ${e.kind}` : ""}
+                </p>
+                {e.detail ? (
+                  <p className="mt-1 text-sm text-[var(--dim)]">{e.detail}</p>
+                ) : null}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 /* ---------- application extras: billing, updates, certificate, complaints, rating ---------- */
 
 function ApplicationExtras({
@@ -6285,7 +8179,7 @@ function ApplicationExtras({
             <ul className="mt-3 space-y-2">
               {cases.map((c) => (
                 <li key={c.id} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-                  <strong>{c.kind}</strong>, {c.status}. {c.reason}
+                  <strong>{c.kind}</strong> on tracking number {c.application_ref}, filed {fmtDateTime(c.created_at)}. Status: {c.status}. {c.reason}
                   {c.reply ? (
                     <span className="block mt-1">
                       <strong>PortaGov replied:</strong> {c.reply}
@@ -6457,8 +8351,10 @@ function ExpiryReminders({ profile }: { profile: ProfileT }) {
               <p className="text-sm text-[var(--text)]">
                 <strong>{doc.title}</strong> ({doc.doc_type}){" "}
                 {days < 0
-                  ? `expired ${Math.abs(days)} days ago`
-                  : `expires in ${days} days, on ${doc.expires_on}`}
+                  ? `expired on ${fmtDate(doc.expires_on)}, ${Math.abs(days)} days ago`
+                  : days === 0
+                    ? `expires today, ${fmtDate(doc.expires_on)}`
+                    : `expires in ${days} days, on ${fmtDate(doc.expires_on)}`}
                 . <Chip tone="gold">{tier}</Chip>
               </p>
               {renewal ? (
@@ -6473,7 +8369,11 @@ function ExpiryReminders({ profile }: { profile: ProfileT }) {
                     Renew (tap 1)
                   </GhostButton>
                 )
-              ) : null}
+              ) : (
+                <GhostButton onClick={() => nav("#/wallet")}>
+                  Update in my wallet
+                </GhostButton>
+              )}
             </li>
           );
         })}
@@ -7181,7 +9081,13 @@ function HelpPage({ profile }: { profile: ProfileT | null }) {
 /* ---------- county service centre mode (walk-in, officer helps on the spot) ---------- */
 
 function CentrePage() {
-  const [officer, setOfficer] = useState("");
+  /* County agent mode: the helper must first sign in as a registered
+     PortaGov agent, by name and phone, before they can apply for
+     anyone. The desk never trusts a typed-in name. */
+  const [agent, setAgent] = useState<AgentT | null>(null);
+  const [agentId, setAgentId] = useState("");
+  const [agentPhone, setAgentPhone] = useState("");
+  const [agentError, setAgentError] = useState("");
   const [centre, setCentre] = useState(OFFICES[0] ?? "");
   const [citizen, setCitizen] = useState<ProfileT | null>(null);
   const [phone, setPhone] = useState("");
@@ -7191,6 +9097,36 @@ function CentrePage() {
   const [doneRef, setDoneRef] = useState("");
   const [error, setError] = useState("");
   const service = serviceById(serviceId);
+
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api.listAgents({}),
+  });
+  const activeAgents = (agents.data?.agents ?? []).filter((a: AgentT) => a.active);
+  const signInAgent = useMutation({
+    mutationFn: async () =>
+      await api.agentSignIn({ agentId: Number(agentId), phone: agentPhone.trim() }),
+    onSuccess: (r) => {
+      setAgent(r.agent);
+      setAgentError("");
+      if (r.agent.service_centre && OFFICES.includes(r.agent.service_centre)) {
+        setCentre(r.agent.service_centre);
+      }
+    },
+    onError: (e) =>
+      setAgentError(e instanceof Error ? e.message : "Could not sign in as this agent."),
+  });
+  const signOutAgent = () => {
+    setAgent(null);
+    setAgentId("");
+    setAgentPhone("");
+    setCitizen(null);
+    setPhone("");
+    setLookupMsg("");
+    setFieldValues({});
+    setDoneRef("");
+    setError("");
+  };
 
   const lookup = useMutation({
     mutationFn: async () => await api.findProfileByPhone({ phone: phone.trim() }),
@@ -7216,7 +9152,7 @@ function CentrePage() {
         serviceName: service.name,
         institution: ministryById(service.ministryId).name,
         channel: "Agent assisted",
-        agentName: `${officer || "Service centre officer"}, ${centre}`,
+        agentName: `${agent?.full_name ?? "County agent"}, ${centre}`,
         notes: "Applied at a County Service Centre, officer assisted, walk-in.",
         details: service.fields
           .map((f) => ({ label: f.label, value: (fieldValues[f.key] ?? "").trim() }))
@@ -7239,34 +9175,96 @@ function CentrePage() {
         Walk-in desk
       </h1>
       <p className="mt-2 max-w-3xl text-[var(--dim)]">
-        For citizens who walk in. The officer helps the citizen apply on the
-        spot, on the same PortaGov system, with the same tracking number, the
-        same billing, and the same phone updates as applying from home.
-        Nothing here is a side channel.
+        For citizens who walk in with no phone or no internet. A registered
+        PortaGov agent signs in here first, then helps the citizen apply on
+        the spot, on the same PortaGov system, with the same tracking number,
+        the same billing, and the same phone updates as applying from home.
+        Nothing here is a side channel. The citizen's own contact details
+        are recorded, so every update still reaches them.
       </p>
 
-      <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
-        <h2 className="font-display text-lg font-bold text-[var(--text)]">Officer and centre</h2>
-        <div className="mt-3 grid gap-3 sm:grid-cols-2">
-          <div>
-            <FieldLabel htmlFor="ctr-officer">Officer's name</FieldLabel>
-            <input id="ctr-officer" className={inputCls} value={officer}
-              onChange={(e) => setOfficer(e.target.value)} />
-          </div>
-          <div>
-            <FieldLabel htmlFor="ctr-centre">Service centre</FieldLabel>
-            <select id="ctr-centre" className={inputCls} value={centre}
-              onChange={(e) => setCentre(e.target.value)}>
-              {OFFICES.map((o) => (
-                <option key={o} value={o}>{o}</option>
-              ))}
-            </select>
+      {!agent ? (
+        <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+          <h2 className="font-display text-lg font-bold text-[var(--text)]">Step 1: the agent signs in</h2>
+          <p className="mt-1 text-sm text-[var(--dim)]">
+            Only a registered PortaGov agent can use this desk. Pick your
+            name and enter the phone number PortaGov has for you.
+          </p>
+          <form
+            className="mt-3 flex flex-wrap items-end gap-3"
+            onSubmit={(e: FormEvent) => {
+              e.preventDefault();
+              setAgentError("");
+              if (!agentId) {
+                setAgentError("Pick your name from the list of registered agents.");
+                return;
+              }
+              signInAgent.mutate();
+            }}
+          >
+            <div className="min-w-56 flex-1">
+              <FieldLabel htmlFor="ctr-agent">Your name, as registered</FieldLabel>
+              <select id="ctr-agent" className={inputCls} value={agentId}
+                onChange={(e) => setAgentId(e.target.value)}>
+                <option value="">Choose your name</option>
+                {activeAgents.map((a: AgentT) => (
+                  <option key={a.id} value={a.id}>
+                    {a.full_name}, {a.county} County{a.service_centre ? `, ${a.service_centre}` : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="min-w-56 flex-1">
+              <FieldLabel htmlFor="ctr-agent-phone">Your agent phone number</FieldLabel>
+              <input id="ctr-agent-phone" {...FIELDS.agentSignIn.phone} className={inputCls} value={agentPhone}
+                onChange={(e) => setAgentPhone(e.target.value)} />
+            </div>
+            <PrimaryButton type="submit" disabled={signInAgent.isPending}>
+              {signInAgent.isPending ? "Checking..." : "Sign in as this agent"}
+            </PrimaryButton>
+          </form>
+          {agents.isPending ? (
+            <p className="mt-2 text-sm text-[var(--dim)]">Loading registered agents...</p>
+          ) : activeAgents.length === 0 ? (
+            <p className="mt-2 text-sm text-[var(--dim)]">
+              No registered agents yet. PortaGov registers agents county by
+              county in the platform console; until then, this desk stays closed.
+            </p>
+          ) : null}
+          {agentError ? (
+            <p role="alert" className="mt-3 rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+              {agentError}
+            </p>
+          ) : null}
+        </div>
+      ) : (
+        <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+          <h2 className="font-display text-lg font-bold text-[var(--text)]">Agent and centre</h2>
+          <p className="mt-1 text-sm text-[var(--dim)]">
+            Signed in as <strong className="text-[var(--text)]">{agent.full_name}</strong>, {agent.county} County
+            agent. Every application you submit here is named for you, so the
+            citizen always knows who helped them.
+          </p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div>
+              <FieldLabel htmlFor="ctr-centre">Service centre</FieldLabel>
+              <select id="ctr-centre" className={inputCls} value={centre}
+                onChange={(e) => setCentre(e.target.value)}>
+                {OFFICES.map((o) => (
+                  <option key={o} value={o}>{o}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex items-end">
+              <GhostButton onClick={signOutAgent}>Sign out, finish helping</GhostButton>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
+      {agent ? (
       <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
-        <h2 className="font-display text-lg font-bold text-[var(--text)]">Step 1: the citizen</h2>
+        <h2 className="font-display text-lg font-bold text-[var(--text)]">Step 2: the citizen</h2>
         <form
           className="mt-3 flex flex-wrap items-end gap-3"
           onSubmit={(e: FormEvent) => {
@@ -7287,9 +9285,15 @@ function CentrePage() {
         {!citizen ? (
           <div className="mt-4">
             <p className="mb-2 text-sm text-[var(--dim)]">
-              New citizen? Their first-time setup, saved once to their profile:
+              New citizen? Their first-time setup, saved once to their profile.
+              You check their ID in person, so their profile counts as
+              verified and they do not need a phone code to apply. Record the
+              contact where their own updates should go, their own number if
+              they have one, or a family member's number who will pass the
+              messages on, and their email if they have one.
             </p>
             <ProfileForm
+              officerMode
               submitLabel="Save citizen profile"
               onSaved={(p) => {
                 setCitizen(p);
@@ -7299,11 +9303,12 @@ function CentrePage() {
           </div>
         ) : null}
       </div>
+      ) : null}
 
-      {citizen ? (
+      {agent && citizen ? (
         <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
           <h2 className="font-display text-lg font-bold text-[var(--text)]">
-            Step 2: apply for {citizen.full_name}
+            Step 3: apply for {citizen.full_name}
           </h2>
           <div className="mt-3">
             <FieldLabel htmlFor="ctr-service">Service</FieldLabel>
@@ -7339,10 +9344,26 @@ function CentrePage() {
             </p>
           ) : null}
           {doneRef ? (
-            <p className="mt-3 rounded-lg p-4 text-white" style={{ backgroundColor: "#0a2a5e" }}>
-              Done. Tracking number <strong>{doneRef}</strong>. Tell the citizen
-              to keep it: every update comes to their phone by SMS and WhatsApp.
-            </p>
+            <div className="mt-3 space-y-3">
+              <p className="rounded-lg p-4 text-white" style={{ backgroundColor: "#0a2a5e" }}>
+                Done. Tracking number <strong>{doneRef}</strong>. Tell the citizen
+                to keep it: every update comes to their phone by SMS and WhatsApp.
+                The application record names you, {agent?.full_name}, as the agent
+                who helped.
+              </p>
+              <GhostButton
+                onClick={() => {
+                  setCitizen(null);
+                  setPhone("");
+                  setLookupMsg("");
+                  setFieldValues({});
+                  setDoneRef("");
+                  setError("");
+                }}
+              >
+                Help the next person
+              </GhostButton>
+            </div>
           ) : (
             <div className="mt-4">
               <PrimaryButton
@@ -7411,10 +9432,15 @@ function AgentsDirectory() {
       ) : (
         <p className="mt-3 text-sm text-[var(--dim)]">
           Agents are being registered county by county. Until an agent is
-          listed here for your county, any County Service Centre officer can
-          help you apply on the spot.
+          listed here for your county, the agent desk stays closed: only a
+          registered agent can apply for someone else.
         </p>
       )}
+      <div className="mt-4">
+        <GhostButton onClick={() => nav("#/centre")}>
+          Agent sign in: open the county agent desk
+        </GhostButton>
+      </div>
     </div>
   );
 }
@@ -8240,20 +10266,28 @@ function ChatInbox() {
 
 /* ---------- receipts in payments ---------- */
 
+/* Company wallet payments are recorded with a WALLET- transaction
+   reference, so show the real method here instead of the stored label. */
+function paymentMethodLabel(p: PaymentT): string {
+  return p.transaction_ref.startsWith("WALLET-") ? "Company wallet" : p.method;
+}
+
 function downloadReceipt(p: PaymentT) {
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>PortaGov receipt ${p.application_ref}</title></head><body style="font-family:sans-serif;color:#0a2a5e;max-width:640px;margin:40px auto;padding:24px;border:3px solid #0a2a5e">
 <h1 style="font-size:22px">PortaGov payment receipt</h1>
 <p>Citizens. Services. Connected.</p>
 <table style="width:100%;font-size:15px;line-height:2">
+<tr><td><strong>Service</strong></td><td>${p.service_name}</td></tr>
+<tr><td><strong>Billing number</strong></td><td>${p.billing_number}</td></tr>
 <tr><td><strong>Tracking number</strong></td><td>${p.application_ref}</td></tr>
-<tr><td><strong>Method</strong></td><td>${p.method}</td></tr>
+<tr><td><strong>Method</strong></td><td>${paymentMethodLabel(p)}</td></tr>
 <tr><td><strong>Amount</strong></td><td>$${p.amount}</td></tr>
 <tr><td><strong>Paid from</strong></td><td>${p.payer_phone}</td></tr>
 <tr><td><strong>Transaction reference</strong></td><td>${p.transaction_ref}</td></tr>
 <tr><td><strong>Status</strong></td><td>${p.status}</td></tr>
-<tr><td><strong>Date</strong></td><td>${p.created_at}</td></tr>
+<tr><td><strong>Date</strong></td><td>${fmtDate(p.created_at)}</td></tr>
 </table>
-<p style="font-size:13px">Keep this receipt. The billing number for this payment is on your application page on PortaGov. PortaGov will never ask you to pay to a personal number.</p>
+<p style="font-size:13px">Keep this receipt. PortaGov will never ask you to pay to a personal number, only to the billing number on this receipt.</p>
 </body></html>`;
   const blob = new Blob([html], { type: "text/html" });
   const url = URL.createObjectURL(blob);
@@ -8276,8 +10310,8 @@ function ReceiptDownloads({ payments }: { payments: PaymentT[] }) {
         {confirmed.map((p) => (
           <div key={p.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
             <p className="text-sm text-[var(--text)]">
-              <strong>Receipt:</strong> {p.method}, ${p.amount}, application{" "}
-              {p.application_ref}, transaction {p.transaction_ref},{" "}
+              <strong>Receipt:</strong> {p.service_name}, {paymentMethodLabel(p)}, ${p.amount}, billing{" "}
+              {p.billing_number}, application {p.application_ref}, transaction {p.transaction_ref},{" "}
               {fmtDate(p.created_at)}. Status: {p.status}.
             </p>
             <GhostButton onClick={() => downloadReceipt(p)}>
@@ -8393,7 +10427,7 @@ function ExpiryWalletList({ profile }: { profile: ProfileT }) {
           return (
             <li key={d.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--surface-alt)] p-3 text-sm">
               <span className="text-[var(--text)]">
-                <strong>{d.title}</strong> ({d.doc_type}), expires {d.expires_on}
+                <strong>{d.title}</strong> ({d.doc_type}), expires {fmtDate(d.expires_on)}
               </span>
               <Chip tone={days <= 30 ? "gold" : "plain"}>
                 {days < 0 ? `Expired ${Math.abs(days)} days ago` : `${days} days left`}
@@ -8411,19 +10445,26 @@ function ExpiryWalletList({ profile }: { profile: ProfileT }) {
 function SecurityPanel({
   profile,
   onProfileChange,
+  onSignOutEverywhere,
 }: {
   profile: ProfileT;
   onProfileChange: (p: ProfileT) => void;
+  onSignOutEverywhere: () => void;
 }) {
   const queryClient = useQueryClient();
   const devices = useQuery({
     queryKey: ["devices", profile.id],
     queryFn: () => api.listDevices({ profileId: profile.id }),
   });
+  const history = useQuery({
+    queryKey: ["sign-in-history", profile.id],
+    queryFn: () => api.listSignInEvents({ profileId: profile.id }),
+  });
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [msg, setMsg] = useState("");
   const [error, setError] = useState("");
+  const [confirmSignOutAll, setConfirmSignOutAll] = useState(false);
   const toggle = useMutation({
     mutationFn: async (enabled: boolean) =>
       await api.setTwoFactor({ profileId: profile.id, enabled }),
@@ -8496,6 +10537,53 @@ function SecurityPanel({
           signs in. If you see a device you do not know, change your password
           at once.
         </p>
+      </div>
+      <div className="mt-4">
+        <p className="font-display font-bold text-[var(--text)]">Sign-in history</p>
+        <ul className="mt-1 space-y-1 text-sm text-[var(--dim)]">
+          {(history.data?.events ?? []).map((e) => (
+            <li key={e.id} className="flex flex-wrap items-center gap-2">
+              <span>
+                {fmtDateTime(e.signed_in_at)}, {e.device_label || "Device"}
+              </span>
+              {e.is_new_device ? (
+                <span className="rounded-full bg-[var(--gold-soft)] px-2 py-0.5 text-xs font-bold text-[var(--warn)]">
+                  New device
+                </span>
+              ) : null}
+            </li>
+          ))}
+          {(history.data?.events ?? []).length === 0 ? (
+            <li>No sign-ins recorded yet. Sign-ins from this device are recorded from now on.</li>
+          ) : null}
+        </ul>
+        <p className="mt-1 text-xs text-[var(--dim)]">
+          If a sign-in here was not you, change your password at once and
+          sign out everywhere below.
+        </p>
+      </div>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg bg-[var(--surface-alt)] p-3">
+        <p className="text-sm text-[var(--text)]">
+          <strong>Sign out everywhere:</strong> signs out this device and
+          every other device on this account, in one tap. Today your data
+          lives on this device only, so this signs out this device and the
+          sessions recorded here. On the shared PortaGov backend it will
+          sign out every device at once.
+        </p>
+        {confirmSignOutAll ? (
+          <span className="flex flex-wrap gap-2">
+            <PrimaryButton onClick={onSignOutEverywhere}>
+              Yes, sign out everywhere
+            </PrimaryButton>
+            <GhostButton onClick={() => setConfirmSignOutAll(false)}>
+              Keep me signed in
+            </GhostButton>
+          </span>
+        ) : (
+          <GhostButton onClick={() => setConfirmSignOutAll(true)}>
+            Sign out everywhere
+          </GhostButton>
+        )}
       </div>
       {profile.has_password ? (
         <form
@@ -8661,7 +10749,7 @@ function EmbassyDesk({ institution }: { institution?: string } = {}) {
                       : ""}
                   </p>
                 </div>
-                <Chip tone="gold">{a.status}</Chip>
+                <Chip tone="gold">{applicationStatusPlain(a.status).short}</Chip>
               </div>
               <EmbassyThread app={a} />
             </div>
@@ -9628,7 +11716,7 @@ function UssdPanel({ profile }: { profile: ProfileT | null }) {
           app ? (
             <div className="mt-3 rounded bg-[var(--surface)] p-3 font-sans text-sm text-[var(--text)]">
               <p><strong>{app.service_name}</strong></p>
-              <p>Status: {app.status}</p>
+              <p>Status: {app.status}, {applicationStatusPlain(app.status).short}. {applicationStatusPlain(app.status).meaning}</p>
               <p>
                 Billing number: {app.billing_number} ({app.billing_status}
                 {app.total_due > 0 ? `, $${app.total_due}` : ""})
@@ -10269,6 +12357,48 @@ function InstitutionReports({ institution }: { institution: string }) {
           processing times to show.
         </p>
       )}
+    </div>
+  );
+}
+
+/* ---------- daily summary for one institution ---------- */
+
+/** Today's numbers for one institution only, counted from its real
+    applications for today: how many came in, how many were finished,
+    and how many are still waiting. Finished means completed today.
+    Still waiting means released to the institution and not finished
+    yet. The date is shown, so yesterday's numbers are never mistaken
+    for today's. */
+function InstitutionDailySummary({ institution }: { institution: string }) {
+  const s = useQuery({
+    queryKey: ["institution-daily-summary", institution],
+    queryFn: () => api.getInstitutionDailySummary({ institution }),
+  });
+  const d = s.data;
+  return (
+    <div className="rounded-xl p-5 text-white" style={{ backgroundColor: "#0a2a5e" }}>
+      <h2 className="font-display text-lg font-bold">Today at {institution}</h2>
+      <p className="text-sm text-white/85">{d?.date_label ?? "Loading..."}</p>
+      {d ? (
+        <div className="mt-3 grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
+          {[
+            [`${d.came_in_today}`, "came in today"],
+            [`${d.finished_today}`, "finished today"],
+            [`${d.still_waiting}`, "still waiting"],
+            [`${d.ready_for_collection}`, "ready for collection"],
+          ].map(([n, label]) => (
+            <div key={label} className="rounded-lg bg-white/10 p-3">
+              <p className="font-display text-2xl font-extrabold" style={{ color: "#d9a821" }}>{n}</p>
+              <p className="text-xs text-white/85">{label}</p>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <p className="mt-3 text-sm text-white/85">
+        Came in counts applications submitted today. Finished counts
+        applications completed today. Still waiting counts applications
+        already released to this institution that are not finished yet.
+      </p>
     </div>
   );
 }
@@ -11204,7 +13334,34 @@ function TemplateLibrary({ institution }: { institution: string }) {
   );
 }
 
-/* ---------- officer daily work list ---------- */
+/* ---------- officer queue: one queue per officer ---------- */
+
+/** Waiting work at one institution, split by officer. An application sits
+    with the officer who last touched it (from the audit log, which
+    records the officer's name on every status change). Anything no
+    officer has picked up yet sits under "Not yet picked up", so nothing
+    waits without a name on it. Urgent means Fast-track or Emergency
+    priority, or waiting more than 48 hours. Waiting time is computed
+    from the real submitted time of each application. Nothing here is
+    invented: an empty queue shows as empty. */
+const OFFICER_WAITING_STATUSES = [
+  "Received by institution",
+  "In review at institution",
+] as const;
+
+function isOfficerUrgent(a: ApplicationT): boolean {
+  if (a.priority === "Emergency" || a.priority === "Fast-track") return true;
+  return Date.now() - new Date(a.created_at).getTime() >= 48 * 3600000;
+}
+
+function sortOfficerQueue(list: ApplicationT[]): ApplicationT[] {
+  return [...list].sort((x, y) => {
+    const ux = isOfficerUrgent(x) ? 0 : 1;
+    const uy = isOfficerUrgent(y) ? 0 : 1;
+    if (ux !== uy) return ux - uy;
+    return x.created_at.localeCompare(y.created_at);
+  });
+}
 
 function OfficerWorkList({ institution }: { institution: string }) {
   const apps = useQuery({
@@ -11215,40 +13372,164 @@ function OfficerWorkList({ institution }: { institution: string }) {
     queryKey: ["inst-appointments", institution],
     queryFn: () => api.listInstitutionAppointments({ institution }),
   });
+  const staff = useQuery({
+    queryKey: ["staff", institution],
+    queryFn: () => api.listStaff({ institution }),
+  });
+  const audit = useQuery({
+    queryKey: ["audit-log", institution],
+    queryFn: () => api.listAuditLog({ institution, limit: 100 }),
+  });
   const today = new Date().toISOString().slice(0, 10);
   const mine = (apps.data?.applications ?? []).filter(
     (a: ApplicationT) => a.institution === institution,
   );
-  const waiting = mine
-    .filter((a: ApplicationT) => a.status === "Received by institution" || a.status === "In review at institution")
-    .sort((a: ApplicationT, b: ApplicationT) => a.created_at.localeCompare(b.created_at));
+  const waiting = mine.filter((a: ApplicationT) =>
+    (OFFICER_WAITING_STATUSES as readonly string[]).includes(a.status),
+  );
+  const urgentCount = waiting.filter(isOfficerUrgent).length;
   const todayAppts = (appts.data?.appointments ?? []).filter(
     (a) => a.date === today,
+  );
+  const lastOfficerByRef = new Map<string, string>();
+  for (const e of audit.data?.entries ?? []) {
+    if (e.application_ref && !lastOfficerByRef.has(e.application_ref)) {
+      lastOfficerByRef.set(e.application_ref, e.actor);
+    }
+  }
+  const officers = staff.data?.staff ?? [];
+  const groups: { name: string; role: string; items: ApplicationT[] }[] =
+    officers.map((s) => ({
+      name: s.name,
+      role: s.role,
+      items: sortOfficerQueue(
+        waiting.filter((a) => lastOfficerByRef.get(a.reference) === s.name),
+      ),
+    }));
+  const unassigned = sortOfficerQueue(
+    waiting.filter((a) => !lastOfficerByRef.get(a.reference)),
   );
   return (
     <div className="rounded-xl border-2 bg-[var(--surface)] p-5" style={{ borderColor: "#0a2a5e" }}>
       <h2 className="font-display text-lg font-bold text-[var(--text)]">
-        Today's work list, in urgency order
+        Officer queue
       </h2>
-      <ol className="mt-3 space-y-2 text-sm">
-        <li className="rounded-lg bg-[var(--surface-alt)] p-3 text-[var(--text)]">
-          <strong>1. Appointments today ({todayAppts.length}):</strong>{" "}
-          {todayAppts.length > 0
-            ? todayAppts.map((a) => `${a.time_slot}, ${a.applicant_name}, ${a.service_name}, ticket ${a.ticket}`).join("; ")
-            : "none booked for today."}
-        </li>
-        <li className="rounded-lg bg-[var(--surface-alt)] p-3 text-[var(--text)]">
-          <strong>2. Waiting longest first ({waiting.length}):</strong>{" "}
-          {waiting.length > 0
-            ? waiting.slice(0, 5).map((a: ApplicationT) => `${a.reference}, ${a.service_name}, waiting since ${fmtDate(a.created_at)}`).join("; ")
-            : "nothing waiting. Good work."}
-        </li>
-        <li className="rounded-lg bg-[var(--surface-alt)] p-3 text-[var(--text)]">
-          <strong>3. Diaspora and embassy cases:</strong>{" "}
-          {mine.filter((a: ApplicationT) => a.channel === "Diaspora").length} on
-          this desk. Answer embassy spaces before the day ends.
-        </li>
-      </ol>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        Who is waiting, who is urgent, and how long each person has waited.
+        An application sits with the officer who last touched it. Urgent
+        means Fast-track or Emergency, or waiting more than 48 hours.
+      </p>
+      <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+        {[
+          [`${waiting.length}`, "waiting"],
+          [`${urgentCount}`, "urgent"],
+          [
+            waiting.length > 0
+              ? waitLabel(
+                  waiting.reduce((oldest, a) =>
+                    a.created_at < oldest.created_at ? a : oldest,
+                  ).created_at,
+                )
+              : "none",
+            "longest wait",
+          ],
+        ].map(([n, label]) => (
+          <div key={label} className="rounded-lg bg-[var(--surface-alt)] p-3">
+            <p className="font-display text-2xl font-extrabold text-[var(--text)]">{n}</p>
+            <p className="text-xs text-[var(--dim)]">{label}</p>
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 text-sm text-[var(--text)]">
+        <strong>Appointments today ({todayAppts.length}):</strong>{" "}
+        {todayAppts.length > 0
+          ? todayAppts.map((a) => `${a.time_slot}, ${a.applicant_name}, ${a.service_name}, ticket ${a.ticket}`).join("; ")
+          : "none booked for today."}
+      </p>
+      {waiting.length === 0 ? (
+        <p className="mt-3 rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
+          Nothing waiting. Good work.
+        </p>
+      ) : null}
+      <div className="mt-3 space-y-3">
+        {groups.map((g) => {
+          const urgent = g.items.filter(isOfficerUrgent).length;
+          return (
+            <div key={g.name} className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <p className="font-display font-bold text-[var(--text)]">
+                  {g.name}
+                  {g.role ? `, ${g.role}` : ""}
+                </p>
+                <Chip tone={urgent > 0 ? "gold" : "plain"}>
+                  {g.items.length} waiting{urgent > 0 ? `, ${urgent} urgent` : ""}
+                </Chip>
+              </div>
+              {g.items.length > 0 ? (
+                <ul className="mt-2 space-y-1 text-sm text-[var(--text)]">
+                  {g.items.map((a) => (
+                    <li key={a.id} className="flex flex-wrap items-center gap-2">
+                      <span>
+                        {a.reference}, {a.service_name}, {a.applicant_name}, waiting {waitLabel(a.created_at)}
+                      </span>
+                      {isOfficerUrgent(a) ? (
+                        <Chip tone="gold">
+                          Urgent{a.priority === "Emergency" || a.priority === "Fast-track" ? `, ${a.priority}` : ", waiting over 48 hours"}
+                        </Chip>
+                      ) : null}
+                      <Chip>{applicationStatusPlain(a.status).short}</Chip>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-1 text-sm text-[var(--dim)]">Nothing waiting with this officer.</p>
+              )}
+            </div>
+          );
+        })}
+        {unassigned.length > 0 || officers.length === 0 ? (
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <p className="font-display font-bold text-[var(--text)]">
+                Not yet picked up
+              </p>
+              <Chip tone={unassigned.some(isOfficerUrgent) ? "gold" : "plain"}>
+                {unassigned.length} waiting
+                {unassigned.filter(isOfficerUrgent).length > 0
+                  ? `, ${unassigned.filter(isOfficerUrgent).length} urgent`
+                  : ""}
+              </Chip>
+            </div>
+            {officers.length === 0 ? (
+              <p className="mt-1 text-sm text-[var(--dim)]">
+                No officers on the roster yet. Add officers under Officers and
+                roles, and each application will sit with the officer who
+                picks it up.
+              </p>
+            ) : null}
+            <ul className="mt-2 space-y-1 text-sm text-[var(--text)]">
+              {unassigned.map((a) => (
+                <li key={a.id} className="flex flex-wrap items-center gap-2">
+                  <span>
+                    {a.reference}, {a.service_name}, {a.applicant_name}, waiting {waitLabel(a.created_at)}
+                  </span>
+                  {isOfficerUrgent(a) ? (
+                    <Chip tone="gold">
+                      Urgent{a.priority === "Emergency" || a.priority === "Fast-track" ? `, ${a.priority}` : ", waiting over 48 hours"}
+                    </Chip>
+                  ) : null}
+                  <Chip>{applicationStatusPlain(a.status).short}</Chip>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+      <p className="mt-3 text-sm text-[var(--dim)]">
+        Diaspora and embassy cases on this desk:{" "}
+        {mine.filter((a: ApplicationT) => a.channel === "Diaspora").length}.
+        Answer embassy spaces before the day ends.
+      </p>
     </div>
   );
 }
@@ -11294,27 +13575,64 @@ function ResumeDrafts({ profile }: { profile: ProfileT }) {
 
 /* ---------- what to bring (appointment one-screen list) ---------- */
 
-function BringList({ appt }: { appt: AppointmentT }) {
-  const items =
-    appt.kind === "Collection"
+/* The day before an appointment, as a plain date. The reminder for a
+   visit is set for this date, and the message tells the person what
+   to bring. */
+function dayBefore(dateStr: string): string {
+  const d = new Date(`${dateStr}T12:00:00Z`);
+  if (Number.isNaN(d.getTime())) return dateStr;
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+
+/* What to bring for an appointment, from the real requirements of the
+   service the appointment is for. Falls back to the visit-type list
+   when the appointment is not linked to a service. */
+function bringItemsForAppointment(
+  appt: AppointmentT,
+  service?: Service,
+): string[] {
+  const ticket = `Your ticket number: ${appt.ticket || "on this screen"}`;
+  const idLine =
+    "Your national ID, passport, voter card, or birth certificate, the one on your profile";
+  if (!service) {
+    return appt.kind === "Collection"
       ? [
-          `Your ticket number: ${appt.ticket || "on this screen"}`,
+          ticket,
           "Your pickup code, from the SMS and your application page",
           "Your national ID, or the document you used on your profile",
           "If someone else collects for you: their own ID and your proxy consent code",
         ]
       : appt.kind === "Print pickup"
         ? [
-            `Your ticket number: ${appt.ticket || "on this screen"}`,
+            ticket,
             "Your print code, from your application page",
             "Your national ID, or the document you used on your profile",
           ]
         : [
-            `Your ticket number: ${appt.ticket || "on this screen"}`,
-            "Your national ID, passport, voter card, or birth certificate, the one on your profile",
+            ticket,
+            idLine,
             "Your original documents for the service, not only copies",
             "For a passport photo sitting: plain clothes with no hat and no sunglasses, white background at the office",
           ];
+  }
+  const items = [ticket, ...service.requirements, idLine];
+  if (appt.kind === "Biometrics" && service.id.startsWith("passport")) {
+    items.push(
+      "For a passport photo sitting: plain clothes with no hat and no sunglasses, white background at the office",
+    );
+  }
+  if (appt.kind === "Collection") {
+    items.push("Your pickup code, from the SMS and your application page");
+    items.push(
+      "If someone else collects for you: their own ID and your proxy consent code",
+    );
+  }
+  return items;
+}
+
+function BringList({ appt, service }: { appt: AppointmentT; service?: Service }) {
+  const items = bringItemsForAppointment(appt, service);
   return (
     <div className="mt-3 rounded-lg bg-[var(--surface-alt)] p-3">
       <p className="text-sm font-bold text-[var(--text)]">
@@ -11333,9 +13651,45 @@ function BringList({ appt }: { appt: AppointmentT }) {
   );
 }
 
+/* The reminder for the day before a visit, shown on the appointment
+   itself. The reminder is saved on this device and shown here, with
+   the date it is set for and what to bring for that service. The SMS
+   itself will be sent once the SMS sender is live, so this box says
+   so plainly instead of claiming a text already went out. */
+function DayBeforeReminder({ appt, service }: { appt: AppointmentT; service?: Service }) {
+  const reminderDate = dayBefore(appt.date);
+  return (
+    <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3">
+      <p className="text-sm font-bold text-[var(--text)]">
+        Reminder, the day before: {fmtDate(reminderDate)}
+      </p>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        PortaGov reminder: you have a {appt.kind.toLowerCase()} visit tomorrow,{" "}
+        {fmtDate(appt.date)}, {appt.time_slot}, at {appt.office}. Your ticket
+        number is {appt.ticket || "on this screen"}.
+      </p>
+      <BringList appt={appt} service={service} />
+      <p className="mt-2 text-sm text-[var(--dim)]">
+        This reminder is saved on this device and shown here. The SMS itself
+        will be sent once the SMS sender is live.
+      </p>
+    </div>
+  );
+}
+
 /* ---------- photo crop and fix tool ---------- */
 
+/* ---------- photo crop and fix tool ---------- */
+
+// A passport photograph is a portrait photo. The crop below outputs a
+// portrait image, 700 by 900 pixels (a 7 by 9 shape, the same shape as the
+// commonly recommended 35 by 45 mm guide size). 35 by 45 mm is a guide
+// recommendation only, not an official size, so it is never shown as one.
+const CROP_WIDTH = 700;
+const CROP_HEIGHT = 900;
+
 function PhotoFixTool({ profile }: { profile: ProfileT }) {
+  const queryClient = useQueryClient();
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [src, setSrc] = useState("");
@@ -11343,13 +13697,14 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
   const [offX, setOffX] = useState(0);
   const [offY, setOffY] = useState(0);
   const [saved, setSaved] = useState("");
+  const [savedSize, setSavedSize] = useState("");
   const [error, setError] = useState("");
   const docs = useQuery({
     queryKey: ["documents", profile.id],
     queryFn: () => api.listDocuments({ profileId: profile.id }),
   });
   const photos = (docs.data?.documents ?? []).filter(
-    (d: DocumentT) => d.doc_type === "Passport photograph",
+    (d: DocumentT) => d.doc_type === "Passport photograph" && d.status !== "Superseded",
   );
   const [replaceId, setReplaceId] = useState(0);
   const [quality, setQuality] = useState("");
@@ -11360,17 +13715,23 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
     if (!canvas || !img || !src) return;
     const ctx2d = canvas.getContext("2d");
     if (!ctx2d) return;
-    const size = 600;
     ctx2d.fillStyle = "#ffffff";
-    ctx2d.fillRect(0, 0, size, size);
-    const base = Math.max(size / img.naturalWidth, size / img.naturalHeight);
+    ctx2d.fillRect(0, 0, CROP_WIDTH, CROP_HEIGHT);
+    const base = Math.max(
+      CROP_WIDTH / img.naturalWidth,
+      CROP_HEIGHT / img.naturalHeight,
+    );
     const w = img.naturalWidth * base * scale;
     const h = img.naturalHeight * base * scale;
-    const x = (size - w) / 2 + offX * 3;
-    const y = (size - h) / 2 + offY * 3;
+    let x = (CROP_WIDTH - w) / 2 + offX * 3;
+    let y = (CROP_HEIGHT - h) / 2 + offY * 3;
+    // Keep the photo covering the whole frame, so moving it can never
+    // leave a white edge in the saved photo.
+    x = Math.min(0, Math.max(CROP_WIDTH - w, x));
+    y = Math.min(0, Math.max(CROP_HEIGHT - h, y));
     ctx2d.drawImage(img, x, y, w, h);
     try {
-      const data = ctx2d.getImageData(0, 0, size, size).data;
+      const data = ctx2d.getImageData(0, 0, CROP_WIDTH, CROP_HEIGHT).data;
       let total = 0;
       let count = 0;
       for (let i = 0; i < data.length; i += 40) {
@@ -11406,14 +13767,14 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
         canvas.toBlob(resolve, "image/jpeg", 0.95),
       );
       if (!blob) throw new Error("The photo could not be prepared.");
-      const file = new File([blob], "passport-photo-fixed.jpg", {
+      const file = new File([blob], "passport-photo-cropped.jpg", {
         type: "image/jpeg",
       });
       const base = await fileToBase64(file);
-      return await api.addDocument({
+      await api.addDocument({
         profileId: profile.id,
         docType: "Passport photograph",
-        title: "Passport photograph, fixed in PortaGov",
+        title: "Passport photograph",
         file: {
           dataBase64: base,
           fileName: file.name,
@@ -11421,29 +13782,37 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
         },
         replacesDocumentId: replaceId,
       });
+      return { kb: Math.max(1, Math.round(blob.size / 1024)) };
     },
-    onSuccess: () => {
+    onSuccess: (r) => {
       setSaved(
         replaceId > 0
-          ? "Saved. The fixed photo replaces the old one in your wallet, and your services will use the fixed photo."
-          : "Saved to your wallet at full quality, ready for your passport application.",
+          ? "Saved. The cropped photo replaces the old one in your wallet, and your services will use the cropped photo."
+          : "Saved. The cropped photo is now the passport photograph in your wallet, at the top of this page.",
+      );
+      setSavedSize(
+        `Cropped photo size: ${CROP_WIDTH} by ${CROP_HEIGHT} pixels, portrait, about ${r.kb} KB.`,
       );
       void docs.refetch();
+      void queryClient.invalidateQueries({ queryKey: ["documents"] });
     },
     onError: (e) =>
       setError(e instanceof Error ? e.message : "The photo could not be saved."),
   });
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+    <div id="photo-fix" className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
       <h2 className="font-display text-lg font-bold text-[var(--text)]">
         Photo crop and fix tool
       </h2>
       <p className="mt-1 text-sm text-[var(--dim)]">
         Fix a passport photo right here, no other app needed. Choose the
-        photo, move and zoom until your head and shoulders sit in the frame
-        like the photo guide shows, then save. PortaGov saves it at full
-        quality, never squeezed down, because this photo goes in your
+        photo, move and zoom until your head and shoulders sit inside the
+        frame like the photo guide shows, then save. The finished photo is
+        portrait, {CROP_WIDTH} by {CROP_HEIGHT} pixels. Guide size: 35 by
+        45 mm is a commonly recommended guide size, not an official size.
+        PortaGov saves it at full quality, never squeezed down, and under
+        the 1 MB portal scan limit, because this photo goes in your
         passport.
       </p>
       <label className="mt-3 inline-block cursor-pointer rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold text-[var(--text)]">
@@ -11457,9 +13826,15 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
             const f = e.target.files?.[0];
             if (f) {
               setSaved("");
+              setSavedSize("");
               setError("");
+              setScale(1);
+              setOffX(0);
+              setOffY(0);
+              setReplaceId(0);
               setSrc(URL.createObjectURL(f));
             }
+            e.target.value = "";
           }}
         />
       </label>
@@ -11467,14 +13842,25 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
         <div className="mt-4 grid gap-4 sm:grid-cols-[300px_1fr]">
           <div>
             <img ref={imgRef} src={src} alt="" className="hidden" onLoad={draw} />
-            <canvas
-              ref={canvasRef}
-              width={600}
-              height={600}
-              className="w-full max-w-75 rounded-lg border-2"
-              style={{ borderColor: "#166534" }}
-              aria-label="Preview of your fixed passport photo"
-            />
+            <div className="relative w-full max-w-[280px]">
+              <canvas
+                ref={canvasRef}
+                width={CROP_WIDTH}
+                height={CROP_HEIGHT}
+                className="w-full rounded-lg border-2"
+                style={{ borderColor: "#166534" }}
+                aria-label="Preview of your cropped passport photo"
+              />
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute rounded-[50%] border-2 border-dashed border-white/90"
+                style={{ left: "18%", right: "18%", top: "7%", height: "52%" }}
+              />
+            </div>
+            <p className="mt-2 text-sm text-[var(--dim)]">
+              Preview: this is exactly the photo that will be saved,{" "}
+              {CROP_WIDTH} by {CROP_HEIGHT} pixels, portrait.
+            </p>
           </div>
           <div className="space-y-3">
             <div>
@@ -11510,7 +13896,7 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
               </div>
             ) : null}
             <PrimaryButton onClick={() => save.mutate()} disabled={save.isPending}>
-              {save.isPending ? "Saving..." : "Save the fixed photo to my wallet"}
+              {save.isPending ? "Saving..." : "Save the cropped photo to my wallet"}
             </PrimaryButton>
             {quality ? (
               <p className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
@@ -11518,7 +13904,10 @@ function PhotoFixTool({ profile }: { profile: ProfileT }) {
               </p>
             ) : null}
             {saved ? (
-              <p className="text-sm font-semibold text-[var(--text)]">{saved}</p>
+              <p role="status" className="text-sm font-semibold text-[var(--text)]">{saved}</p>
+            ) : null}
+            {savedSize ? (
+              <p className="text-sm text-[var(--dim)]">{savedSize}</p>
             ) : null}
             {error ? (
               <p role="alert" className="text-sm font-semibold text-[var(--warn)]">{error}</p>
@@ -12673,6 +15062,7 @@ function InstitutionPortalPage({ ministryId, profile }: { ministryId: string; pr
         ) : null}
         {tab === "reports" ? (
           <div className="mt-4 space-y-5">
+            <InstitutionDailySummary institution={ministry.name} />
             <InstitutionReports institution={ministry.name} />
             <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
               <h2 className="font-display text-lg font-bold text-[var(--text)]">
@@ -13373,6 +15763,499 @@ function OnboardingApprovals() {
   );
 }
 
+/* ---------- per-page Help button: plain words about this page, then a real person ---------- */
+
+const PAGE_HELP: Record<string, { title: string; lines: string[] }> = {
+  home: {
+    title: "Home",
+    lines: [
+      "This is the front page. Pick a ministry or a service to start, or sign in to see your own applications.",
+      "You apply to PortaGov first. PortaGov checks your documents, you pay a billing number, and only then is your application sent to the institution.",
+      "PortaGov never asks you to pay to a personal number. Pay only to the billing number on your application.",
+    ],
+  },
+  ministry: {
+    title: "Ministry",
+    lines: [
+      "This page lists one ministry and the services it offers.",
+      "Pick a service to see its fee, the time it takes, and the documents you need.",
+      "You sign in before you start an application.",
+    ],
+  },
+  service: {
+    title: "Service",
+    lines: [
+      "This page explains one service: its fee, the time it takes, and what you need.",
+      "Read the documents list first. Every document must be green before you can submit.",
+      "Press Start application when you are ready. You sign in first if you have not already.",
+    ],
+  },
+  signin: {
+    title: "Sign in",
+    lines: [
+      "Sign in with your phone number. PortaGov sends you a code, and you type it here.",
+      "New here? Choose I am new here and fill in your details once. PortaGov saves them, so you never type them again.",
+      "Returning? Choose I am not new here and your saved details come back.",
+    ],
+  },
+  account: {
+    title: "My account",
+    lines: [
+      "Your saved details live here: your name, phone, address, and documents.",
+      "Change anything that is wrong. Every application you start after that uses the new details.",
+      "Your profile is saved on your account, so you only give your details once.",
+    ],
+  },
+  apply: {
+    title: "Apply",
+    lines: [
+      "Fill in this form step by step. The checklist at the top must be all green before you can submit.",
+      "You can save a draft and finish later. Drafts are listed under Drafts in My applications, on this device.",
+      "After you submit, PortaGov gives you a billing number and a tracking number. Pay the billing number, and PortaGov releases your application to the institution.",
+    ],
+  },
+  applications: {
+    title: "My applications",
+    lines: [
+      "Every application you have sent, with its live status.",
+      "Drafts you have not finished yet are listed at the top. Press Resume draft to pick one up where you left off.",
+      "Press an application to see its timeline, its billing number, and its payments.",
+    ],
+  },
+  application: {
+    title: "Application",
+    lines: [
+      "This is one application. The top card shows where it is: with PortaGov or with the institution.",
+      "Your tracking number and billing number are on this page. Keep the tracking number, you need it to follow up.",
+      "Pay the billing number with MTN MoMo or Orange Money, then book a visit here if the service needs you in person.",
+    ],
+  },
+  wallet: {
+    title: "Wallet",
+    lines: [
+      "Your document wallet holds your documents, so you never upload the same one twice.",
+      "Add a document once, and attach it to any application from here.",
+      "Payment receipts from every confirmed payment are kept here too, with the billing number, amount, date, service and method.",
+    ],
+  },
+  appointments: {
+    title: "Appointments",
+    lines: [
+      "Your booked visits, soonest first.",
+      "Book a visit from an application page when the service needs you in person.",
+      "Bring your ID and your ticket number to the visit.",
+    ],
+  },
+  payments: {
+    title: "Payments",
+    lines: [
+      "Every payment, receipt, and refund of yours, in one list.",
+      "A receipt appears here only after PortaGov confirms the payment against your billing number.",
+      "Press a payment to open its application, or download the receipt to print it.",
+    ],
+  },
+  family: {
+    title: "My family",
+    lines: [
+      "The people you apply for most, saved once with their consent.",
+      "Only family members with consent saved here can be chosen on an application.",
+      "PortaGov never applies for someone without their consent.",
+    ],
+  },
+  track: {
+    title: "Track",
+    lines: [
+      "Type your tracking number and phone to see where your application is.",
+      "You do not need to be signed in to track.",
+      "If the number is not found, check the letters and try again, or ask the help desk.",
+    ],
+  },
+  access: {
+    title: "Ways to apply",
+    lines: [
+      "Ways to apply: by yourself, with a PortaGov agent, or from abroad.",
+      "No smartphone of your own? An agent at a service centre can sit with you and apply in your name.",
+      "Living abroad? Apply from any country and choose embassy delivery or collection in Monrovia.",
+    ],
+  },
+  how: {
+    title: "How it works",
+    lines: [
+      "How PortaGov works, step by step: apply, documents checked, pay the billing number, then release to the institution.",
+      "The institution only sees your application after PortaGov releases it.",
+      "PortaGov tracks your payment, tracking number and updates at every step.",
+    ],
+  },
+  help: {
+    title: "Help",
+    lines: [
+      "Ask the help team anything, in plain words.",
+      "Leave your name and number, and the help team will call you back.",
+      "If the assistant cannot answer, your question becomes a ticket for a real person, on the same tracking number where it applies.",
+    ],
+  },
+  centre: {
+    title: "Service centre",
+    lines: [
+      "County service centres: walk in, and an officer helps you apply on the spot.",
+      "Bring your documents and your phone number.",
+      "The officer applies with you, and your application still goes through PortaGov the same way.",
+    ],
+  },
+  business: {
+    title: "Business",
+    lines: [
+      "For businesses: file applications for your people from one company wallet.",
+      "Pay a billing from the company balance, and the receipt belongs to that person's application.",
+      "Your business details are saved once and reused on every application.",
+    ],
+  },
+  verify: {
+    title: "Verify",
+    lines: [
+      "Check that a PortaGov certificate is real.",
+      "Type the certificate number, and PortaGov tells you if it is valid and who it belongs to.",
+      "A certificate that does not verify should not be trusted.",
+    ],
+  },
+  embassies: {
+    title: "Embassies",
+    lines: [
+      "Every Liberian embassy, with its hours, contacts, and what it can collect or deliver.",
+      "Living abroad, choose the embassy in your country when you apply.",
+      "The embassy is updated about your service, so it can help you locally.",
+    ],
+  },
+  privacy: {
+    title: "Privacy",
+    lines: [
+      "Your details belong to you. PortaGov uses them only to run your applications.",
+      "PortaGov never sells your details and never asks for your password or code by phone.",
+      "Read this page for the full promise, in plain words.",
+    ],
+  },
+  certificate: {
+    title: "Certificate",
+    lines: [
+      "Your digital certificate for a finished service.",
+      "Check the number, the name, and the service. Keep it safe, and share it only where you need to.",
+      "Anyone can verify it on the Verify page.",
+    ],
+  },
+  near: {
+    title: "Near me",
+    lines: [
+      "Services and help near you, by county.",
+      "Find the closest service centre or agent.",
+      "If nothing is near you, apply from home, that is what PortaGov is for.",
+    ],
+  },
+  dashboard: {
+    title: "Dashboard",
+    lines: [
+      "A public view of how PortaGov is doing.",
+      "Counts of applications and services, with no personal details.",
+      "Your own applications are under My applications, not here.",
+    ],
+  },
+  training: {
+    title: "Training",
+    lines: [
+      "Short guides that teach you how to use PortaGov.",
+      "Start with the basics, then learn one thing at a time.",
+      "Stuck? Ask a question below, or open the help page.",
+    ],
+  },
+  status: {
+    title: "Status",
+    lines: [
+      "The live state of PortaGov: whether services are running normally.",
+      "If something is down, this page says what is affected.",
+      "Your applications and drafts are safe on your device while PortaGov is checked.",
+    ],
+  },
+  shared: {
+    title: "Shared application",
+    lines: [
+      "Someone shared an application with you through a secure link.",
+      "You see only what was shared with you, nothing else.",
+      "If the link does not open, ask the person who sent it to send it again.",
+    ],
+  },
+  onboarding: {
+    title: "Join PortaGov",
+    lines: [
+      "Joining a new institution to PortaGov.",
+      "Fill in the form, preview how your services will look, and test in the sandbox.",
+      "PortaGov approves you before you go live, with no rebuild and no code change.",
+    ],
+  },
+};
+
+function pageHelpFor(route: Route): { title: string; lines: string[] } {
+  return (
+    PAGE_HELP[route.name] ?? {
+      title: "This page",
+      lines: [
+        "This page is part of PortaGov, where you apply for government services from home.",
+        "If anything here is unclear, ask below in plain words. If the assistant cannot answer, it passes your question to a real person.",
+      ],
+    }
+  );
+}
+
+function PageHelpButton({ route, profile }: { route: Route; profile: ProfileT | null }) {
+  const [open, setOpen] = useState(false);
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [askError, setAskError] = useState("");
+  const [pendingRoute, setPendingRoute] = useState("");
+  const [pendingQuestion, setPendingQuestion] = useState("");
+  const [guestName, setGuestName] = useState("");
+  const [guestPhone, setGuestPhone] = useState("");
+  const [ticketMsg, setTicketMsg] = useState("");
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  const help = pageHelpFor(route);
+  const apps = useQuery({
+    queryKey: ["applications", profile?.id ?? 0],
+    queryFn: () => api.listApplications({ profileId: profile?.id ?? 0 }),
+    enabled: !!profile && open,
+  });
+
+  /* Close the help panel when the person taps or clicks anywhere outside
+     it, or presses Escape, the same way the Accessibility dropdown closes. */
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: MouseEvent | TouchEvent) => {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("touchstart", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("touchstart", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const ask = useMutation({
+    mutationFn: async (q: string) => {
+      const pageText = `${help.title}. ${help.lines.join(" ")}`;
+      const context = [
+        `The citizen is on this page: ${pageText}`,
+        assistantContext(q, profile, apps.data?.applications ?? []),
+      ].join("\n\n");
+      return await api.askAssistant({ question: q, context });
+    },
+    onSuccess: (r, q) => {
+      setAnswer(r.answer);
+      if (r.needs_ticket) {
+        setPendingRoute(r.route && r.route !== "None" ? r.route : "Help desk");
+        setPendingQuestion(q);
+      } else {
+        setPendingRoute("");
+        setPendingQuestion("");
+      }
+    },
+    onError: () => {
+      setAnswer("");
+      setAskError(
+        "I could not reach my knowledge just now. You can still pass your question to the Help desk below, and a real person will answer.",
+      );
+      setPendingRoute("Help desk");
+      setPendingQuestion(question);
+    },
+  });
+
+  const relatedApp = () => {
+    const myApps = apps.data?.applications ?? [];
+    if (route.name === "application") {
+      return myApps.find((a) => a.id === route.id) ?? myApps[0];
+    }
+    return (
+      myApps.find((a) =>
+        pendingQuestion.toUpperCase().includes(a.reference.toUpperCase()),
+      ) ?? myApps[0]
+    );
+  };
+
+  const createTicket = useMutation({
+    mutationFn: async () => {
+      const related = relatedApp();
+      const syncNote = related
+        ? `\n\n[Synced to application ${related.reference} (${related.service_name} at ${related.institution}, status ${related.status}). Keep every reply on this same application and tracking number, ${related.reference}.]`
+        : "";
+      return await api.submitHelpRequest({
+        profileId: profile?.id ?? null,
+        name: profile?.full_name ?? guestName,
+        phone: profile?.phone ?? guestPhone,
+        topic: pendingRoute,
+        message: `${pendingQuestion}\n\n[Asked from the ${help.title} page. Passed by the PortaGov assistant to: ${pendingRoute}. The assistant could not answer this fully. Citizen is signed in as ${profile?.full_name ?? "a guest"}.]${syncNote}`,
+      });
+    },
+    onSuccess: (r) => {
+      const related = relatedApp();
+      setTicketMsg(
+        `Done. Your ticket is ${ticketNumber(r.id, new Date().toISOString())}, routed to ${pendingRoute}.${related ? ` It is synced to your application ${related.reference}, so the reply stays on that same tracking number.` : ""} A real person will answer, promised within one working day, and the reply lands in your messages and on the Help page.`,
+      );
+      setPendingRoute("");
+      setPendingQuestion("");
+      setAnswer("");
+    },
+  });
+
+  return (
+    <div className="relative shrink-0" ref={panelRef}>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-label="Help with this page"
+        title="Help with this page"
+        onClick={() => {
+          setOpen((o) => !o);
+          setTicketMsg("");
+        }}
+        className="flex h-9 w-9 items-center justify-center rounded-full border text-base font-extrabold"
+        style={{
+          color: "var(--text)",
+          borderColor: "var(--border)",
+          backgroundColor: open ? "var(--gold-soft)" : "var(--surface-alt)",
+        }}
+      >
+        ?
+      </button>
+      {open ? (
+        <div
+          role="dialog"
+          aria-label={`Help: ${help.title}`}
+          className="absolute right-0 top-full z-50 mt-2 max-h-[75vh] w-[min(92vw,22rem)] overflow-y-auto rounded-xl border p-4 shadow-lg"
+          style={{
+            borderColor: "var(--border)",
+            backgroundColor: "var(--surface)",
+          }}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <p className="font-display font-extrabold text-[var(--text)]">
+              Help: {help.title}
+            </p>
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              aria-label="Close help"
+              className="rounded-full px-2 py-1 font-bold text-[var(--text)]"
+            >
+              ×
+            </button>
+          </div>
+          <ul className="mt-2 space-y-1.5 text-sm text-[var(--dim)]">
+            {help.lines.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+          <form
+            className="mt-3 space-y-2"
+            onSubmit={(e: FormEvent) => {
+              e.preventDefault();
+              const q = question.trim();
+              if (q.length < 3) return;
+              setAnswer("");
+              setTicketMsg("");
+              setAskError("");
+              ask.mutate(q);
+            }}
+          >
+            <FieldLabel htmlFor="page-help-q">
+              Ask a question about this page
+            </FieldLabel>
+            <input
+              id="page-help-q"
+              className={inputCls}
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              placeholder="Type your question in plain words"
+            />
+            <PrimaryButton type="submit" disabled={ask.isPending}>
+              {ask.isPending ? "Asking..." : "Ask"}
+            </PrimaryButton>
+          </form>
+          {answer ? (
+            <p className="mt-3 rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
+              {answer}
+            </p>
+          ) : null}
+          {askError ? (
+            <p role="alert" className="mt-3 text-sm font-semibold text-[var(--warn)]">
+              {askError}
+            </p>
+          ) : null}
+          {pendingRoute ? (
+            <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-3">
+              <p className="text-sm text-[var(--text)]">
+                I cannot answer this fully. I can pass it to the{" "}
+                {pendingRoute}, and a real person will answer.
+              </p>
+              {!profile ? (
+                <div className="mt-2 space-y-2">
+                  <div>
+                    <FieldLabel htmlFor="page-help-name">Your name</FieldLabel>
+                    <input
+                      id="page-help-name"
+                      className={inputCls}
+                      value={guestName}
+                      onChange={(e) => setGuestName(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <FieldLabel htmlFor="page-help-phone">Your phone number</FieldLabel>
+                    <input
+                      id="page-help-phone"
+                      className={inputCls}
+                      value={guestPhone}
+                      onChange={(e) => setGuestPhone(e.target.value)}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              <div className="mt-2">
+                <PrimaryButton
+                  type="button"
+                  disabled={
+                    createTicket.isPending ||
+                    (!profile &&
+                      (guestName.trim().length < 2 || guestPhone.trim().length < 7))
+                  }
+                  onClick={() => createTicket.mutate()}
+                >
+                  {createTicket.isPending
+                    ? "Sending..."
+                    : `Pass to the ${pendingRoute}`}
+                </PrimaryButton>
+              </div>
+            </div>
+          ) : null}
+          {ticketMsg ? (
+            <p role="status" className="mt-3 text-sm font-semibold text-[var(--text)]">
+              {ticketMsg}
+            </p>
+          ) : null}
+          <p className="mt-3 text-xs text-[var(--dim)]">
+            Need a person another way?{" "}
+            <a href="#/help" className="font-semibold underline">
+              Open the full help page
+            </a>
+            .
+          </p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 /* ---------- PortaGov AI assistant (floating, on citizen pages) ---------- */
 
 type ChatMsg = { from: "ai" | "citizen" | "system"; text: string };
@@ -13987,11 +16870,42 @@ function StaffPortalPage() {
   const [phone, setPhone] = useState("");
   const [staffPassword, setStaffPassword] = useState("");
   const [error, setError] = useState("");
+  /* Two-step sign-in: step 1 checks the password and issues a code,
+     step 2 checks the code. The staff session only starts after step 2. */
+  const [step, setStep] = useState<"password" | "code">("password");
+  const [staffId, setStaffId] = useState(0);
+  const [staffCode, setStaffCode] = useState("");
+  const [demoCode, setDemoCode] = useState("");
   const signIn = useMutation({
     mutationFn: async () => await api.findStaff({ name: name.trim(), phone: phone.trim(), password: staffPassword }),
     onSuccess: (r) => {
-      if (!r.staff) {
-        setError("No active staff account matches that name, phone, and password. Staff accounts are created in the platform portal, with a password set there.");
+      if (r.locked) {
+        setError(lockMessage(r.minutes_left));
+        return;
+      }
+      if (!r.need_code) {
+        setError("No active staff account matches that name, phone, and password. Staff accounts are created in the platform portal, with a password set there. Five wrong passwords lock the account for 15 minutes.");
+        return;
+      }
+      setStaffId(r.staff_id);
+      setDemoCode(r.demo_code);
+      setStaffCode("");
+      setStep("code");
+    },
+  });
+  const verifyCode = useMutation({
+    mutationFn: async () => await api.verifyStaffCode({ staffId, code: staffCode.trim() }),
+    onSuccess: (r) => {
+      if (r.locked) {
+        setError(`${lockMessage(r.minutes_left)} Go back and sign in again for a fresh code after that time.`);
+        return;
+      }
+      if (!r.ok || !r.staff) {
+        setError(
+          r.attempts_left > 0 && r.attempts_left < 5
+            ? `That code is not correct, or it has expired. You have ${r.attempts_left} ${r.attempts_left === 1 ? "try" : "tries"} left before the account locks for 15 minutes.`
+            : "That code is not correct, or it has expired. Go back and sign in again for a fresh code.",
+        );
         return;
       }
       setSession(r.staff);
@@ -14022,42 +16936,83 @@ function StaffPortalPage() {
         <div className="mt-5 max-w-xl rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
           <p className="text-sm text-[var(--dim)]">
             Staff accounts are created by the platform portal, with a role,
-            permissions, and a password. Sign in with the name, phone, and
-            password on your staff account. Your name appears on the work
+            permissions, and a password. Sign-in has two steps: your
+            password, then a one-time code. Your name appears on the work
             you do, in the audit trail.
           </p>
-          <form
-            className="mt-4 space-y-3"
-            onSubmit={(e: FormEvent) => {
-              e.preventDefault();
-              setError("");
-              signIn.mutate();
-            }}
-          >
-            <div>
-              <FieldLabel htmlFor="staff-name">Your full name (required)</FieldLabel>
-              <input id="staff-name" {...FIELDS.findStaff.name} className={inputCls} value={name}
-                onChange={(e) => setName(e.target.value)} autoComplete="name" />
-            </div>
-            <div>
-              <FieldLabel htmlFor="staff-phone">Your phone number (required)</FieldLabel>
-              <input id="staff-phone" {...FIELDS.findStaff.phone} className={inputCls} value={phone}
-                onChange={(e) => setPhone(e.target.value)} autoComplete="tel" />
-            </div>
-            <div>
-              <FieldLabel htmlFor="staff-password">Your password (required)</FieldLabel>
-              <input id="staff-password" type="password" {...FIELDS.findStaff.password} className={inputCls} value={staffPassword}
-                onChange={(e) => setStaffPassword(e.target.value)} autoComplete="current-password" />
-            </div>
-            {error ? (
-              <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
-                {error}
+          {step === "code" ? (
+            <div className="mt-4 space-y-3">
+              <h2 className="font-display text-xl font-bold text-[var(--text)]">
+                Step 2: enter your code
+              </h2>
+              <p className="text-sm text-[var(--dim)]">
+                We sent a 6 number code to your staff phone. In this build
+                the code is shown here:{" "}
+                <strong className="text-[var(--text)]">{demoCode}</strong>
               </p>
-            ) : null}
-            <PrimaryButton type="submit" disabled={signIn.isPending}>
-              Sign in to the staff portal
-            </PrimaryButton>
-          </form>
+              <div>
+                <FieldLabel htmlFor="staff-code">Staff sign-in code</FieldLabel>
+                <input id="staff-code" {...FIELDS.verifyStaffCode.code} className={inputCls} value={staffCode}
+                  onChange={(e) => setStaffCode(e.target.value)}
+                  placeholder="6 numbers" inputMode="numeric" />
+              </div>
+              {error ? (
+                <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+                  {error}
+                </p>
+              ) : null}
+              <div className="flex flex-wrap gap-3">
+                <PrimaryButton
+                  onClick={() => {
+                    setError("");
+                    verifyCode.mutate();
+                  }}
+                  disabled={verifyCode.isPending}
+                >
+                  Finish sign-in
+                </PrimaryButton>
+                <GhostButton onClick={() => { setStep("password"); setError(""); }}>
+                  Back
+                </GhostButton>
+              </div>
+              <p className="text-sm text-[var(--dim)]">
+                Five wrong codes lock the account for 15 minutes.
+              </p>
+            </div>
+          ) : (
+            <form
+              className="mt-4 space-y-3"
+              onSubmit={(e: FormEvent) => {
+                e.preventDefault();
+                setError("");
+                signIn.mutate();
+              }}
+            >
+              <div>
+                <FieldLabel htmlFor="staff-name">Your full name (required)</FieldLabel>
+                <input id="staff-name" {...FIELDS.findStaff.name} className={inputCls} value={name}
+                  onChange={(e) => setName(e.target.value)} autoComplete="name" />
+              </div>
+              <div>
+                <FieldLabel htmlFor="staff-phone">Your phone number (required)</FieldLabel>
+                <input id="staff-phone" {...FIELDS.findStaff.phone} className={inputCls} value={phone}
+                  onChange={(e) => setPhone(e.target.value)} autoComplete="tel" />
+              </div>
+              <div>
+                <FieldLabel htmlFor="staff-password">Your password (required)</FieldLabel>
+                <input id="staff-password" type="password" {...FIELDS.findStaff.password} className={inputCls} value={staffPassword}
+                  onChange={(e) => setStaffPassword(e.target.value)} autoComplete="current-password" />
+              </div>
+              {error ? (
+                <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+                  {error}
+                </p>
+              ) : null}
+              <PrimaryButton type="submit" disabled={signIn.isPending}>
+                Continue to the code step
+              </PrimaryButton>
+            </form>
+          )}
         </div>
       ) : (
         <div className="mt-4 space-y-6">

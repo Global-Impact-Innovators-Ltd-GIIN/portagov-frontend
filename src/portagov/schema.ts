@@ -12,6 +12,7 @@ export const profiles = sqliteTable("profiles", {
   county: text("county").notNull(),
   phone: text("phone").notNull().unique(),
   email: text("email").notNull().default(""),
+  photo: text("photo").notNull().default(""),
   emergencyName: text("emergency_name").notNull(),
   emergencyPhone: text("emergency_phone").notNull(),
   nationalId: text("national_id").notNull().default(""),
@@ -41,7 +42,9 @@ export const profiles = sqliteTable("profiles", {
     .notNull()
     .default(false),
   failedAttempts: integer("failed_attempts").notNull().default(0),
+  codeFailedAttempts: integer("code_failed_attempts").notNull().default(0),
   lockedUntil: integer("locked_until", { mode: "timestamp_ms" }),
+  sessionsRevokedAt: integer("sessions_revoked_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -210,6 +213,9 @@ export const statusEvents = sqliteTable("status_events", {
     .references(() => applications.id),
   status: text("status").notNull(),
   note: text("note").notNull().default(""),
+  /* Who did it: the applicant, a named officer, the agent who helped, or
+     PortaGov itself. Empty on events recorded before actors were stored. */
+  actor: text("actor").notNull().default(""),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -359,6 +365,9 @@ export const staffAccounts = sqliteTable("staff_accounts", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull(),
   phone: text("phone").notNull(),
+  failedAttempts: integer("failed_attempts").notNull().default(0),
+  codeFailedAttempts: integer("code_failed_attempts").notNull().default(0),
+  lockedUntil: integer("locked_until", { mode: "timestamp_ms" }),
   role: text("role", {
     enum: [
       "Help desk",
@@ -544,10 +553,46 @@ export const devices = sqliteTable("devices", {
     .references(() => profiles.id),
   deviceId: text("device_id").notNull(),
   label: text("label").notNull().default(""),
+  signedOut: integer("signed_out", { mode: "boolean" })
+    .notNull()
+    .default(false),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
   lastSeen: integer("last_seen", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+/* Sign-in history: one row per successful citizen sign-in, so the
+   person can see when and from which device their account was used,
+   including sign-ins from a device seen for the first time. */
+export const signInEvents = sqliteTable("sign_in_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  profileId: integer("profile_id")
+    .notNull()
+    .references(() => profiles.id),
+  deviceId: text("device_id").notNull().default(""),
+  label: text("label").notNull().default(""),
+  isNewDevice: integer("is_new_device", { mode: "boolean" })
+    .notNull()
+    .default(false),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+/* One-time codes for the second step of staff sign-in. Kept apart
+   from citizen auth codes because staff accounts are not profiles. */
+export const staffAuthCodes = sqliteTable("staff_auth_codes", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  staffId: integer("staff_id")
+    .notNull()
+    .references(() => staffAccounts.id),
+  code: text("code").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+  used: integer("used", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
 });
@@ -590,6 +635,9 @@ export const complaints = sqliteTable("complaints", {
     .notNull()
     .default("New"),
   reply: text("reply").notNull().default(""),
+  /* When PortaGov answered, so the answer shows in the application
+     activity record on the right date. Empty until answered. */
+  answeredAt: integer("answered_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

@@ -687,6 +687,70 @@ export const STATUS_STEPS = [
   "Completed",
 ] as const;
 
+/* Plain-words meaning for every application status the backend can set.
+   The backend enum in updateApplicationStatus has nine values, and
+   STATUS_STEPS adds "Payment confirmed", so all ten are covered here.
+   Use applicationStatusPlain() everywhere a status is shown, so the
+   short label and the explanation stay the same on every page. No
+   status is invented here: unknown values fall back to the raw text. */
+export const APPLICATION_STATUS_PLAIN: Record<
+  string,
+  { short: string; meaning: string }
+> = {
+  "Submitted to PortaGov": {
+    short: "Received",
+    meaning: "PortaGov has received your application. It is waiting for review.",
+  },
+  "Under review by PortaGov": {
+    short: "In progress",
+    meaning: "PortaGov is checking your application before releasing it to the institution.",
+  },
+  "Payment confirmed": {
+    short: "In progress",
+    meaning: "Your payment is confirmed. PortaGov will release your application next.",
+  },
+  "Released to institution": {
+    short: "In progress",
+    meaning: "PortaGov has sent your application to the institution.",
+  },
+  "Received by institution": {
+    short: "Received",
+    meaning: "The institution has received your application.",
+  },
+  "In review at institution": {
+    short: "In progress",
+    meaning: "The institution is working on your application now.",
+  },
+  "Appointment set": {
+    short: "In progress",
+    meaning: "Your visit is booked. Come in at the booked time.",
+  },
+  "Ready for collection": {
+    short: "Ready to collect",
+    meaning: "Your document is ready. Bring your pickup code and your ID to collect it.",
+  },
+  Completed: {
+    short: "Completed",
+    meaning: "Your service is complete.",
+  },
+  "More information needed": {
+    short: "Needs your attention",
+    meaning: "PortaGov or the institution needs one more thing from you. Open the application and read the note.",
+  },
+};
+
+export function applicationStatusPlain(status: string): {
+  short: string;
+  meaning: string;
+} {
+  return (
+    APPLICATION_STATUS_PLAIN[status] ?? {
+      short: status,
+      meaning: "Follow this application for updates.",
+    }
+  );
+}
+
 export function ministryById(id: string): Ministry {
   return MINISTRIES.find((m) => m.id === id) ?? MINISTRIES[0]!;
 }

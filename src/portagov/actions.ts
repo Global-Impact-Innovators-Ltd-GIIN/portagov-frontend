@@ -4,6 +4,7 @@
 import { defineAction, z, type ActionsModule } from "./sdk";
 import { asc, desc, eq } from "./db";
 import * as schema from "./schema";
+import { serviceById } from "./services";
 
 const profileShape = z.object({
   id: z.number(),
@@ -15,6 +16,7 @@ const profileShape = z.object({
   county: z.string(),
   phone: z.string(),
   email: z.string(),
+  photo: z.string(),
   emergency_name: z.string(),
   emergency_phone: z.string(),
   national_id: z.string(),
@@ -74,6 +76,7 @@ function toProfile(row: ProfileRow): z.infer<typeof profileShape> {
     county: row.county,
     phone: row.phone,
     email: row.email,
+    photo: typeof row.photo === "string" ? row.photo : "",
     emergency_name: row.emergencyName,
     emergency_phone: row.emergencyPhone,
     national_id: row.nationalId,
@@ -238,6 +241,8 @@ const paymentShape = z.object({
   id: z.number(),
   application_id: z.number(),
   application_ref: z.string(),
+  billing_number: z.string(),
+  service_name: z.string(),
   method: z.string(),
   amount: z.number(),
   payer_phone: z.string(),
@@ -324,6 +329,141 @@ async function checkCode(
   return true;
 }
 
+/* Wrong-code lockout: 5 wrong codes lock sign-in for 15 minutes,
+   the same limit as wrong passwords. The lock is shared through
+   lockedUntil, so a code lock also blocks a password sign-in until
+   it expires, and loginStart already reports the minutes left. */
+const CODE_LOCKOUT_ATTEMPTS = 5;
+const CODE_LOCKOUT_MINUTES = 15;
+
+function minutesLeft(until: Date | null | undefined): number {
+  if (!until) return 0;
+  return Math.max(0, Math.ceil((until.getTime() - Date.now()) / 60000));
+}
+
+async function recordSignInEvent(
+  ctx: Ctx,
+  profileId: number,
+  deviceId: string,
+  label: string,
+  isNewDevice: boolean,
+): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  await db.insert(schema.signInEvents).values({
+    profileId,
+    deviceId,
+    label,
+    isNewDevice,
+  });
+}
+
+/** Checks a citizen code and counts wrong tries. A correct code clears
+    the count. Five wrong codes lock the account for 15 minutes. */
+async function checkCitizenCode(
+  ctx: Ctx,
+  profileId: number,
+  purpose: string,
+  code: string,
+): Promise<{
+  ok: boolean;
+  locked: boolean;
+  minutesLeft: number;
+  attemptsLeft: number;
+}> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.profiles)
+    .where(eq(schema.profiles.id, profileId))
+    .limit(1);
+  const row = rows[0];
+  if (!row) {
+    return { ok: false, locked: false, minutesLeft: 0, attemptsLeft: 0 };
+  }
+  if (row.lockedUntil && row.lockedUntil.getTime() > Date.now()) {
+    return {
+      ok: false,
+      locked: true,
+      minutesLeft: minutesLeft(row.lockedUntil),
+      attemptsLeft: 0,
+    };
+  }
+  const ok = await checkCode(ctx, profileId, purpose, code);
+  if (ok) {
+    await db
+      .update(schema.profiles)
+      .set({ codeFailedAttempts: 0 })
+      .where(eq(schema.profiles.id, profileId));
+    return {
+      ok: true,
+      locked: false,
+      minutesLeft: 0,
+      attemptsLeft: CODE_LOCKOUT_ATTEMPTS,
+    };
+  }
+  const attempts = (row.codeFailedAttempts ?? 0) + 1;
+  if (attempts >= CODE_LOCKOUT_ATTEMPTS) {
+    await db
+      .update(schema.profiles)
+      .set({
+        codeFailedAttempts: 0,
+        lockedUntil: new Date(Date.now() + CODE_LOCKOUT_MINUTES * 60 * 1000),
+      })
+      .where(eq(schema.profiles.id, profileId));
+    return {
+      ok: false,
+      locked: true,
+      minutesLeft: CODE_LOCKOUT_MINUTES,
+      attemptsLeft: 0,
+    };
+  }
+  await db
+    .update(schema.profiles)
+    .set({ codeFailedAttempts: attempts })
+    .where(eq(schema.profiles.id, profileId));
+  return {
+    ok: false,
+    locked: false,
+    minutesLeft: 0,
+    attemptsLeft: CODE_LOCKOUT_ATTEMPTS - attempts,
+  };
+}
+
+async function issueStaffCode(ctx: Ctx, staffId: number): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const code = makeCode();
+  await db.insert(schema.staffAuthCodes).values({
+    staffId,
+    code,
+    expiresAt: Date.now() + 10 * 60 * 1000,
+  });
+  return code;
+}
+
+async function checkStaffCode(
+  ctx: Ctx,
+  staffId: number,
+  code: string,
+): Promise<boolean> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.staffAuthCodes)
+    .where(eq(schema.staffAuthCodes.staffId, staffId))
+    .orderBy(desc(schema.staffAuthCodes.id))
+    .limit(10);
+  const match = rows.find(
+    (r) => !r.used && r.code === code.trim(),
+  );
+  if (!match) return false;
+  if (match.expiresAt < Date.now()) return false;
+  await db
+    .update(schema.staffAuthCodes)
+    .set({ used: true })
+    .where(eq(schema.staffAuthCodes.id, match.id));
+  return true;
+}
+
 function passwordProblem(pw: string): string | null {
   if (pw.length < 12) return "Your password must be at least 12 characters long.";
   if (!/[A-Z]/.test(pw)) return "Your password needs at least one capital letter.";
@@ -385,9 +525,12 @@ async function logEvent(
   applicationId: number,
   status: string,
   note: string,
+  actor = "",
 ) {
   const db = ctx.db<typeof schema>();
-  await db.insert(schema.statusEvents).values({ applicationId, status, note });
+  await db
+    .insert(schema.statusEvents)
+    .values({ applicationId, status, note, actor });
 }
 
 async function notify(
@@ -518,6 +661,28 @@ export const Actions = {
           language: args.language,
           updatedAt: new Date(),
         })
+        .where(eq(schema.profiles.id, args.id))
+        .returning();
+      const row = updated[0];
+      if (!row) throw new Error("Profile not found.");
+      ctx.invalidateQueries();
+      return { profile: toProfile(row) };
+    },
+  }),
+
+  updateProfilePhoto: defineAction({
+    description:
+      "Saves or removes a citizen profile photo. The photo is a small square JPEG data URL, cropped in the browser, stored with the profile in the browser store, so it is still there after sign out and sign in on the same device.",
+    request: z.object({
+      id: z.number().int().positive(),
+      photo: z.string().max(500000).default(""),
+    }),
+    response: z.object({ profile: profileShape }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const updated = await db
+        .update(schema.profiles)
+        .set({ photo: args.photo, updatedAt: new Date() })
         .where(eq(schema.profiles.id, args.id))
         .returning();
       const row = updated[0];
@@ -659,7 +824,15 @@ export const Actions = {
         .returning();
       const row = inserted[0];
       if (!row) throw new Error("Application could not be submitted.");
-      await logEvent(ctx, row.id, "Submitted to PortaGov", "Application and documents received by PortaGov. PortaGov is checking the documents.");
+      await logEvent(
+        ctx,
+        row.id,
+        "Submitted to PortaGov",
+        "Application and documents received by PortaGov. PortaGov is checking the documents.",
+        args.channel === "Agent assisted" && args.agentName
+          ? `${args.agentName}, agent for ${profile.fullName}`
+          : profile.fullName,
+      );
       await notify(
         ctx,
         profile.id,
@@ -670,7 +843,13 @@ export const Actions = {
           : `PortaGov: We got your application for ${row.serviceName}. Your tracking number is ${row.reference}. Your billing number is ${billingNumber}. Please pay $${totalDue} with MTN MoMo or Orange Money and quote the billing number. We release your application when the billing number is confirmed paid.`,
       );
       if (releaseNow) {
-        await logEvent(ctx, row.id, "Released to institution", "Automatic release is on.");
+        await logEvent(
+          ctx,
+          row.id,
+          "Released to institution",
+          "Automatic release is on.",
+          "PortaGov (automatic release)",
+        );
         await notify(
           ctx,
           profile.id,
@@ -771,7 +950,13 @@ export const Actions = {
           `Set status to ${args.status}`,
           app.reference,
         );
-        await logEvent(ctx, app.id, args.status, args.statusNote);
+        await logEvent(
+          ctx,
+          app.id,
+          args.status,
+          args.statusNote,
+          args.officerName || app.institution,
+        );
         if (args.status === "Ready for collection" && !app.pickupCode) {
           const code = String(
             100000 + ((app.id * 7919 + Date.now()) % 900000),
@@ -991,12 +1176,37 @@ export const Actions = {
         .returning({ id: schema.appointments.id });
       const row = inserted[0];
       if (!row) throw new Error("Appointment could not be booked.");
+      /* The reminder is recorded for the day before the visit, with
+         what to bring from the real requirements of the service this
+         appointment is for. It is saved in the app and shown on the
+         appointment. The SMS itself will be sent once the SMS sender
+         is live, so the message says so plainly. */
+      const reminderDate = (() => {
+        const d = new Date(`${args.date}T12:00:00Z`);
+        if (Number.isNaN(d.getTime())) return args.date;
+        d.setUTCDate(d.getUTCDate() - 1);
+        return d.toISOString().slice(0, 10);
+      })();
+      let bring: string[] = [];
+      if (args.applicationId != null) {
+        const appRows = await db
+          .select()
+          .from(schema.applications)
+          .where(eq(schema.applications.id, args.applicationId))
+          .limit(1);
+        const svc = appRows[0] ? serviceById(appRows[0].serviceId) : undefined;
+        if (svc) bring = svc.requirements;
+      }
+      const bringText =
+        bring.length > 0
+          ? ` Bring: ${bring.join("; ")}. Also bring your ticket number ${ticket} and the ID on your profile.`
+          : ` Please bring your ID and your ticket number ${ticket}.`;
       await notify(
         ctx,
         args.profileId,
         args.applicationId,
         "Appointment reminder",
-        `PortaGov reminder: You have a ${args.kind} visit on ${args.date}, ${args.timeSlot}, at ${args.office}. Your ticket number is ${ticket}. Please bring your ID and your ticket number.`,
+        `PortaGov reminder for ${reminderDate}, the day before your visit: you have a ${args.kind} visit on ${args.date}, ${args.timeSlot}, at ${args.office}.${bringText} This reminder is saved in the app. The SMS itself will be sent once the SMS sender is live.`,
       );
       ctx.invalidateQueries();
       return { id: row.id, ticket };
@@ -1116,12 +1326,14 @@ export const Actions = {
         .orderBy(desc(schema.payments.id))
         .limit(args.limit);
       const apps = await db.select().from(schema.applications);
-      const refById = new Map(apps.map((a) => [a.id, a.reference]));
+      const appById = new Map(apps.map((a) => [a.id, a]));
       return {
         payments: rows.map((row) => ({
           id: row.id,
           application_id: row.applicationId,
-          application_ref: refById.get(row.applicationId) ?? "",
+          application_ref: appById.get(row.applicationId)?.reference ?? "",
+          billing_number: appById.get(row.applicationId)?.billingNumber ?? "",
+          service_name: appById.get(row.applicationId)?.serviceName ?? "",
           method: row.method,
           amount: row.amount,
           payer_phone: row.payerPhone,
@@ -1325,6 +1537,7 @@ export const Actions = {
         app.id,
         app.status,
         `Proxy consent recorded: ${args.proxyName} may collect with their own ID and consent code ${code}.`,
+        app.applicantName,
       );
       await notify(
         ctx,
@@ -1426,7 +1639,13 @@ export const Actions = {
         .limit(1);
       const relApp = relRows[0];
       if (relApp) {
-        await logEvent(ctx, relApp.id, "Released to institution", args.statusNote);
+        await logEvent(
+          ctx,
+          relApp.id,
+          "Released to institution",
+          args.statusNote,
+          "PortaGov",
+        );
         await notify(
           ctx,
           relApp.profileId,
@@ -1505,7 +1724,13 @@ export const Actions = {
         .limit(1);
       const recalled = recallRows[0];
       if (recalled) {
-        await logEvent(ctx, recalled.id, "Under review by PortaGov", "Recalled by PortaGov for another look.");
+        await logEvent(
+          ctx,
+          recalled.id,
+          "Under review by PortaGov",
+          "Recalled by PortaGov for another look.",
+          "PortaGov",
+        );
         await notify(
           ctx,
           recalled.profileId,
@@ -1558,6 +1783,7 @@ export const Actions = {
           id: z.number(),
           status: z.string(),
           note: z.string(),
+          actor: z.string(),
           created_at: z.string(),
         }),
       ),
@@ -1574,7 +1800,159 @@ export const Actions = {
           id: r.id,
           status: r.status,
           note: r.note,
+          actor: r.actor ?? "",
           created_at: r.createdAt.toISOString(),
+        })),
+      };
+    },
+  }),
+
+  listApplicationActivity: defineAction({
+    description:
+      "Full activity record for one application: every touch in date order, with who did it and when. Built only from real stored events: status changes, the PortaGov audit trail, updates sent to the citizen, payments, and complaints or appeals. Nothing is invented.",
+    request: z.object({ applicationId: z.number().int().positive() }),
+    response: z.object({
+      reference: z.string(),
+      entries: z.array(
+        z.object({
+          kind: z.string(),
+          actor: z.string(),
+          title: z.string(),
+          detail: z.string(),
+          created_at: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const apps = await db
+        .select()
+        .from(schema.applications)
+        .where(eq(schema.applications.id, args.applicationId))
+        .limit(1);
+      const app = apps[0];
+      if (!app) throw new Error("Application not found.");
+      type Entry = {
+        kind: string;
+        actor: string;
+        title: string;
+        detail: string;
+        at: Date;
+        seq: number;
+      };
+      const entries: Entry[] = [];
+      const events = await db
+        .select()
+        .from(schema.statusEvents)
+        .where(eq(schema.statusEvents.applicationId, args.applicationId))
+        .orderBy(asc(schema.statusEvents.id));
+      for (const e of events) {
+        /* Events recorded before actors were stored carry no actor.
+           Only then fall back to what the application itself proves:
+           the submission was the applicant's own act, and a release
+           was PortaGov's act. Never guess a person's name. */
+        const actor =
+          e.actor ||
+          (e.status === "Submitted to PortaGov"
+            ? app.applicantName
+            : e.status === "Released to institution"
+              ? "PortaGov"
+              : app.institution);
+        entries.push({
+          kind: "Status",
+          actor,
+          title: e.status,
+          detail: e.note,
+          at: e.createdAt,
+          seq: e.id,
+        });
+      }
+      const auditRows = await db.select().from(schema.auditLog);
+      for (const a of auditRows.filter(
+        (r) => r.applicationRef === app.reference,
+      )) {
+        entries.push({
+          kind: "PortaGov record",
+          actor: a.actor,
+          title: a.action,
+          detail: `${a.institution} record.`,
+          at: a.createdAt,
+          seq: a.id,
+        });
+      }
+      /* One notify() writes the same update twice, once for SMS and
+         once for WhatsApp. Show it once, naming both channels. */
+      const msgRows = await db.select().from(schema.messages);
+      const byBody = new Map<string, { channels: Set<string>; row: (typeof msgRows)[number] }>();
+      for (const m of msgRows.filter(
+        (r) => r.applicationId === args.applicationId,
+      )) {
+        const key = `${m.kind}|${m.body}`;
+        const found = byBody.get(key);
+        if (found) {
+          found.channels.add(m.channel);
+          if (m.createdAt < found.row.createdAt) found.row = m;
+        } else {
+          byBody.set(key, { channels: new Set([m.channel]), row: m });
+        }
+      }
+      for (const { channels, row } of byBody.values()) {
+        entries.push({
+          kind: "Update sent",
+          actor: "PortaGov",
+          title: row.kind,
+          detail: `${row.body} (Sent by ${[...channels].join(" and ")}.)`,
+          at: row.createdAt,
+          seq: row.id,
+        });
+      }
+      const payRows = await db.select().from(schema.payments);
+      for (const p of payRows.filter(
+        (r) => r.applicationId === args.applicationId,
+      )) {
+        entries.push({
+          kind: "Payment",
+          actor: p.payerPhone,
+          title: `${p.method} payment ${p.status.toLowerCase()}: $${p.amount}`,
+          detail: `Transaction reference ${p.transactionRef}, billing number ${app.billingNumber}.`,
+          at: p.createdAt,
+          seq: p.id,
+        });
+      }
+      const caseRows = await db.select().from(schema.complaints);
+      for (const c of caseRows.filter(
+        (r) => r.applicationId === args.applicationId,
+      )) {
+        entries.push({
+          kind: c.kind,
+          actor: app.applicantName,
+          title: `${c.kind} filed`,
+          detail: c.reason,
+          at: c.createdAt,
+          seq: c.id,
+        });
+        if (c.reply && c.answeredAt) {
+          entries.push({
+            kind: c.kind,
+            actor: "PortaGov",
+            title: `PortaGov answered the ${c.kind.toLowerCase()}`,
+            detail: c.reply,
+            at: c.answeredAt,
+            seq: c.id,
+          });
+        }
+      }
+      entries.sort(
+        (a, b) => a.at.getTime() - b.at.getTime() || a.seq - b.seq,
+      );
+      return {
+        reference: app.reference,
+        entries: entries.map((e) => ({
+          kind: e.kind,
+          actor: e.actor,
+          title: e.title,
+          detail: e.detail,
+          created_at: e.at.toISOString(),
         })),
       };
     },
@@ -1745,6 +2123,31 @@ export const Actions = {
             .where(eq(schema.applications.id, pay.applicationId))
             .limit(1);
           const app = apps[0];
+          if (app) {
+            /* Every confirmed payment gets its own receipt in the wallet,
+               for that payment alone: its own amount, method and
+               transaction reference, with the billing number, service and
+               tracking number. Saved once per payment, never twice, and
+               never the running total, so a payment plan with two parts
+               gets two correct receipts. */
+            const receiptTitle = `Receipt for ${app.serviceName}, billing ${app.billingNumber}, $${pay.amount} via ${pay.method}, transaction ${pay.transactionRef}, tracking ${app.reference}`;
+            const savedDocs = await db
+              .select()
+              .from(schema.documents)
+              .where(eq(schema.documents.profileId, app.profileId));
+            const receiptExists = savedDocs.some(
+              (d) => d.docType === "Payment receipt" && d.title === receiptTitle,
+            );
+            if (!receiptExists) {
+              await db.insert(schema.documents).values({
+                profileId: app.profileId,
+                docType: "Payment receipt",
+                title: receiptTitle,
+                docNumber: app.billingNumber,
+                issuedOn: new Date().toISOString().slice(0, 10),
+              });
+            }
+          }
           if (app && app.billingStatus !== "Paid") {
             const confirmed = await db
               .select()
@@ -1771,6 +2174,7 @@ export const Actions = {
               fullyPaid
                 ? `Billing number ${app.billingNumber} confirmed paid: $${amountPaid} received.`
                 : `Payment plan: first part confirmed for billing number ${app.billingNumber}: $${amountPaid} of $${totalDue} received. The second part is due before collection.`,
+              "PortaGov",
             );
             await notify(
               ctx,
@@ -1781,13 +2185,6 @@ export const Actions = {
                 ? `PortaGov: Payment received. Your billing number ${app.billingNumber} is confirmed paid. Amount received: $${amountPaid} for ${app.serviceName}. Tracking number: ${app.reference}. Your receipt is saved in your document wallet forever.`
                 : `PortaGov: Payment received, first part. Billing number ${app.billingNumber}: $${amountPaid} of $${totalDue} paid for ${app.serviceName}. Tracking number: ${app.reference}. The second part, $${totalDue - amountPaid}, is due before you collect. Your receipt for this part is saved in your document wallet.`,
             );
-            await db.insert(schema.documents).values({
-              profileId: app.profileId,
-              docType: "Payment receipt",
-              title: `Receipt for ${app.serviceName}, billing ${app.billingNumber}, $${amountPaid}, tracking ${app.reference}`,
-              docNumber: app.billingNumber,
-              issuedOn: new Date().toISOString().slice(0, 10),
-            });
             const modeRows = await db
               .select()
               .from(schema.settings)
@@ -1813,6 +2210,7 @@ export const Actions = {
                 app.id,
                 "Released to institution",
                 "Released after billing number was confirmed paid.",
+                "PortaGov (automatic release)",
               );
               await notify(
                 ctx,
@@ -1908,6 +2306,66 @@ export const Actions = {
         .where(eq(schema.agents.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
+    },
+  }),
+
+  agentSignIn: defineAction({
+    description:
+      "County agent sign-in for the agent desk: checks the agent against the registered agent network by name and phone, so only a registered, active agent can apply on someone's behalf.",
+    request: z.object({
+      agentId: z.number().int().positive(),
+      phone: z.string().trim().min(7).max(20),
+    }),
+    response: z.object({
+      agent: z.object({
+        id: z.number(),
+        full_name: z.string(),
+        county: z.string(),
+        phone: z.string(),
+        service_centre: z.string(),
+        active: z.boolean(),
+        rating: z.number(),
+      }),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.agents)
+        .where(eq(schema.agents.id, args.agentId))
+        .limit(1);
+      const agent = rows[0];
+      if (!agent || !agent.active) {
+        throw new Error(
+          "That agent is not registered with PortaGov, or is not active. Only a registered agent can use the agent desk.",
+        );
+      }
+      const digits = (s: string) => s.replace(/\D/g, "");
+      const given = digits(args.phone);
+      const stored = digits(agent.phone);
+      const match =
+        given.length > 0 &&
+        stored.length > 0 &&
+        (given === stored ||
+          (given.length >= 9 &&
+            stored.length >= 9 &&
+            given.slice(-9) === stored.slice(-9)));
+      if (!match) {
+        throw new Error(
+          "That phone number does not match the number PortaGov has for this agent. Check it and try again.",
+        );
+      }
+      return {
+        agent: {
+          id: agent.id,
+          full_name: agent.fullName,
+          county: agent.county,
+          phone: agent.phone,
+          service_centre: agent.serviceCentre,
+          active: agent.active,
+          rating: agent.rating,
+        },
+      };
     },
   }),
 
@@ -2235,10 +2693,35 @@ export const Actions = {
     response: okResponse,
     handler: async (ctx, args): Promise<z.infer<typeof okResponse>> => {
       const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.complaints)
+        .where(eq(schema.complaints.id, args.id))
+        .limit(1);
+      const complaint = rows[0];
+      if (!complaint) throw new Error("That complaint or appeal was not found.");
       await db
         .update(schema.complaints)
-        .set({ status: args.status, reply: args.reply })
+        .set({ status: args.status, reply: args.reply, answeredAt: new Date() })
         .where(eq(schema.complaints.id, args.id));
+      /* The citizen must hear about the answer, not only find it by
+         revisiting the page: send it to their own phone and email
+         updates on the same tracking number. */
+      const apps = await db
+        .select()
+        .from(schema.applications)
+        .where(eq(schema.applications.id, complaint.applicationId))
+        .limit(1);
+      const app = apps[0];
+      await notify(
+        ctx,
+        complaint.profileId,
+        complaint.applicationId,
+        `${complaint.kind} answer`,
+        app
+          ? `PortaGov: Your ${complaint.kind.toLowerCase()} on application ${app.reference} has an answer from PortaGov${args.reply ? `: ${args.reply}` : ". Open the application to read it."}`
+          : `PortaGov: Your ${complaint.kind.toLowerCase()} has an answer from PortaGov${args.reply ? `: ${args.reply}` : "."}`,
+      );
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -3132,10 +3615,22 @@ export const Actions = {
       ok: z.boolean(),
       email_code: z.string(),
       profile: profileShape.nullable(),
+      locked: z.boolean(),
+      minutes_left: z.number(),
+      attempts_left: z.number(),
     }),
     async handler(ctx, args) {
-      const ok = await checkCode(ctx, args.profileId, "signup", args.code);
-      if (!ok) return { ok: false, email_code: "", profile: null };
+      const checked = await checkCitizenCode(ctx, args.profileId, "signup", args.code);
+      if (!checked.ok) {
+        return {
+          ok: false,
+          email_code: "",
+          profile: null,
+          locked: checked.locked,
+          minutes_left: checked.minutesLeft,
+          attempts_left: checked.attemptsLeft,
+        };
+      }
       const db = ctx.db<typeof schema>();
       await db
         .update(schema.profiles)
@@ -3147,13 +3642,29 @@ export const Actions = {
         .where(eq(schema.profiles.id, args.profileId))
         .limit(1);
       const row = rows[0];
-      if (!row) return { ok: false, email_code: "", profile: null };
+      if (!row) {
+        return {
+          ok: false,
+          email_code: "",
+          profile: null,
+          locked: false,
+          minutes_left: 0,
+          attempts_left: CODE_LOCKOUT_ATTEMPTS,
+        };
+      }
       let emailCode = "";
       if (row.email && !row.emailVerified) {
         emailCode = await issueCode(ctx, row.id, "email");
       }
       ctx.invalidateQueries();
-      return { ok: true, email_code: emailCode, profile: toProfile(row) };
+      return {
+        ok: true,
+        email_code: emailCode,
+        profile: toProfile(row),
+        locked: false,
+        minutes_left: 0,
+        attempts_left: CODE_LOCKOUT_ATTEMPTS,
+      };
     },
   }),
 
@@ -3163,10 +3674,24 @@ export const Actions = {
       profileId: z.number().int().positive(),
       code: z.string().trim().min(6).max(6),
     }),
-    response: z.object({ ok: z.boolean(), profile: profileShape.nullable() }),
+    response: z.object({
+      ok: z.boolean(),
+      profile: profileShape.nullable(),
+      locked: z.boolean(),
+      minutes_left: z.number(),
+      attempts_left: z.number(),
+    }),
     async handler(ctx, args) {
-      const ok = await checkCode(ctx, args.profileId, "email", args.code);
-      if (!ok) return { ok: false, profile: null };
+      const checked = await checkCitizenCode(ctx, args.profileId, "email", args.code);
+      if (!checked.ok) {
+        return {
+          ok: false,
+          profile: null,
+          locked: checked.locked,
+          minutes_left: checked.minutesLeft,
+          attempts_left: checked.attemptsLeft,
+        };
+      }
       const db = ctx.db<typeof schema>();
       await db
         .update(schema.profiles)
@@ -3178,7 +3703,13 @@ export const Actions = {
         .where(eq(schema.profiles.id, args.profileId))
         .limit(1);
       ctx.invalidateQueries();
-      return { ok: true, profile: rows[0] ? toProfile(rows[0]) : null };
+      return {
+        ok: true,
+        profile: rows[0] ? toProfile(rows[0]) : null,
+        locked: false,
+        minutes_left: 0,
+        attempts_left: CODE_LOCKOUT_ATTEMPTS,
+      };
     },
   }),
 
@@ -3273,9 +3804,16 @@ export const Actions = {
       if (dev) {
         await db
           .update(schema.devices)
-          .set({ lastSeen: new Date() })
+          .set({ lastSeen: new Date(), signedOut: false })
           .where(eq(schema.devices.id, dev.id));
       }
+      await recordSignInEvent(
+        ctx,
+        row.id,
+        args.deviceId,
+        args.deviceLabel,
+        false,
+      );
       return {
         result: "ok" as const,
         ...empty,
@@ -3299,6 +3837,9 @@ export const Actions = {
       ok: z.boolean(),
       new_device_warning: z.boolean(),
       profile: profileShape.nullable(),
+      locked: z.boolean(),
+      minutes_left: z.number(),
+      attempts_left: z.number(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -3308,9 +3849,24 @@ export const Actions = {
         .where(eq(schema.profiles.id, args.profileId))
         .limit(1);
       const row = rows[0];
-      if (!row) return { ok: false, new_device_warning: false, profile: null };
-      const ok = await checkCode(ctx, row.id, "login", args.code);
-      if (!ok) return { ok: false, new_device_warning: false, profile: null };
+      const failed = {
+        ok: false,
+        new_device_warning: false,
+        profile: null,
+        locked: false,
+        minutes_left: 0,
+        attempts_left: CODE_LOCKOUT_ATTEMPTS,
+      };
+      if (!row) return failed;
+      const checked = await checkCitizenCode(ctx, row.id, "login", args.code);
+      if (!checked.ok) {
+        return {
+          ...failed,
+          locked: checked.locked,
+          minutes_left: checked.minutesLeft,
+          attempts_left: checked.attemptsLeft,
+        };
+      }
       if (!row.passwordHash) {
         const problem = passwordProblem(args.newPassword);
         if (problem) throw new Error(problem);
@@ -3335,7 +3891,22 @@ export const Actions = {
           deviceId: args.deviceId,
           label: args.deviceLabel,
         });
+      } else {
+        const dev = devices.find((d) => d.deviceId === args.deviceId);
+        if (dev) {
+          await db
+            .update(schema.devices)
+            .set({ lastSeen: new Date(), signedOut: false })
+            .where(eq(schema.devices.id, dev.id));
+        }
       }
+      await recordSignInEvent(
+        ctx,
+        row.id,
+        args.deviceId,
+        args.deviceLabel,
+        !known,
+      );
       const fresh = await db
         .select()
         .from(schema.profiles)
@@ -3346,6 +3917,9 @@ export const Actions = {
         ok: true,
         new_device_warning: !known && devices.length > 0,
         profile: fresh[0] ? toProfile(fresh[0]) : null,
+        locked: false,
+        minutes_left: 0,
+        attempts_left: CODE_LOCKOUT_ATTEMPTS,
       };
     },
   }),
@@ -3396,6 +3970,106 @@ export const Actions = {
           last_seen: r.lastSeen.toISOString(),
         })),
       };
+    },
+  }),
+
+  listSignInEvents: defineAction({
+    description:
+      "Sign-in history for an account: when each sign-in happened, from which device, and whether the device was new.",
+    request: z.object({ profileId: z.number().int().positive() }),
+    response: z.object({
+      events: z.array(
+        z.object({
+          id: z.number(),
+          device_label: z.string(),
+          is_new_device: z.boolean(),
+          signed_in_at: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.signInEvents)
+        .where(eq(schema.signInEvents.profileId, args.profileId))
+        .orderBy(desc(schema.signInEvents.id))
+        .limit(20);
+      return {
+        events: rows.map((r) => ({
+          id: r.id,
+          device_label: r.label,
+          is_new_device: r.isNewDevice,
+          signed_in_at: r.createdAt.toISOString(),
+        })),
+      };
+    },
+  }),
+
+  signOutAll: defineAction({
+    description:
+      "Signs out everywhere: marks every device on the account signed out and records the time, so a saved session on any device stops working until the person signs in again. In this browser-only build it signs out this device and the sessions recorded here; on the shared backend the same record will sign out every device at once.",
+    request: z.object({ profileId: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      devices_signed_out: z.number(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const devices = await db
+        .select()
+        .from(schema.devices)
+        .where(eq(schema.devices.profileId, args.profileId));
+      for (const d of devices) {
+        await db
+          .update(schema.devices)
+          .set({ signedOut: true })
+          .where(eq(schema.devices.id, d.id));
+      }
+      await db
+        .update(schema.profiles)
+        .set({ sessionsRevokedAt: new Date() })
+        .where(eq(schema.profiles.id, args.profileId));
+      ctx.invalidateQueries();
+      return { ok: true, devices_signed_out: devices.length };
+    },
+  }),
+
+  checkCitizenSession: defineAction({
+    description:
+      "Checks whether a saved citizen session is still valid on this device: it is not valid when the account was signed out everywhere after this device last signed in.",
+    request: z.object({
+      phone: z.string().trim().min(7).max(20),
+      deviceId: z.string().trim().min(4).max(80),
+    }),
+    response: z.object({
+      valid: z.boolean(),
+      profile: profileShape.nullable(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.profiles)
+        .where(eq(schema.profiles.phone, args.phone))
+        .limit(1);
+      const row = rows[0];
+      if (!row) return { valid: false, profile: null };
+      if (!row.sessionsRevokedAt) {
+        return { valid: true, profile: toProfile(row) };
+      }
+      const devices = await db
+        .select()
+        .from(schema.devices)
+        .where(eq(schema.devices.profileId, row.id));
+      const dev = devices.find((d) => d.deviceId === args.deviceId);
+      const valid = Boolean(
+        dev &&
+          !dev.signedOut &&
+          dev.lastSeen &&
+          dev.lastSeen.getTime() >= row.sessionsRevokedAt.getTime(),
+      );
+      return { valid, profile: valid ? toProfile(row) : null };
     },
   }),
 
@@ -4907,7 +5581,7 @@ export const Actions = {
 
   findStaff: defineAction({
     description:
-      "Staff portal sign-in: finds an active staff account by name and phone and checks the account password, returning its role and permissions scope. Name and phone alone never sign anyone in.",
+      "Staff portal sign-in, step 1 of 2: finds an active staff account by name and phone and checks the account password. A correct password never signs anyone in on its own: it issues a one-time code that must be checked with verifyStaffCode before the staff session starts. Name and phone alone never sign anyone in.",
     request: z.object({
       name: z.string().trim().min(2).max(120),
       phone: z.string().trim().min(7).max(20),
@@ -4922,6 +5596,11 @@ export const Actions = {
           scope: z.string(),
         })
         .nullable(),
+      need_code: z.boolean(),
+      staff_id: z.number(),
+      demo_code: z.string(),
+      locked: z.boolean(),
+      minutes_left: z.number(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -4932,20 +5611,145 @@ export const Actions = {
       const match = rows.find(
         (r) => r.active && r.name.toLowerCase() === args.name.toLowerCase(),
       );
-      let verified: typeof match = undefined;
-      if (match && match.passwordHash) {
-        const attempt = await hashPassword(args.password, match.passwordSalt);
-        if (attempt === match.passwordHash) verified = match;
+      const empty = {
+        staff: null,
+        need_code: false,
+        staff_id: 0,
+        demo_code: "",
+        locked: false,
+        minutes_left: 0,
+      };
+      if (!match) return empty;
+      if (match.lockedUntil && match.lockedUntil.getTime() > Date.now()) {
+        return {
+          ...empty,
+          locked: true,
+          minutes_left: minutesLeft(match.lockedUntil),
+        };
       }
+      let verified = false;
+      if (match.passwordHash) {
+        const attempt = await hashPassword(args.password, match.passwordSalt);
+        verified = attempt === match.passwordHash;
+      }
+      if (!verified) {
+        const attempts = (match.failedAttempts ?? 0) + 1;
+        if (attempts >= 5) {
+          await db
+            .update(schema.staffAccounts)
+            .set({
+              failedAttempts: 0,
+              lockedUntil: new Date(Date.now() + 15 * 60 * 1000),
+            })
+            .where(eq(schema.staffAccounts.id, match.id));
+          return { ...empty, locked: true, minutes_left: 15 };
+        }
+        await db
+          .update(schema.staffAccounts)
+          .set({ failedAttempts: attempts })
+          .where(eq(schema.staffAccounts.id, match.id));
+        return empty;
+      }
+      await db
+        .update(schema.staffAccounts)
+        .set({ failedAttempts: 0 })
+        .where(eq(schema.staffAccounts.id, match.id));
+      const code = await issueStaffCode(ctx, match.id);
       return {
-        staff: verified
-          ? {
-              id: verified.id,
-              name: verified.name,
-              role: verified.role,
-              scope: verified.scope,
-            }
-          : null,
+        ...empty,
+        need_code: true,
+        staff_id: match.id,
+        demo_code: code,
+      };
+    },
+  }),
+
+  verifyStaffCode: defineAction({
+    description:
+      "Staff portal sign-in, step 2 of 2: checks the one-time code issued by findStaff. Only a correct code starts the staff session. Five wrong codes lock the staff account for 15 minutes.",
+    request: z.object({
+      staffId: z.number().int().positive(),
+      code: z.string().trim().min(6).max(6),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      staff: z
+        .object({
+          id: z.number(),
+          name: z.string(),
+          role: z.string(),
+          scope: z.string(),
+        })
+        .nullable(),
+      locked: z.boolean(),
+      minutes_left: z.number(),
+      attempts_left: z.number(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.staffAccounts)
+        .where(eq(schema.staffAccounts.id, args.staffId))
+        .limit(1);
+      const row = rows[0];
+      const failed = {
+        ok: false,
+        staff: null,
+        locked: false,
+        minutes_left: 0,
+        attempts_left: CODE_LOCKOUT_ATTEMPTS,
+      };
+      if (!row || !row.active) return failed;
+      if (row.lockedUntil && row.lockedUntil.getTime() > Date.now()) {
+        return {
+          ...failed,
+          locked: true,
+          minutes_left: minutesLeft(row.lockedUntil),
+          attempts_left: 0,
+        };
+      }
+      const ok = await checkStaffCode(ctx, row.id, args.code);
+      if (!ok) {
+        const attempts = (row.codeFailedAttempts ?? 0) + 1;
+        if (attempts >= CODE_LOCKOUT_ATTEMPTS) {
+          await db
+            .update(schema.staffAccounts)
+            .set({
+              codeFailedAttempts: 0,
+              lockedUntil: new Date(
+                Date.now() + CODE_LOCKOUT_MINUTES * 60 * 1000,
+              ),
+            })
+            .where(eq(schema.staffAccounts.id, row.id));
+          return {
+            ...failed,
+            locked: true,
+            minutes_left: CODE_LOCKOUT_MINUTES,
+            attempts_left: 0,
+          };
+        }
+        await db
+          .update(schema.staffAccounts)
+          .set({ codeFailedAttempts: attempts })
+          .where(eq(schema.staffAccounts.id, row.id));
+        return { ...failed, attempts_left: CODE_LOCKOUT_ATTEMPTS - attempts };
+      }
+      await db
+        .update(schema.staffAccounts)
+        .set({ codeFailedAttempts: 0 })
+        .where(eq(schema.staffAccounts.id, row.id));
+      return {
+        ok: true,
+        staff: {
+          id: row.id,
+          name: row.name,
+          role: row.role,
+          scope: row.scope,
+        },
+        locked: false,
+        minutes_left: 0,
+        attempts_left: CODE_LOCKOUT_ATTEMPTS,
       };
     },
   }),
@@ -5305,7 +6109,13 @@ export const Actions = {
         throw new Error("This application has not been released to the institution yet.");
       }
       const note = `${app.institution} needs more information for ${app.reference}. Missing: ${args.missing}. Please send it by ${args.deadline}. Open your application in PortaGov and add what is missing, or reply in the message thread on the application.`;
-      await logEvent(ctx, app.id, "More information requested", note);
+      await logEvent(
+        ctx,
+        app.id,
+        "More information requested",
+        note,
+        args.officerName || app.institution,
+      );
       await notify(ctx, app.profileId, app.id, "More information needed", note);
       if (args.officerName) {
         await logAudit(
@@ -5354,6 +6164,7 @@ export const Actions = {
         app.id,
         "Received by institution",
         `${app.institution} confirmed receipt of ${app.reference}. The citizen can see this confirmation now.`,
+        args.officerName || app.institution,
       );
       await notify(
         ctx,
@@ -5408,6 +6219,56 @@ export const Actions = {
         open_tickets: help.filter((h) => h.status !== "Answered").length,
         payments_today: payments.filter((p) => p.createdAt >= start).length,
         completed_total: apps.filter((a) => a.status === "Completed").length,
+      };
+    },
+  }),
+
+  getInstitutionDailySummary: defineAction({
+    description:
+      "Daily summary for one institution: how many applications came in today, how many were finished today, and how many are still waiting, all counted from the real applications for that day.",
+    request: z.object({
+      institution: z.string().trim().min(2).max(120),
+    }),
+    response: z.object({
+      date_label: z.string(),
+      date: z.string(),
+      institution: z.string(),
+      came_in_today: z.number(),
+      finished_today: z.number(),
+      still_waiting: z.number(),
+      ready_for_collection: z.number(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const apps = await db.select().from(schema.applications);
+      const mine = apps.filter((a) => a.institution === args.institution);
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const waitingStatuses = [
+        "Received by institution",
+        "In review at institution",
+        "Appointment set",
+        "More information needed",
+      ];
+      return {
+        date_label: start.toLocaleDateString("en-GB", {
+          weekday: "long",
+          day: "numeric",
+          month: "long",
+          year: "numeric",
+        }),
+        date: start.toISOString().slice(0, 10),
+        institution: args.institution,
+        came_in_today: mine.filter((a) => a.createdAt >= start).length,
+        finished_today: mine.filter(
+          (a) => a.status === "Completed" && a.updatedAt >= start,
+        ).length,
+        still_waiting: mine.filter(
+          (a) => a.released && waitingStatuses.includes(a.status),
+        ).length,
+        ready_for_collection: mine.filter(
+          (a) => a.status === "Ready for collection",
+        ).length,
       };
     },
   }),
@@ -6230,6 +7091,8 @@ ${args.text}`,
           id: r.id,
           application_id: r.applicationId,
           application_ref: byId.get(r.applicationId)?.reference ?? "",
+          billing_number: byId.get(r.applicationId)?.billingNumber ?? "",
+          service_name: byId.get(r.applicationId)?.serviceName ?? "",
           method: r.method,
           amount: r.amount,
           payer_phone: r.payerPhone,
