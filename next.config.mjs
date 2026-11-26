@@ -8,6 +8,20 @@ const csp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "media-src 'self' blob:",
+  /* A wallet PDF is shown in an iframe from a blob: URL (a saved
+     file arrives as a data: URL and is turned into a blob: URL in
+     DocumentViewer). Without frame-src, it falls back to
+     default-src 'self', and blob: is not 'self', so Chrome blocks
+     the iframe with "This content is blocked" while the same blob:
+     URL opens fine in a new tab (top-level navigation is not
+     governed by frame-src) and images work because img-src already
+     allows blob:. object-src covers the same PDF viewer path when
+     it is loaded as a plugin. frame-ancestors 'none' and
+     X-Frame-Options DENY below are unrelated: they stop other
+     sites framing this page, not this page framing a blob: URL,
+     so they stay as they are. */
+  "frame-src 'self' blob:",
+  "object-src 'self' blob:",
   "font-src 'self' data:",
   `connect-src 'self' ${api}`,
   "frame-ancestors 'none'",

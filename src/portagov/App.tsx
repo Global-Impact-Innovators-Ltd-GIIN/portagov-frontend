@@ -5228,6 +5228,13 @@ function DocumentViewer({
      browser's PDF viewer accepts. Blob: URLs already work as they
      are, and are left alone. */
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  /* A PDF frame that never loads is a blocked frame: Chrome does
+     not fire load for a frame it blocks, so after a few seconds
+     without a load the viewer shows its own fallback instead of
+     leaving the browser's blocked page on screen. A blob: URL is
+     local, so a working preview loads far faster than this. */
+  const [pdfLoaded, setPdfLoaded] = useState(false);
+  const [pdfFailed, setPdfFailed] = useState(false);
   const docUrl = doc?.url ?? "";
 
   useEffect(() => {
@@ -5260,7 +5267,24 @@ function DocumentViewer({
     setZoom(1);
     setFit(false);
     setNatural(null);
+    setPdfLoaded(false);
+    setPdfFailed(false);
   }, [doc?.url]);
+
+  /* A blocked PDF frame never fires load in Chrome, so if the
+     iframe has not loaded a few seconds after it mounts, show our
+     own fallback instead of leaving the browser's blocked page on
+     screen. A blob: URL is local, so a working preview loads far
+     faster than this. The effect sits before the early return
+     below because hooks cannot run after it. */
+  useEffect(() => {
+    if (doc?.contentType !== "application/pdf") return;
+    if (!displayUrl.startsWith("blob:") && !displayUrl.startsWith("http"))
+      return;
+    if (pdfLoaded || pdfFailed) return;
+    const t = window.setTimeout(() => setPdfFailed(true), 6000);
+    return () => window.clearTimeout(t);
+  }, [doc?.contentType, displayUrl, pdfLoaded, pdfFailed]);
 
   useEffect(() => {
     if (!doc) return;
@@ -5280,6 +5304,17 @@ function DocumentViewer({
 
   const isImage = doc.contentType.startsWith("image/");
   const isPdf = doc.contentType === "application/pdf";
+  /* Only a blob: (or http(s):) address may go in the PDF iframe.
+     A saved file starts as a data: URL while it is turned into a
+     blob: URL, and a data: URL inside a frame is blocked by the
+     browser, so the iframe only mounts once the blob: URL is
+     ready; until then the viewer shows "Preparing preview" instead
+     of a blocked frame. */
+  const pdfSrc =
+    isPdf &&
+    (displayUrl.startsWith("blob:") || displayUrl.startsWith("http"))
+      ? displayUrl
+      : "";
   const canZoom = isImage || isPdf;
   const zoomLabel = fit
     ? "Fit to screen"
@@ -5429,11 +5464,49 @@ function DocumentViewer({
                     : { width: `${zoom * 100}%`, height: `${62 * zoom}vh` }
                 }
               >
-                <iframe
-                  src={displayUrl}
-                  title={doc.title}
-                  className="h-full w-full rounded-lg border border-[var(--border)] bg-white"
-                />
+                {pdfFailed ? (
+                  <div className="flex h-full w-full flex-col items-center justify-center rounded-lg border border-[var(--border)] bg-white p-5 text-center">
+                    <p className="font-display text-lg font-bold text-[var(--text)]">
+                      This PDF could not be shown here
+                    </p>
+                    <p className="mt-2 text-sm text-[var(--dim)]">
+                      Your browser would not show this PDF inside
+                      PortaGov. The file itself is fine, download it or
+                      open it in a new tab to see it.
+                    </p>
+                    <div className="mt-4 flex flex-wrap justify-center gap-2">
+                      <a
+                        href={displayUrl}
+                        download={doc.fileName || undefined}
+                        className="inline-flex min-h-[44px] items-center rounded-lg bg-[var(--navy)] px-4 py-2 text-sm font-bold text-white"
+                        style={{ backgroundColor: "#0a2a5e" }}
+                      >
+                        Download the file
+                      </a>
+                      <a
+                        href={displayUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-bold text-[var(--text)]"
+                      >
+                        Open in a new tab
+                      </a>
+                    </div>
+                  </div>
+                ) : pdfSrc ? (
+                  <iframe
+                    src={pdfSrc}
+                    title={doc.title}
+                    onLoad={() => setPdfLoaded(true)}
+                    className="h-full w-full rounded-lg border border-[var(--border)] bg-white"
+                  />
+                ) : (
+                  <div className="flex h-full w-full items-center justify-center rounded-lg border border-[var(--border)] bg-white">
+                    <p className="text-sm text-[var(--dim)]">
+                      Preparing preview…
+                    </p>
+                  </div>
+                )}
               </div>
               <p className="mt-2 text-center text-sm text-[var(--dim)]">
                 If the PDF does not show here, use Download above, or{" "}
@@ -5809,7 +5882,15 @@ function WalletPage({ profile }: { profile: ProfileT }) {
     seenOther.add(d.doc_type);
     return false;
   });
-  const savedCount = DOC_TYPES.filter((t) => savedByType.has(t)).length;
+  /* Count every saved file, including extra Other documents:
+     the old count only counted the 10 standard types, so a wallet
+     with 4 files (3 standard types plus a second Other document)
+     wrongly said "3 of 10 documents saved". "Still missing" counts
+     the standard types not yet saved. */
+  const savedCount = liveDocs.length;
+  const standardMissing = DOC_TYPES.filter(
+    (t) => !savedByType.has(t),
+  ).length;
   const stagedCount = Object.keys(staged).length;
   const warnedDocs = Object.entries(staged).flatMap(([docType, s]) =>
     checkStagedDoc(docType, s).map((warning) => ({ docType, warning })),
@@ -5974,9 +6055,11 @@ function WalletPage({ profile }: { profile: ProfileT }) {
       ) : (
         <>
           <p className="mt-5 font-display text-lg font-bold text-[var(--text)]" role="status">
-            {savedCount} of {DOC_TYPES.length} documents saved
-            {savedCount < DOC_TYPES.length
-              ? `, ${DOC_TYPES.length - savedCount} still missing`
+            {savedCount <= DOC_TYPES.length
+              ? `${savedCount} of ${DOC_TYPES.length} documents saved`
+              : `${savedCount} documents saved`}
+            {standardMissing > 0
+              ? `, ${standardMissing} still missing`
               : ""}
           </p>
           <div className="mt-3 space-y-3">
