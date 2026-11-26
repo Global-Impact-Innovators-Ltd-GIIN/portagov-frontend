@@ -337,9 +337,9 @@ function passwordProblem(pw: string): string | null {
 /* Liberian identity document formats. National ID: the NIR card carries a
    10 digit National Identification Number; the card number is 2 letters
    plus 7 digits on the current biometric card (LR1234567) and 3 letters
-   plus 7 digits on the older card (LIB1234567). Passport: one letter
+   plus 7 digits on the older card (LIB1234567). Passport: one or two letters
    followed by 6 to 8 digits (L123456 in the published bank identifier
-   list, L12345678 on the current e-passport series). National ID stays
+   list, L12345678 and PP1234567 on the current e-passport series). National ID stays
    optional: a passport or another document is always accepted instead. */
 function identityProblem(args: z.infer<typeof profileInput>): string | null {
   if (args.hasNationalId) {
@@ -354,8 +354,8 @@ function identityProblem(args: z.infer<typeof profileInput>): string | null {
     const v = args.altIdNumber.replace(/[\s-]/g, "").toUpperCase();
     if (!v)
       return "Type your passport number, or choose another document instead.";
-    if (!/^[A-Z]\d{6,8}$/.test(v))
-      return "That does not match a Liberian passport number. It is one letter followed by digits, like L12345678, printed at the top of the passport's photo page. Check it and type it again.";
+    if (!/^[A-Z]{1,2}\d{6,8}$/.test(v))
+      return "That does not match a Liberian passport number. It is one or two letters followed by digits, like PP1234567 or L12345678, printed at the top of the passport's photo page. Check it and type it again.";
   }
   return null;
 }

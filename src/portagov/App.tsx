@@ -31,11 +31,10 @@ SERVICE_CENTRE_HOURS,
 } from "./services";
 import QRCode from "qrcode";
 import { logoMain, logoBadge, logoMark } from "./assets";
+import { LIBERIA_FLAG_VIDEO, LIBERIA_FLAG_POSTER, HERO_LOGO_VIDEO, HERO_LOGO_POSTER } from "./heroVideos";
 import {
   SafeAreaTopScrim,
   PdfViewer,
-  LiberiaFlagHero,
-  LogoAnimationHero,
   ListenButton,
 } from "./components";
 
@@ -551,9 +550,9 @@ const inputCls =
    National ID: the NIR card carries a 10 digit National Identification
    Number; the card number itself is 2 letters plus 7 digits on the current
    biometric card (LR1234567) and 3 letters plus 7 digits on the older card
-   (LIB1234567). Passport: one letter followed by 6 to 8 digits, the shapes
+   (LIB1234567). Passport: one or two letters followed by 6 to 8 digits, the shapes
    published for Liberian passport numbers (L123456 in the bank identifier
-   list, L12345678 on the current e-passport series). */
+   list, L12345678 and PP1234567 on the current e-passport series). */
 export function nationalIdProblem(raw: string): string | null {
   const v = raw.replace(/[\s-]/g, "").toUpperCase();
   if (!v) return "Type your national ID number, or choose a different way to prove who you are below.";
@@ -565,8 +564,8 @@ export function nationalIdProblem(raw: string): string | null {
 export function passportNumberProblem(raw: string): string | null {
   const v = raw.replace(/[\s-]/g, "").toUpperCase();
   if (!v) return "Type your passport number, or choose a different way to prove who you are below.";
-  if (!/^[A-Z]\d{6,8}$/.test(v))
-    return "That does not match a Liberian passport number. It is one letter followed by digits, like L12345678, printed at the top of the passport's photo page. Check it and type it again.";
+  if (!/^[A-Z]{1,2}\d{6,8}$/.test(v))
+    return "That does not match a Liberian passport number. It is one or two letters followed by digits, like PP1234567 or L12345678, printed at the top of the passport's photo page. Check it and type it again.";
   return null;
 }
 
@@ -787,13 +786,24 @@ function HomePage({
       >
         {lowData ? null : (
           <>
-            <LiberiaFlagHero />
+            <video
+              aria-hidden
+              className="hero-bg-video absolute inset-0 h-full w-full object-cover opacity-60"
+              autoPlay
+              muted
+              loop
+              playsInline
+              preload="metadata"
+              poster={LIBERIA_FLAG_POSTER}
+            >
+              <source src={LIBERIA_FLAG_VIDEO} type="video/mp4" />
+            </video>
             <div
               aria-hidden
               className="absolute inset-0"
               style={{
                 background:
-                  "linear-gradient(165deg, rgba(7, 31, 69, 0.88) 0%, rgba(10, 42, 94, 0.82) 55%, rgba(5, 22, 48, 0.9) 100%)",
+                  "linear-gradient(90deg, rgba(7, 31, 69, 0.85) 0%, rgba(10, 42, 94, 0.65) 55%, rgba(5, 22, 48, 0.5) 100%)",
               }}
             />
           </>
@@ -807,7 +817,7 @@ function HomePage({
               Government services, from your home.
             </h1>
             <p className="mt-3 max-w-xl text-base text-white/85">
-              PortaGov connects you to Liberia's ministries and agencies in one
+              PortaGov connects you to Liberian ministries and agencies in one
               place. Apply from home, send your documents once, pay with mobile
               money, and travel in only when you are told to come, for
               biometrics or to collect what is ready. Open to every county of
@@ -1890,8 +1900,8 @@ function ProfileForm({
               onChange={(e) => set({ passportNumber: e.target.value })}
               placeholder="L12345678" />
             <p className="mt-1 text-xs text-[var(--dim)]">
-              Printed at the top of your passport's photo page: one letter
-              followed by digits, like L12345678. PortaGov checks it against
+              Printed at the top of your passport's photo page: one or two letters
+              followed by digits, like PP1234567 or L12345678. PortaGov checks it against
               the Liberian passport format.
             </p>
           </div>
@@ -4829,7 +4839,18 @@ function PlatformPage() {
         className="relative overflow-hidden text-white"
         style={{ backgroundColor: "#0a2a5e" }}
       >
-        <LogoAnimationHero />
+        <video
+          aria-hidden
+          className="hero-bg-video absolute inset-0 h-full w-full object-cover"
+          autoPlay
+          muted
+          loop
+          playsInline
+          preload="metadata"
+          poster={HERO_LOGO_POSTER}
+        >
+          <source src={HERO_LOGO_VIDEO} type="video/mp4" />
+        </video>
         <div
           aria-hidden
           className="absolute inset-0"
@@ -5442,6 +5463,7 @@ export function App() {
       };
     }
   });
+  const [accessOpen, setAccessOpen] = useState(false);
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.large = prefs.large ? "true" : "false";
@@ -5712,29 +5734,72 @@ export function App() {
                 </svg>
               )}
             </button>
-            <div className="hidden items-center gap-1 lg:flex" role="group" aria-label="Reading and display options">
-              {(
-                [
-                  ["Large text", prefs.large, () => setPrefs((p) => ({ ...p, large: !p.large }))],
-                  ["High contrast", prefs.hc, () => setPrefs((p) => ({ ...p, hc: !p.hc }))],
-                  ["Low data", prefs.low, () => setPrefs((p) => ({ ...p, low: !p.low }))],
-                ] as const
-              ).map(([label, on, toggle]) => (
-                <button
-                  key={label}
-                  type="button"
-                  aria-pressed={on}
-                  onClick={toggle}
-                  className="rounded-full border px-2.5 py-1 text-xs font-bold"
-                  style={
-                    on
-                      ? { backgroundColor: "#0a2a5e", color: "#fff", borderColor: "#0a2a5e" }
-                      : { color: "var(--dim)", borderColor: "var(--border)" }
-                  }
+            <div className="relative">
+              <button
+                type="button"
+                aria-expanded={accessOpen}
+                aria-label="Accessibility options"
+                onClick={() => setAccessOpen((o) => !o)}
+                className="flex h-9 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-xs font-bold"
+                style={{
+                  color: "var(--text)",
+                  borderColor: "var(--border)",
+                  backgroundColor: accessOpen ? "var(--gold-soft)" : "var(--surface-alt)",
+                }}
+              >
+                <svg
+                  aria-hidden
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-4 w-4"
                 >
-                  {label}
-                </button>
-              ))}
+                  <circle cx="12" cy="5" r="2" />
+                  <path d="M4 9h16" />
+                  <path d="M12 9v5" />
+                  <path d="m12 14-3 7" />
+                  <path d="m12 14 3 7" />
+                </svg>
+                Accessibility
+              </button>
+              {accessOpen ? (
+                <div
+                  role="group"
+                  aria-label="Reading and display options"
+                  className="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border p-2 shadow-lg"
+                  style={{
+                    borderColor: "var(--border)",
+                    backgroundColor: "var(--surface)",
+                  }}
+                >
+                  {(
+                    [
+                      ["Large text", prefs.large, () => setPrefs((p) => ({ ...p, large: !p.large }))],
+                      ["High contrast", prefs.hc, () => setPrefs((p) => ({ ...p, hc: !p.hc }))],
+                      ["Low data", prefs.low, () => setPrefs((p) => ({ ...p, low: !p.low }))],
+                    ] as const
+                  ).map(([label, on, toggle]) => (
+                    <button
+                      key={label}
+                      type="button"
+                      aria-pressed={on}
+                      onClick={toggle}
+                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-sm font-bold"
+                      style={
+                        on
+                          ? { backgroundColor: "#0a2a5e", color: "#fff" }
+                          : { color: "var(--text)" }
+                      }
+                    >
+                      {label}
+                      <span aria-hidden>{on ? "On" : "Off"}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </div>
             {profile ? (
               <>
@@ -13506,13 +13571,13 @@ function AssistantPanel({ profile }: { profile: ProfileT | null }) {
         onClick={() => setOpen(!open)}
         aria-expanded={open}
         aria-label="Open the PortaGov assistant"
-        className="fixed bottom-20 right-4 z-50 flex items-center gap-2 rounded-full px-4 py-3 font-display text-sm font-extrabold text-white shadow-lg md:bottom-6"
+        title="Open the PortaGov assistant"
+        className="fixed bottom-20 right-4 z-50 flex h-12 w-12 items-center justify-center rounded-full shadow-lg md:bottom-6"
         style={{ backgroundColor: "#0a2a5e", border: "2px solid #d9a821" }}
       >
-        <span aria-hidden className="flex h-6 w-6 items-center justify-center rounded-full text-xs" style={{ backgroundColor: "#d9a821", color: "#0a2a5e" }}>
-          PG
-        </span>
-        Assistant
+        <svg aria-hidden viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-6 w-6">
+          <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+        </svg>
       </button>
       {open ? (
         <div className="fixed bottom-36 right-4 z-50 flex max-h-[85vh] w-[min(92vw,380px)] flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-2xl md:bottom-24" role="dialog" aria-label="PortaGov assistant chat">
@@ -14768,10 +14833,16 @@ function LiberianEnglishButton() {
           setSimple("");
         }}
         aria-expanded={open}
-        className="fixed bottom-36 right-4 z-50 rounded-full border-2 px-3.5 py-2 text-sm font-bold shadow-lg md:bottom-24"
+        aria-label="Tell me in Liberian English"
+        title="Tell me in Liberian English"
+        className="fixed bottom-36 right-4 z-50 flex h-12 w-12 items-center justify-center rounded-full border-2 shadow-lg md:bottom-24"
         style={{ borderColor: "#0a2a5e", backgroundColor: "#ffffff", color: "#0a2a5e" }}
       >
-        Tell me in Liberian English
+        <svg aria-hidden viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-6 w-6">
+          <circle cx="12" cy="12" r="10" />
+          <path d="M2 12h20" />
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+        </svg>
       </button>
       {open ? (
         <div className="fixed bottom-48 right-4 z-50 w-[min(92vw,380px)] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-2xl md:bottom-36" role="dialog" aria-label="This page in Liberian English">
