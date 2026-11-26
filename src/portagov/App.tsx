@@ -803,7 +803,7 @@ function HomePage({
               className="absolute inset-0"
               style={{
                 background:
-                  "linear-gradient(90deg, rgba(7, 31, 69, 0.85) 0%, rgba(10, 42, 94, 0.65) 55%, rgba(5, 22, 48, 0.5) 100%)",
+                  "linear-gradient(90deg, rgba(7, 31, 69, 0.92) 0%, rgba(10, 42, 94, 0.73) 55%, rgba(5, 22, 48, 0.58) 100%)",
               }}
             />
           </>
