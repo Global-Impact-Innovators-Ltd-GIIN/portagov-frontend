@@ -4373,24 +4373,66 @@ function ApplicationDetailPage({
   const [method, setMethod] = useState<"MTN MoMo" | "Orange Money">("MTN MoMo");
   const [payerPhone, setPayerPhone] = useState(profile.phone);
   const [txnRef, setTxnRef] = useState("");
-  const [amount, setAmount] = useState("");
   const [payError, setPayError] = useState("");
-  const pay = useMutation({
+  /* Approved payment flow (Giin, 2026-11-27): type ANY MoMo number to
+     pay from, click Make payment, the system shows the billing number
+     and amount, the phone is prompted by USSD to press 1 and enter
+     the MoMo PIN, PortaGov waits, then shows Transaction completed
+     with the tracking/reference number. Real MoMo is not live yet,
+     so the USSD prompt below is the mock stand-in for that phone
+     prompt, with the same steps, and no real money moves. */
+  const [payStep, setPayStep] = useState<"form" | "ussd" | "waiting" | "done">("form");
+  const [payUssdStep, setPayUssdStep] = useState<1 | 2>(1);
+  const [payStarted, setPayStarted] = useState<any>(null);
+  const [payDone, setPayDone] = useState<any>(null);
+  const refreshAfterPayment = () => {
+    // Refresh the application too, not only the payments list: the
+    // amount paid and billing status live on the application, and
+    // without this the page kept showing $0 / "Not confirmed paid
+    // yet" until a manual reload after a confirmed payment.
+    void queryClient.invalidateQueries({ queryKey: ["payments"] });
+    void queryClient.invalidateQueries({ queryKey: ["applications"] });
+  };
+  const startPay = useMutation({
     mutationFn: async () =>
-      await api.recordPayment({
+      await (api as any).startPayment({
         applicationId: id,
         method,
-        amount: Number(amount) || 0,
         payerPhone,
         transactionRef: txnRef,
       }),
-    onSuccess: () => {
-      setTxnRef("");
-      void queryClient.invalidateQueries({ queryKey: ["payments"] });
+    onSuccess: (r: any) => {
+      if (!r.txn_ref) {
+        // Free service, or already paid: nothing to confirm on a phone.
+        setPayDone({ ...r, status: "Confirmed" });
+        setPayStep("done");
+        refreshAfterPayment();
+        return;
+      }
+      setPayStarted(r);
+      setPayUssdStep(1);
+      setPayStep("ussd");
     },
     onError: (e) =>
-      setPayError(e instanceof Error ? e.message : "Payment could not be recorded."),
+      setPayError(e instanceof Error ? e.message : "Payment could not be started."),
   });
+  const confirmPay = useMutation({
+    mutationFn: async () =>
+      await (api as any).confirmPayment({
+        applicationId: id,
+        txn_ref: payStarted?.txn_ref,
+      }),
+    onSuccess: (r: any) => {
+      setPayDone(r);
+      setPayStep("done");
+      refreshAfterPayment();
+    },
+    onError: (e) => {
+      setPayStep("ussd");
+      setPayError(e instanceof Error ? e.message : "Payment could not be confirmed.");
+    },
+  });
+  const pay = startPay;
 
   const [kind, setKind] = useState<"Biometrics" | "Collection" | "Interview">("Biometrics");
   const [groupSize, setGroupSize] = useState(1);
@@ -4401,8 +4443,14 @@ function ApplicationDetailPage({
   const [apptDone, setApptDone] = useState(false);
   const [ticket, setTicket] = useState("");
   const book = useMutation({
-    mutationFn: async () =>
-      await api.bookAppointment({
+    mutationFn: async () => {
+      if (date) {
+        const day = new Date(`${date}T12:00:00`).getDay();
+        if (day === 0 || day === 6) {
+          throw new Error("PortaGov offices are open on weekdays only, Monday to Friday. Choose a weekday for your visit.");
+        }
+      }
+      return await api.bookAppointment({
         profileId: profile.id,
         applicationId: id,
         kind,
@@ -4410,7 +4458,8 @@ function ApplicationDetailPage({
         date,
         timeSlot: slot,
         groupSize,
-      }),
+      });
+    },
     onSuccess: (r) => {
       setApptDone(true);
       setTicket(r.ticket);
@@ -4554,57 +4603,137 @@ function ApplicationDetailPage({
                 ))}
               </ul>
             ) : null}
-            <form
-              className="mt-3 space-y-3"
-              onSubmit={(e: FormEvent) => {
-                e.preventDefault();
-                setPayError("");
-                if (txnRef.trim().length < 3) {
-                  setPayError("Enter the transaction reference from your mobile money message.");
-                  return;
-                }
-                pay.mutate();
-              }}
-            >
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div>
-                  <FieldLabel htmlFor="pay-method">Payment method</FieldLabel>
-                  <select id="pay-method" {...FIELDS.recordPayment.method} className={inputCls} value={method}
-                    onChange={(e) => setMethod(e.target.value === "Orange Money" ? "Orange Money" : "MTN MoMo")}>
-                    <option>MTN MoMo</option>
-                    <option>Orange Money</option>
-                  </select>
-                </div>
-                <div>
-                  <FieldLabel htmlFor="pay-phone">Phone that paid</FieldLabel>
-                  <input id="pay-phone" {...FIELDS.recordPayment.payerPhone} className={inputCls} value={payerPhone}
-                    onChange={(e) => setPayerPhone(e.target.value)} />
-                </div>
-              </div>
-              <div>
-                <FieldLabel htmlFor="pay-amount">Amount paid (USD)</FieldLabel>
-                <input id="pay-amount" {...FIELDS.recordPayment.amount} type="number" className={inputCls} value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
-                  placeholder="The amount on your billing number" />
-                <p className="mt-1 text-xs text-[var(--dim)]">
-                  Quote billing number {app.billing_number} when you pay. PortaGov confirms the payment against this billing number before anything is released.
+            {payStep === "done" && payDone ? (
+              <div className="mt-3 rounded-lg bg-[var(--surface-alt)] p-4 text-sm text-[var(--text)]">
+                <p className="font-display text-base font-bold">Transaction completed</p>
+                <p className="mt-1">
+                  Your payment of <strong>${payDone.amount}</strong> by {payDone.method || method} from{" "}
+                  {payDone.payer_phone || payerPhone} is confirmed. Billing number{" "}
+                  <strong>{payDone.billing_number || app.billing_number}</strong>.
+                </p>
+                <p className="mt-1">
+                  Tracking / reference number: <strong>{app.reference}</strong>
+                  {payDone.txn_ref ? (
+                    <>, transaction reference <strong>{payDone.txn_ref}</strong></>
+                  ) : null}
+                  {payDone.user_ref ? (
+                    <>, your reference from your phone: <strong>{payDone.user_ref}</strong></>
+                  ) : null}
+                  . The amount paid above is updated now, no need to reload the page.
                 </p>
               </div>
-              <div>
-                <FieldLabel htmlFor="pay-ref">Transaction reference</FieldLabel>
-                <input id="pay-ref" {...FIELDS.recordPayment.transactionRef} className={inputCls} value={txnRef}
-                  onChange={(e) => setTxnRef(e.target.value)}
-                  placeholder="From your MoMo or Orange Money confirmation" />
-              </div>
-              {payError ? (
-                <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
-                  {payError}
+            ) : payStep === "ussd" && payStarted ? (
+              <div className="mt-3 space-y-3 rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-4 text-sm text-[var(--text)]">
+                <p className="font-display font-bold">Pay on your phone</p>
+                <p>
+                  Billing number <strong>{payStarted.billing_number || app.billing_number}</strong>, amount{" "}
+                  <strong>${payStarted.amount}</strong>. A prompt is on its way to{" "}
+                  <strong>{payStarted.payer_phone}</strong>.
                 </p>
-              ) : null}
-              <PrimaryButton type="submit" disabled={pay.isPending}>
-                {pay.isPending ? "Recording..." : "Record this payment"}
-              </PrimaryButton>
-            </form>
+                <div className="rounded-lg bg-[var(--surface)] p-3">
+                  <p className="font-bold">On your phone you will see:</p>
+                  <p className="mt-1">
+                    PortaGov: pay ${payStarted.amount} for {app.service_name}, billing{" "}
+                    {payStarted.billing_number || app.billing_number}. Press 1 to confirm, then enter your MoMo PIN.
+                  </p>
+                </div>
+                <p className="text-xs text-[var(--dim)]">
+                  Demo for now: no real money moves yet. When the real MoMo provider is live, this same prompt will
+                  arrive on your phone by USSD.
+                </p>
+                {payUssdStep === 1 ? (
+                  <PrimaryButton type="button" onClick={() => setPayUssdStep(2)}>
+                    Press 1 to confirm
+                  </PrimaryButton>
+                ) : (
+                  <>
+                    <p className="font-semibold">Step 1 done. Now enter your MoMo PIN on your phone.</p>
+                    <PrimaryButton
+                      type="button"
+                      disabled={confirmPay.isPending}
+                      onClick={() => {
+                        setPayError("");
+                        setPayStep("waiting");
+                        confirmPay.mutate();
+                      }}
+                    >
+                      I entered my PIN
+                    </PrimaryButton>
+                  </>
+                )}
+                {payError ? (
+                  <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+                    {payError}
+                  </p>
+                ) : null}
+              </div>
+            ) : payStep === "waiting" ? (
+              <div className="mt-3 rounded-lg bg-[var(--surface-alt)] p-4 text-sm text-[var(--text)]">
+                <p className="font-display font-bold">Waiting for your phone...</p>
+                <p className="mt-1">
+                  PortaGov is waiting for the confirmation from {payStarted?.payer_phone || payerPhone}. Do not close
+                  this page. When the transaction completes, this screen will show Transaction completed with your
+                  tracking number.
+                </p>
+              </div>
+            ) : (
+              <form
+                className="mt-3 space-y-3"
+                onSubmit={(e: FormEvent) => {
+                  e.preventDefault();
+                  setPayError("");
+                  if (!payerPhone.trim()) {
+                    setPayError("Type the MoMo number you want to pay from.");
+                    return;
+                  }
+                  startPay.mutate();
+                }}
+              >
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <FieldLabel htmlFor="pay-method">Payment method</FieldLabel>
+                    <select id="pay-method" {...FIELDS.recordPayment.method} className={inputCls} value={method}
+                      onChange={(e) => setMethod(e.target.value === "Orange Money" ? "Orange Money" : "MTN MoMo")}>
+                      <option>MTN MoMo</option>
+                      <option>Orange Money</option>
+                    </select>
+                  </div>
+                  <div>
+                    <FieldLabel htmlFor="pay-phone">Phone to pay from</FieldLabel>
+                    <input id="pay-phone" {...FIELDS.recordPayment.payerPhone} className={inputCls} value={payerPhone}
+                      onChange={(e) => setPayerPhone(e.target.value)} />
+                    <p className="mt-1 text-xs text-[var(--dim)]">
+                      Type any MoMo number you want to pay from. It does not have to be the number you signed up
+                      with. The prompt will go to this number.
+                    </p>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-sm text-[var(--text)]">
+                    Amount to pay: <strong>${app.total_due - app.amount_paid} USD</strong>, billing number{" "}
+                    <strong>{app.billing_number}</strong>. PortaGov confirms the payment against this billing number
+                    before anything is released.
+                  </p>
+                </div>
+                <div>
+                  <FieldLabel htmlFor="pay-ref">Your reference from your phone (optional)</FieldLabel>
+                  <input id="pay-ref" {...FIELDS.recordPayment.transactionRef} className={inputCls} value={txnRef}
+                    onChange={(e) => setTxnRef(e.target.value)}
+                    placeholder="Only if your MoMo message already gave you one" />
+                  <p className="mt-1 text-xs text-[var(--dim)]">
+                    If you type a reference here, PortaGov keeps it with this payment. You do not need one to pay.
+                  </p>
+                </div>
+                {payError ? (
+                  <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+                    {payError}
+                  </p>
+                ) : null}
+                <PrimaryButton type="submit" disabled={startPay.isPending}>
+                  {startPay.isPending ? "Starting payment..." : "Make payment"}
+                </PrimaryButton>
+              </form>
+            )}
           </div>
 
           <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">

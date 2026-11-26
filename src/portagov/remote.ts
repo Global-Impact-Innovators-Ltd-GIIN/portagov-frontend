@@ -142,6 +142,25 @@ function saveAppCache(cache: Record<string, any>): void {
   storeSet(APPS_KEY, JSON.stringify(cache));
 }
 
+/** Payments started on this device, keyed by transaction reference.
+    The backend payment record does not carry the payer's phone number,
+    so PortaGov keeps it here with the billing number and any reference
+    the citizen typed, and listPayments below reads it back. */
+const PAYMENTS_KEY = "portagov-remote-payments-v1";
+
+function pendingPayments(): Record<string, any> {
+  try {
+    const raw = storeGet(PAYMENTS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePendingPayments(cache: Record<string, any>): void {
+  storeSet(PAYMENTS_KEY, JSON.stringify(cache));
+}
+
 function emptyProfile(id: number, phone: string): any {
   return {
     id,
@@ -627,24 +646,85 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
         beneficiary: args.onBehalfOf ? { name: args.onBehalfOf, relation: "Family" } : undefined,
       },
     });
-    // Upload the wallet documents the person picked, in order, against
-    // the backend's exact required document names.
+    // Upload the wallet documents the person picked, matched to the
+    // backend's required document names BY MEANING, not by position.
+    // The old code paired picked[i] with required[i], so for a Birth
+    // Certificate the passport photograph was sent as "Hospital
+    // notification or affidavit", the National ID as "Parent's ID",
+    // and the third document, the hospital birth record, was dropped
+    // entirely because the backend only requires two documents.
+    // The backend accepts any doc_type it is sent (it stores a
+    // non-required name as given), so documents that do not match a
+    // required name are still uploaded under their own wallet name
+    // and are never silently dropped.
     const required: any[] = svc.required_documents || [];
     let uploaded = 0;
+    let uploadedRequired = 0;
+    const missingRequired: string[] = [];
     const docIds: number[] = [];
+    const used = new Set<number>();
+    const normDoc = (s: any) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const docText = (d: any) => normDoc(`${d.doc_type || ""} ${d.title || ""} ${d.file_name || ""}`);
+    const matchRequired = (reqName: string, docs: any[]) => {
+      const req = normDoc(reqName);
+      // Hospital notification / affidavit / birth record: the
+      // hospital or clinic birth record from the wallet.
+      if (/(hospital|clinic|notification|affidavit|birth record)/.test(req)) {
+        return (
+          docs.find((d) => /(hospital|clinic)/.test(docText(d))) ||
+          docs.find((d) => /(birth record|notification|affidavit)/.test(docText(d))) ||
+          null
+        );
+      }
+      // Any ID the ministry asks for (Parent's ID, Owner ID, ...):
+      // the person's National ID first, then Passport, then Voter card.
+      if (/\bid\b/.test(req) || req.endsWith(" id")) {
+        return (
+          docs.find((d) => normDoc(d.doc_type) === "national id" || normDoc(d.title) === "national id") ||
+          docs.find((d) => normDoc(d.doc_type) === "passport" || normDoc(d.title) === "passport") ||
+          docs.find((d) => normDoc(d.doc_type) === "voter card" || normDoc(d.title) === "voter card") ||
+          docs.find((d) => /\bid\b/.test(docText(d))) ||
+          null
+        );
+      }
+      // Generic match: same name, or one name contained in the other.
+      return (
+        docs.find((d) => normDoc(d.title) === req || normDoc(d.doc_type) === req) ||
+        docs.find((d) => docText(d).includes(req) || req.includes(normDoc(d.title)) || req.includes(normDoc(d.doc_type))) ||
+        null
+      );
+    };
+    const uploadDoc = async (doc: any, docType: string) => {
+      const file = doc.file_url ? dataUrlToFile(doc.file_url, doc.file_name, doc.content_type) : null;
+      if (!file) return false;
+      const form = new FormData();
+      form.append("file", file);
+      form.append("doc_type", docType);
+      await apiCall(`/api/applications/${created.id}/documents`, { method: "POST", form });
+      uploaded += 1;
+      docIds.push(doc.id);
+      used.add(doc.id);
+      return true;
+    };
     try {
       const wallet = await (Actions as any).listDocuments({ profileId: args.profileId });
-      const picked = (wallet.documents || []).filter((d: any) => (args.documentIds || []).includes(d.id));
-      for (let i = 0; i < picked.length && i < required.length; i++) {
-        const doc = picked[i];
-        const file = doc.file_url ? dataUrlToFile(doc.file_url, doc.file_name, doc.content_type) : null;
-        if (!file) continue;
-        const form = new FormData();
-        form.append("file", file);
-        form.append("doc_type", required[i].name);
-        await apiCall(`/api/applications/${created.id}/documents`, { method: "POST", form });
-        uploaded += 1;
-        docIds.push(doc.id);
+      // Keep the citizen's tick order, not the wallet's storage order.
+      const picked = (wallet.documents || [])
+        .filter((d: any) => (args.documentIds || []).includes(d.id))
+        .sort((a: any, b: any) => (args.documentIds || []).indexOf(a.id) - (args.documentIds || []).indexOf(b.id));
+      for (const req of required) {
+        const doc = matchRequired(req.name, picked.filter((d: any) => !used.has(d.id)));
+        if (!doc) {
+          missingRequired.push(req.name);
+          continue;
+        }
+        if (await uploadDoc(doc, req.name)) uploadedRequired += 1;
+      }
+      // Every remaining picked document goes up under its own wallet
+      // name (for example "Passport photograph"), never dropped.
+      for (const doc of picked) {
+        if (used.has(doc.id)) continue;
+        await uploadDoc(doc, doc.title || doc.doc_type || "Supporting document");
       }
     } catch (e: any) {
       // A document that will not upload must stop the application with a
@@ -674,8 +754,8 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       details: JSON.stringify(args.details || []),
       document_ids: JSON.stringify(docIds),
       status_note:
-        uploaded < required.length
-          ? `Draft saved with PortaGov. ${required.length - uploaded} required document(s) still missing: attach them from your wallet before you pay, or the ministry cannot accept it.`
+        uploadedRequired < required.length
+          ? `Draft saved with PortaGov. ${required.length - uploadedRequired} required document(s) still missing (${missingRequired.join(", ")}): attach them from your wallet before you pay, or the ministry cannot accept it.`
           : `Billing number ${created.bill_id || ""}: pay $${Number(created.fee_usd ?? 0)} with MTN MoMo or Orange Money. PortaGov releases your application only when this billing number is confirmed paid.`,
     };
     saveAppCache(cache);
@@ -810,67 +890,166 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
   },
 
   async recordPayment(args: any) {
+    // Kept for callers that pay in one step: start the payment, then
+    // confirm it (the USSD "press 1, then PIN" step on the phone).
+    const started: any = await (remote as any).startPayment(args);
+    if (!started.txn_ref) return { id: started.id || 0, txn_ref: "", billing_number: started.billing_number || "", amount: started.amount || 0, reference: started.reference || "" };
+    const done: any = await (remote as any).confirmPayment({
+      applicationId: args.applicationId,
+      txn_ref: started.txn_ref,
+    });
+    return { id: done.id || started.id || 0, txn_ref: done.txn_ref || started.txn_ref, billing_number: done.billing_number || started.billing_number, amount: done.amount ?? started.amount, reference: done.reference || "" };
+  },
+
+  /**
+   * Start a mobile money payment, the first half of the approved
+   * payment flow (Giin, 2026-11-27): the citizen types ANY MoMo
+   * number to pay from, pre-filled with their sign-up number but
+   * editable, and clicks Make payment. The backend generates the
+   * billing number and a transaction reference and, in mock mode,
+   * waits for the citizen to confirm on their phone. Nothing is
+   * confirmed here: confirmPayment below is the second half, after
+   * the person presses 1 and enters their PIN on the phone.
+   * The payer number, the billing number and any reference the
+   * citizen typed are saved with the payment, never dropped.
+   */
+  async startPayment(args: any) {
     const cache = appCache();
     const saved = cache[String(args.applicationId)];
     const detail = await apiCall(`/api/applications/${args.applicationId}`, {});
     const fee = Number(detail.fee_usd ?? 0);
-    if (fee > 0 && !detail.paid) {
-      const pay = await apiCall(`/api/applications/${args.applicationId}/pay`, {
-        method: "POST",
-        body: {
-          method: args.method === "Orange Money" ? "orange_money" : "mtn_momo",
-          msisdn: args.payerPhone,
-        },
-      });
-      if (pay.confirm_by_user) {
-        await apiCall(`/api/applications/payments/${pay.txn_ref}/confirm`, {
+    const billing = detail.bill_id || "";
+    if (fee <= 0 || detail.paid) {
+      // Free service, or already paid: submit straight away.
+      if (!detail.paid) {
+        await apiCall(`/api/applications/${args.applicationId}/submit`, { method: "POST", body: {} });
+      }
+      return {
+        id: 0,
+        txn_ref: "",
+        billing_number: billing,
+        amount: fee,
+        method: args.method,
+        payer_phone: args.payerPhone || "",
+        user_ref: args.transactionRef || "",
+        reference: detail.reference || "",
+        confirm_by_user: false,
+        already_paid: Boolean(detail.paid),
+      };
+    }
+    const pay = await apiCall(`/api/applications/${args.applicationId}/pay`, {
+      method: "POST",
+      body: {
+        method: args.method === "Orange Money" ? "orange_money" : "mtn_momo",
+        msisdn: args.payerPhone,
+      },
+    });
+    const rec = {
+      id: pay.id,
+      txn_ref: pay.txn_ref,
+      billing_number: billing,
+      amount: fee,
+      method: args.method,
+      payer_phone: args.payerPhone || "",
+      user_ref: args.transactionRef || "",
+      application_id: args.applicationId,
+      confirm_by_user: Boolean(pay.confirm_by_user),
+    };
+    const pending = pendingPayments();
+    pending[String(pay.txn_ref)] = rec;
+    savePendingPayments(pending);
+    void saved;
+    return rec;
+  },
+
+  /**
+   * Second half of the payment flow: the citizen has pressed 1 to
+   * confirm the transaction and amount on their phone and entered
+   * their MoMo PIN there. In mock mode this call is the stand-in for
+   * that USSD confirmation; when a real MoMo/Orange Money provider
+   * is live, the same step waits for the provider to settle instead.
+   * After confirmation the application is submitted, which releases
+   * it to the institution, and the caller must refresh the
+   * application and payments lists so the paid amount shows at once.
+   */
+  async confirmPayment(args: any) {
+    const cache = appCache();
+    const saved = cache[String(args.applicationId)];
+    const pending = pendingPayments()[String(args.txn_ref)] || {};
+    const txnRef = args.txn_ref;
+    if (pending.confirm_by_user !== false) {
+      try {
+        await apiCall(`/api/applications/payments/${txnRef}/confirm`, {
           method: "POST",
           body: { success: true },
         });
-      } else {
-        // Live provider payment: poll until the provider settles it.
+      } catch {
+        // The confirm call did not land: fall through to polling the
+        // payment status, so a dropped connection does not lose a
+        // payment that the provider already settled.
         let settled = false;
         for (let i = 0; i < 10; i++) {
           await new Promise((r) => setTimeout(r, 3000));
-          const st = await apiCall(`/api/applications/payments/${pay.txn_ref}/status`, {});
-          if (st.status === "success") { settled = true; break; }
-          if (st.status === "failed") throw new Error("The payment was not confirmed by the provider. Check your phone and try again.");
+          const st = await apiCall(`/api/applications/payments/${txnRef}/status`, {}).catch(() => null);
+          if (st && st.status === "success") { settled = true; break; }
+          if (st && st.status === "failed") throw new Error("The payment was not confirmed by the provider. Check your phone and try again.");
         }
         if (!settled) throw new Error("The payment is still pending with the provider. Check your phone, then check the payment status again.");
       }
-      const after = await apiCall(`/api/applications/${args.applicationId}`, {});
-      if (!after.paid) throw new Error("PortaGov could not confirm this payment. The money may still arrive; check the payment status before paying again.");
-      if (saved) {
-        saved.status_note = "Paid and released to the institution.";
-        saveAppCache(cache);
+    } else {
+      // Live provider payment: poll until the provider settles it.
+      let settled = false;
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const st = await apiCall(`/api/applications/payments/${txnRef}/status`, {});
+        if (st.status === "success") { settled = true; break; }
+        if (st.status === "failed") throw new Error("The payment was not confirmed by the provider. Check your phone and try again.");
       }
-      // Submit now that the fee is paid: this is the release to the
-      // institution in the backend flow.
-      await apiCall(`/api/applications/${args.applicationId}/submit`, { method: "POST", body: {} });
-      return { id: pay.id };
+      if (!settled) throw new Error("The payment is still pending with the provider. Check your phone, then check the payment status again.");
     }
-    // Free service: submit straight away.
+    const after = await apiCall(`/api/applications/${args.applicationId}`, {});
+    if (!after.paid) throw new Error("PortaGov could not confirm this payment. The money may still arrive; check the payment status before paying again.");
+    if (saved) {
+      saved.status_note = "Paid and released to the institution.";
+      saveAppCache(cache);
+    }
+    // Submit now that the fee is paid: this is the release to the
+    // institution in the backend flow.
     await apiCall(`/api/applications/${args.applicationId}/submit`, { method: "POST", body: {} });
-    return { id: 0 };
+    return {
+      id: pending.id || 0,
+      txn_ref: txnRef,
+      billing_number: pending.billing_number || after.bill_id || "",
+      amount: Number(pending.amount ?? after.fee_usd ?? 0),
+      method: pending.method || "",
+      payer_phone: pending.payer_phone || "",
+      user_ref: pending.user_ref || "",
+      reference: after.reference || "",
+      status: "Confirmed",
+    };
   },
 
   async listPayments(_args: any) {
     try {
       const rows = await apiCall("/api/applications", {});
       const payments: any[] = [];
+      const pending = pendingPayments();
       for (const r of rows || []) {
         const detail = await apiCall(`/api/applications/${r.id}`, {}).catch(() => null);
         if (!detail) continue;
         for (const p of detail.payments || []) {
+          const kept = pending[String(p.txn_ref || "")] || {};
           payments.push({
             id: p.id,
             application_id: r.id,
             application_ref: r.reference,
-            billing_number: r.bill_id || "",
+            billing_number: r.bill_id || kept.billing_number || "",
             service_name: r.service?.name || "",
             method: p.method === "mtn_momo" ? "MTN MoMo" : p.method === "orange_money" ? "Orange Money" : p.method,
             amount: Number(p.amount_usd ?? 0),
-            payer_phone: "",
+            // The backend does not return the payer's number, so read
+            // back the number the citizen typed when they paid.
+            payer_phone: kept.payer_phone || "",
             transaction_ref: p.txn_ref || "",
             status: p.status === "success" ? "Confirmed" : p.status === "refunded" ? "Refunded" : "Recorded",
             refund_reason: p.refund_reason || "",
@@ -894,6 +1073,14 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     };
     const center = OFFICE_TO_CENTER[args.office];
     if (!center || !args.applicationId) return (Actions as any).bookAppointment(args);
+    // PortaGov offices are open on weekdays only. Reject a Saturday or
+    // Sunday here with a clear message instead of failing silently.
+    if (args.date) {
+      const day = new Date(`${String(args.date).slice(0, 10)}T12:00:00`).getDay();
+      if (day === 0 || day === 6) {
+        throw new Error("PortaGov offices are open on weekdays only, Monday to Friday. Choose a weekday for your visit.");
+      }
+    }
     const start = String(args.timeSlot || "09:00").slice(0, 5);
     const slot = `${args.date}T${start}:00`;
     let appt: any;
