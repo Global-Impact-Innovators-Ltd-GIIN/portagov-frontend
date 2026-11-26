@@ -819,11 +819,8 @@ function HomePage({
               Government services, from your home.
             </h1>
             <p className="mt-3 max-w-xl text-base text-white/85">
-              PortaGov connects you to Liberian ministries and agencies in one
-              place. Apply from home, send your documents once, pay with mobile
-              money, and travel in only when you are told to come, for
-              biometrics or to collect what is ready. Open to every county of
-              Liberia, and to Liberians living abroad in any country.
+              Apply from home. Pay with mobile money. Come in only when you
+              are told to.
             </p>
             {profile ? (
               <div className="mt-5 flex flex-nowrap gap-2 sm:gap-3">
