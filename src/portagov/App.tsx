@@ -821,7 +821,7 @@ function FieldLabel({ htmlFor, children }: { htmlFor: string; children: ReactNod
 }
 
 const inputCls =
-  "w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[var(--text)]";
+  "min-w-0 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[var(--text)]";
 
 /* Liberian identity document formats, checked the same way on the server.
    National ID: the NIR card carries a 10 digit National Identification
@@ -917,7 +917,7 @@ function PhoneInput({
   const code = DIAL_CODES[country] ?? "231";
 
   return (
-    <div className="flex w-full">
+    <div className="flex w-full min-w-0">
       <select
         aria-label="Country dialling code"
         value={country}
@@ -925,7 +925,7 @@ function PhoneInput({
           setCountry(e.target.value);
           emit(e.target.value, digits);
         }}
-        className="w-32 shrink-0 truncate rounded-l-lg border border-r-0 border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-[var(--text)] sm:w-40"
+        className="w-28 min-w-0 shrink-0 truncate rounded-l-lg border border-r-0 border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-[var(--text)] sm:w-40"
       >
         {PHONE_COUNTRIES.map((c) => (
           <option key={c} value={c}>
@@ -2164,8 +2164,8 @@ function ProfileForm({
   };
 
   return (
-    <form onSubmit={onSubmit} className="space-y-4">
-      <div className="grid gap-4 sm:grid-cols-2">
+    <form onSubmit={onSubmit} className="min-w-0 w-full space-y-4">
+      <div className="grid min-w-0 gap-4 [>&*]:min-w-0 sm:grid-cols-2">
         <div>
           <FieldLabel htmlFor="pf-first-name">First name</FieldLabel>
           <input id="pf-first-name" {...FIELDS.createProfile.fullName} className={inputCls} value={draft.firstName}
@@ -2439,7 +2439,7 @@ function ProfileForm({
           </div>
         ) : null}
         {draft.idChoice === "none" ? (
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div className="mt-3 grid min-w-0 gap-3 [>&*]:min-w-0 sm:grid-cols-2">
             <div>
               <FieldLabel htmlFor="pf-alt-type">Document you will use instead</FieldLabel>
               <select id="pf-alt-type" className={inputCls} value={draft.altIdType}
@@ -2487,7 +2487,7 @@ function ProfileForm({
             PortaGov stores it scrambled, never as plain words. Five wrong
             tries at sign-in lock the account for 15 minutes.
           </p>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div className="mt-3 grid min-w-0 gap-3 [>&*]:min-w-0 sm:grid-cols-2">
             <div>
               <FieldLabel htmlFor="pf-pw">Password</FieldLabel>
               <input id="pf-pw" {...FIELDS.registerAccount.password} type="password" className={inputCls} value={password}
@@ -2555,11 +2555,18 @@ function ProfileForm({
               ["Language", r.language],
             ];
             return (
-              <dl className="mt-3 grid gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
+              <dl className="mt-3 divide-y divide-[var(--border)] text-sm">
                 {rows.map(([k, v]) => (
-                  <div key={k} className="flex flex-col">
-                    <dt className="font-semibold text-[var(--dim)]">{k}</dt>
-                    <dd className="text-[var(--text)]">{v}</dd>
+                  <div
+                    key={k}
+                    className="flex items-baseline justify-between gap-3 py-2"
+                  >
+                    <dt className="shrink-0 font-semibold text-[var(--dim)]">
+                      {k}
+                    </dt>
+                    <dd className="min-w-0 flex-1 break-words text-right font-medium text-[var(--text)]">
+                      {v && v.trim() ? v : "Not given"}
+                    </dd>
                   </div>
                 ))}
               </dl>
@@ -2703,8 +2710,8 @@ function SignInPage({
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-8">
-      <div className="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)]">
-        <div className="p-6 text-white" style={{ backgroundColor: "#0a2a5e" }}>
+      <div className="min-w-0 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)]">
+        <div className="p-4 text-white sm:p-6" style={{ backgroundColor: "#0a2a5e" }}>
           <img src={logoMark} alt="PortaGov mark" className="h-16 w-16 rounded-full bg-white object-cover" />
           <h1 className="mt-3 font-display text-2xl font-extrabold">Sign in to PortaGov</h1>
           <p className="mt-1 text-sm text-white/85">
@@ -2713,7 +2720,7 @@ function SignInPage({
             in.
           </p>
         </div>
-        <div className="p-6">
+        <div className="min-w-0 p-4 sm:p-6">
           {regInfo ? (
             <div className="space-y-4">
               <h2 className="font-display text-xl font-bold text-[var(--text)]">
@@ -2773,7 +2780,7 @@ function SignInPage({
             </div>
           ) : mode === "choose" ? (
             <>
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="grid min-w-0 gap-4 [>&*]:min-w-0 sm:grid-cols-2">
               <button
                 type="button"
                 onClick={() => setMode("new")}
