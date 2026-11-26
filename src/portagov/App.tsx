@@ -4457,6 +4457,78 @@ function ApplicationsPage({ profile }: { profile: ProfileT }) {
 
 /* ---------- application detail ---------- */
 
+/* ---------- your numbers: the three linked numbers ---------- */
+/* One small, quiet box that shows the three numbers that belong to one
+   application together, tracking, billing and transaction, so a citizen,
+   an institution and PortaGov all see the same link. The numbers are
+   already linked in the backend by application id; this only shows that
+   link. Keep it plain: short labels, one row each, label in front of its
+   value, nothing loud, no extra buttons. On a narrow phone each row
+   stays on one line, label left, value right, wrapping neatly. */
+function LinkedNumbersRow({
+  label,
+  value,
+  dimValue,
+}: {
+  label: string;
+  value: string;
+  dimValue?: boolean;
+}) {
+  return (
+    <div className="flex justify-between gap-4">
+      <dt className="shrink-0 text-[var(--dim)]">{label}</dt>
+      <dd
+        className={`min-w-0 text-right font-semibold break-all ${
+          dimValue ? "text-[var(--dim)]" : "text-[var(--text)]"
+        }`}
+      >
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function LinkedNumbers({
+  tracking,
+  billing,
+  transaction,
+  amountPaid,
+  payerPhone,
+}: {
+  tracking: string;
+  billing: string;
+  transaction?: string | null;
+  amountPaid?: number | null;
+  payerPhone?: string | null;
+}) {
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-lg font-bold text-[var(--text)]">
+        Your numbers
+      </h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        These three numbers belong to this one application. Any one of them
+        finds the other two.
+      </p>
+      <dl className="mt-3 space-y-2 text-sm">
+        <LinkedNumbersRow label="Tracking number" value={tracking} />
+        <LinkedNumbersRow label="Billing number" value={billing} />
+        <LinkedNumbersRow
+          label="Transaction number"
+          value={transaction || "Not paid yet"}
+          dimValue={!transaction}
+        />
+        {amountPaid != null ? (
+          <LinkedNumbersRow label="Amount paid" value={`$${amountPaid}`} />
+        ) : null}
+        {payerPhone ? (
+          <LinkedNumbersRow label="Paid from" value={payerPhone} />
+        ) : null}
+      </dl>
+    </div>
+  );
+}
+
 function ApplicationDetailPage({
   id,
   profile,
@@ -4699,8 +4771,9 @@ function ApplicationDetailPage({
         </p>
         <h1 className="mt-1 font-display text-2xl font-extrabold">{app.service_name}</h1>
         <p className="mt-1 text-white/85">
-          Reference <strong>{app.reference}</strong>, keep this number.{" "}
-          {app.institution}. Submitted {fmtDateTime(app.created_at)}.
+          {app.institution}. Submitted {fmtDateTime(app.created_at)}. Your
+          tracking, billing and transaction numbers are together in Your
+          numbers below.
         </p>
         <p className="mt-2 text-sm text-white/85">
           {app.released
@@ -6469,6 +6542,15 @@ function TrackPage({ profile }: { profile: ProfileT | null }) {
     onSuccess: () => setSearched(true),
   });
   const app = track.data?.application ?? null;
+  const trackPayments = useQuery({
+    queryKey: ["payments"],
+    queryFn: () => api.listPayments({ limit: 100 }),
+  });
+  const trackPayment = app
+    ? (trackPayments.data?.payments ?? [])
+        .filter((pay: PaymentT) => pay.application_id === app.id && pay.status === "Confirmed")
+        .sort((a: PaymentT, b: PaymentT) => b.created_at.localeCompare(a.created_at))[0]
+    : undefined;
   if (!profile) {
     return (
       <div className="mx-auto max-w-2xl px-4 py-8">
@@ -6537,7 +6619,7 @@ function TrackPage({ profile }: { profile: ProfileT | null }) {
             <div>
               <p className="font-display text-lg font-bold text-[var(--text)]">{app.service_name}</p>
               <p className="text-sm text-[var(--dim)]">
-                {app.institution}, reference {app.reference}, submitted {fmtDate(app.created_at)}
+                {app.institution}, submitted {fmtDate(app.created_at)}
               </p>
             </div>
             <Chip tone="gold">{applicationStatusPlain(app.status).short}</Chip>
@@ -6550,6 +6632,15 @@ function TrackPage({ profile }: { profile: ProfileT | null }) {
               ? "PortaGov has released this application to the institution."
               : "This application is still with PortaGov for review. The institution receives it only when PortaGov releases it."}
           </p>
+          <div className="mt-4">
+            <LinkedNumbers
+              tracking={app.reference}
+              billing={app.billing_number}
+              transaction={trackPayment?.transaction_ref}
+              amountPaid={app.amount_paid}
+              payerPhone={trackPayment?.payer_phone}
+            />
+          </div>
           <div className="mt-4">
             <StatusTimeline status={app.status} />
           </div>
@@ -8454,6 +8545,15 @@ function ApplicationExtras({
     queryKey: ["my-complaints", profile.id],
     queryFn: () => api.listMyComplaints({ profileId: profile.id }),
   });
+  /* The latest confirmed payment for this application, so the
+     transaction number in Your numbers below is the real one. */
+  const payments = useQuery({
+    queryKey: ["payments"],
+    queryFn: () => api.listPayments({ limit: 100 }),
+  });
+  const latestPayment = (payments.data?.payments ?? [])
+    .filter((pay: PaymentT) => pay.application_id === app.id && pay.status === "Confirmed")
+    .sort((a: PaymentT, b: PaymentT) => b.created_at.localeCompare(a.created_at))[0];
   const [kind, setKind] = useState<"Complaint" | "Appeal">("Complaint");
   const [reason, setReason] = useState("");
   const [caseDone, setCaseDone] = useState(false);
@@ -8501,17 +8601,23 @@ function ApplicationExtras({
     <div className="mt-5 grid gap-5 md:grid-cols-2">
       <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
         <h2 className="font-display text-lg font-bold text-[var(--text)]">
-          Billing and amount paid
+          Your numbers
         </h2>
+        <p className="mt-1 text-sm text-[var(--dim)]">
+          These three numbers belong to this one application. Any one of them
+          finds the other two.
+        </p>
         <dl className="mt-3 space-y-2 text-sm">
-          <div className="flex justify-between gap-4">
-            <dt className="text-[var(--dim)]">Tracking number</dt>
-            <dd className="font-bold text-[var(--text)]">{app.reference}</dd>
-          </div>
-          <div className="flex justify-between gap-4">
-            <dt className="text-[var(--dim)]">Billing number</dt>
-            <dd className="font-bold text-[var(--text)]">{app.billing_number}</dd>
-          </div>
+          <LinkedNumbersRow label="Tracking number" value={app.reference} />
+          <LinkedNumbersRow label="Billing number" value={app.billing_number} />
+          <LinkedNumbersRow
+            label="Transaction number"
+            value={latestPayment?.transaction_ref || "Not paid yet"}
+            dimValue={!latestPayment}
+          />
+          {latestPayment ? (
+            <LinkedNumbersRow label="Paid from" value={latestPayment.payer_phone} />
+          ) : null}
           <div className="flex justify-between gap-4">
             <dt className="text-[var(--dim)]">Service fee</dt>
             <dd className="font-semibold text-[var(--text)]">${app.service_fee}</dd>
@@ -8549,8 +8655,8 @@ function ApplicationExtras({
         </dl>
         <p className="mt-3 text-sm text-[var(--dim)]">
           The rule is simple: PortaGov releases your application to{" "}
-          {app.institution} only when billing number {app.billing_number} is
-          confirmed paid
+          {app.institution} only when the billing number above is confirmed
+          paid
           {totalDue === 0
             ? ", and this service is free, so it counts as paid at once"
             : ""}
@@ -10752,15 +10858,23 @@ function ReceiptDownloads({ payments }: { payments: PaymentT[] }) {
       </SectionTitle>
       <div className="space-y-3">
         {confirmed.map((p) => (
-          <div key={p.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-            <p className="text-sm text-[var(--text)]">
-              <strong>Receipt:</strong> {p.service_name}, {paymentMethodLabel(p)}, ${p.amount}, billing{" "}
-              {p.billing_number}, application {p.application_ref}, transaction {p.transaction_ref},{" "}
-              {fmtDate(p.created_at)}. Status: {p.status}.
+          <div key={p.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+            <p className="text-sm text-[var(--dim)]">
+              Receipt: {p.service_name}, {paymentMethodLabel(p)}, {fmtDate(p.created_at)}. Status:{" "}
+              {p.status}.
             </p>
-            <GhostButton onClick={() => downloadReceipt(p)}>
-              Download receipt (printable)
-            </GhostButton>
+            <dl className="mt-3 space-y-2 text-sm">
+              <LinkedNumbersRow label="Tracking number" value={p.application_ref} />
+              <LinkedNumbersRow label="Billing number" value={p.billing_number} />
+              <LinkedNumbersRow label="Transaction number" value={p.transaction_ref} />
+              <LinkedNumbersRow label="Amount paid" value={`$${p.amount}`} />
+              <LinkedNumbersRow label="Paid from" value={p.payer_phone} />
+            </dl>
+            <div className="mt-4">
+              <GhostButton onClick={() => downloadReceipt(p)}>
+                Download receipt (printable)
+              </GhostButton>
+            </div>
           </div>
         ))}
       </div>
