@@ -600,7 +600,7 @@ function PrimaryButton({
       type={type ?? "button"}
       onClick={onClick}
       disabled={disabled}
-      className="rounded-lg bg-[var(--navy)] px-5 py-2.5 font-semibold text-white disabled:opacity-50"
+      className="shrink-0 whitespace-nowrap rounded-lg bg-[var(--navy)] px-5 py-2.5 font-semibold text-white disabled:opacity-50"
       style={{ backgroundColor: "#0a2a5e" }}
     >
       {children}
@@ -7663,9 +7663,6 @@ export function App() {
                 </div>
               ) : null}
             </div>
-            {portal === "citizen" ? (
-              <PageHelpButton route={route} profile={profile} />
-            ) : null}
             {profile ? (
               <div className="relative shrink-0" ref={avatarRef}>
                 <button
@@ -7801,7 +7798,7 @@ export function App() {
       {portal === "citizen" ? (
         <>
           {flag("liberian_english") ? <LiberianEnglishButton /> : null}
-          {flag("assistant") ? <AssistantPanel profile={profile} /> : null}
+          {flag("assistant") ? <AssistantPanel profile={profile} route={route} /> : null}
         </>
       ) : null}
 
@@ -16144,258 +16141,6 @@ function pageHelpFor(route: Route): { title: string; lines: string[] } {
   );
 }
 
-function PageHelpButton({ route, profile }: { route: Route; profile: ProfileT | null }) {
-  const [open, setOpen] = useState(false);
-  const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [askError, setAskError] = useState("");
-  const [pendingRoute, setPendingRoute] = useState("");
-  const [pendingQuestion, setPendingQuestion] = useState("");
-  const [guestName, setGuestName] = useState("");
-  const [guestPhone, setGuestPhone] = useState("");
-  const [ticketMsg, setTicketMsg] = useState("");
-  const panelRef = useRef<HTMLDivElement | null>(null);
-
-  const help = pageHelpFor(route);
-  const apps = useQuery({
-    queryKey: ["applications", profile?.id ?? 0],
-    queryFn: () => api.listApplications({ profileId: profile?.id ?? 0 }),
-    enabled: !!profile && open,
-  });
-
-  /* Close the help panel when the person taps or clicks anywhere outside
-     it, or presses Escape, the same way the Accessibility dropdown closes. */
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (e: MouseEvent | TouchEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    document.addEventListener("touchstart", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-      document.removeEventListener("touchstart", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
-
-  const ask = useMutation({
-    mutationFn: async (q: string) => {
-      const pageText = `${help.title}. ${help.lines.join(" ")}`;
-      const context = [
-        `The citizen is on this page: ${pageText}`,
-        assistantContext(q, profile, apps.data?.applications ?? []),
-      ].join("\n\n");
-      return await api.askAssistant({ question: q, context });
-    },
-    onSuccess: (r, q) => {
-      setAnswer(r.answer);
-      if (r.needs_ticket) {
-        setPendingRoute(r.route && r.route !== "None" ? r.route : "Help desk");
-        setPendingQuestion(q);
-      } else {
-        setPendingRoute("");
-        setPendingQuestion("");
-      }
-    },
-    onError: () => {
-      setAnswer("");
-      setAskError(
-        "I could not reach my knowledge just now. You can still pass your question to the Help desk below, and a real person will answer.",
-      );
-      setPendingRoute("Help desk");
-      setPendingQuestion(question);
-    },
-  });
-
-  const relatedApp = () => {
-    const myApps = apps.data?.applications ?? [];
-    if (route.name === "application") {
-      return myApps.find((a) => a.id === route.id) ?? myApps[0];
-    }
-    return (
-      myApps.find((a) =>
-        pendingQuestion.toUpperCase().includes(a.reference.toUpperCase()),
-      ) ?? myApps[0]
-    );
-  };
-
-  const createTicket = useMutation({
-    mutationFn: async () => {
-      const related = relatedApp();
-      const syncNote = related
-        ? `\n\n[Synced to application ${related.reference} (${related.service_name} at ${related.institution}, status ${related.status}). Keep every reply on this same application and tracking number, ${related.reference}.]`
-        : "";
-      return await api.submitHelpRequest({
-        profileId: profile?.id ?? null,
-        name: profile?.full_name ?? guestName,
-        phone: profile?.phone ?? guestPhone,
-        topic: pendingRoute,
-        message: `${pendingQuestion}\n\n[Asked from the ${help.title} page. Passed by the PortaGov assistant to: ${pendingRoute}. The assistant could not answer this fully. Citizen is signed in as ${profile?.full_name ?? "a guest"}.]${syncNote}`,
-      });
-    },
-    onSuccess: (r) => {
-      const related = relatedApp();
-      setTicketMsg(
-        `Done. Your ticket is ${ticketNumber(r.id, new Date().toISOString())}, routed to ${pendingRoute}.${related ? ` It is synced to your application ${related.reference}, so the reply stays on that same tracking number.` : ""} A real person will answer, promised within one working day, and the reply lands in your messages and on the Help page.`,
-      );
-      setPendingRoute("");
-      setPendingQuestion("");
-      setAnswer("");
-    },
-  });
-
-  return (
-    <div className="relative shrink-0" ref={panelRef}>
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-label="Help with this page"
-        title="Help with this page"
-        onClick={() => {
-          setOpen((o) => !o);
-          setTicketMsg("");
-        }}
-        className="flex h-9 w-9 items-center justify-center rounded-full border text-base font-extrabold"
-        style={{
-          color: "var(--text)",
-          borderColor: "var(--border)",
-          backgroundColor: open ? "var(--gold-soft)" : "var(--surface-alt)",
-        }}
-      >
-        ?
-      </button>
-      {open ? (
-        <div
-          role="dialog"
-          aria-label={`Help: ${help.title}`}
-          className="absolute right-0 top-full z-50 mt-2 max-h-[75vh] w-[min(92vw,22rem)] overflow-y-auto rounded-xl border p-4 shadow-lg"
-          style={{
-            borderColor: "var(--border)",
-            backgroundColor: "var(--surface)",
-          }}
-        >
-          <div className="flex items-start justify-between gap-2">
-            <p className="font-display font-extrabold text-[var(--text)]">
-              Help: {help.title}
-            </p>
-            <button
-              type="button"
-              onClick={() => setOpen(false)}
-              aria-label="Close help"
-              className="rounded-full px-2 py-1 font-bold text-[var(--text)]"
-            >
-              ×
-            </button>
-          </div>
-          <ul className="mt-2 space-y-1.5 text-sm text-[var(--dim)]">
-            {help.lines.map((line) => (
-              <li key={line}>{line}</li>
-            ))}
-          </ul>
-          <form
-            className="mt-3 space-y-2"
-            onSubmit={(e: FormEvent) => {
-              e.preventDefault();
-              const q = question.trim();
-              if (q.length < 3) return;
-              setAnswer("");
-              setTicketMsg("");
-              setAskError("");
-              ask.mutate(q);
-            }}
-          >
-            <FieldLabel htmlFor="page-help-q">
-              Ask a question about this page
-            </FieldLabel>
-            <input
-              id="page-help-q"
-              className={inputCls}
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              placeholder="Type your question in plain words"
-            />
-            <PrimaryButton type="submit" disabled={ask.isPending}>
-              {ask.isPending ? "Asking..." : "Ask"}
-            </PrimaryButton>
-          </form>
-          {answer ? (
-            <p className="mt-3 rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-              {answer}
-            </p>
-          ) : null}
-          {askError ? (
-            <p role="alert" className="mt-3 text-sm font-semibold text-[var(--warn)]">
-              {askError}
-            </p>
-          ) : null}
-          {pendingRoute ? (
-            <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-3">
-              <p className="text-sm text-[var(--text)]">
-                I cannot answer this fully. I can pass it to the{" "}
-                {pendingRoute}, and a real person will answer.
-              </p>
-              {!profile ? (
-                <div className="mt-2 space-y-2">
-                  <div>
-                    <FieldLabel htmlFor="page-help-name">Your name</FieldLabel>
-                    <input
-                      id="page-help-name"
-                      className={inputCls}
-                      value={guestName}
-                      onChange={(e) => setGuestName(e.target.value)}
-                    />
-                  </div>
-                  <div>
-                    <FieldLabel htmlFor="page-help-phone">Your phone number</FieldLabel>
-                    <input
-                      id="page-help-phone"
-                      className={inputCls}
-                      value={guestPhone}
-                      onChange={(e) => setGuestPhone(e.target.value)}
-                    />
-                  </div>
-                </div>
-              ) : null}
-              <div className="mt-2">
-                <PrimaryButton
-                  type="button"
-                  disabled={
-                    createTicket.isPending ||
-                    (!profile &&
-                      (guestName.trim().length < 2 || guestPhone.trim().length < 7))
-                  }
-                  onClick={() => createTicket.mutate()}
-                >
-                  {createTicket.isPending
-                    ? "Sending..."
-                    : `Pass to the ${pendingRoute}`}
-                </PrimaryButton>
-              </div>
-            </div>
-          ) : null}
-          {ticketMsg ? (
-            <p role="status" className="mt-3 text-sm font-semibold text-[var(--text)]">
-              {ticketMsg}
-            </p>
-          ) : null}
-          <p className="mt-3 text-xs text-[var(--dim)]">
-            Need a person another way?{" "}
-            <a href="#/help" className="font-semibold underline">
-              Open the full help page
-            </a>
-            .
-          </p>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 /* ---------- PortaGov AI assistant (floating, on citizen pages) ---------- */
 
 type ChatMsg = { from: "ai" | "citizen" | "system"; text: string };
@@ -16439,7 +16184,8 @@ function assistantContext(question: string, profile: ProfileT | null, apps: Appl
   ].join("\n\n");
 }
 
-function AssistantPanel({ profile }: { profile: ProfileT | null }) {
+function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: Route }) {
+  const help = pageHelpFor(route);
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMsg[]>([
     {
@@ -16467,7 +16213,10 @@ function AssistantPanel({ profile }: { profile: ProfileT | null }) {
     mutationFn: async (question: string) =>
       await api.askAssistant({
         question,
-        context: assistantContext(question, profile, apps.data?.applications ?? [], kb.data?.articles ?? []),
+        context: [
+          `The citizen is on this page: ${help.title}. ${help.lines.join(" ")}`,
+          assistantContext(question, profile, apps.data?.applications ?? [], kb.data?.articles ?? []),
+        ].join("\n\n"),
       }),
     onSuccess: (r, question) => {
       setMessages((prev) => [...prev, { from: "ai", text: r.answer }]);
@@ -16574,6 +16323,17 @@ function AssistantPanel({ profile }: { profile: ProfileT | null }) {
             </button>
           </div>
           <div ref={scrollRef} className="min-h-[30vh] flex-1 space-y-2 overflow-y-auto p-3">
+            <div className="rounded-xl bg-[var(--surface-alt)] p-3">
+              <p className="text-sm font-bold text-[var(--text)]">Help with this page: {help.title}</p>
+              <ul className="mt-1 space-y-1 text-sm text-[var(--dim)]">
+                {help.lines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+              <p className="mt-2 text-xs text-[var(--dim)]">
+                Ask below in plain words. If the assistant cannot answer, it passes your question to a real person.
+              </p>
+            </div>
             {messages.map((m, i) => (
               <div
                 key={i}
