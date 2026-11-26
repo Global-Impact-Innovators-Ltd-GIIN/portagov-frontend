@@ -296,8 +296,9 @@ function nav(path: string) {
 }
 
 /** Go back to the page the person came from; fall back to Home when this
-    page was opened directly. Used by the back arrow and the X close
-    button on every page. */
+    page was opened directly. Used by the back arrow on every page. The X
+    close button does not use this: it closes the page outright, see
+    closePage(). */
 function goBack() {
   const s = stack();
   if (s.length > 1) {
@@ -305,6 +306,14 @@ function goBack() {
     applyPath(s[s.length - 1] ?? "#/");
     return;
   }
+  pathStack = ["#/"];
+  applyPath("#/");
+}
+
+/** Close the page the person is on and go to the homepage, clearing the
+    page stack so the person is out of that page entirely, not one step
+    back. Used by the X close button on every page. */
+function closePage() {
   pathStack = ["#/"];
   applyPath("#/");
 }
@@ -519,15 +528,18 @@ function BackArrow({ onClick }: { onClick?: () => void }) {
   );
 }
 
-/** The X close button at the top right of every opened page, panel, and
-    form: closes the view and goes back, alongside any bottom back button. */
+/** The X close button at the top right of every opened page: closes the
+    page outright and goes to the homepage, clearing the page stack. It
+    is not a back button: the Back button takes the person to the previous
+    page, the X closes where they were. An explicit onClick, when passed,
+    is used instead. */
 function CloseX({ onClick, label }: { onClick?: () => void; label?: string }) {
   return (
     <button
       type="button"
-      onClick={onClick ?? goBack}
-      aria-label={label ?? "Close and go back"}
-      title={label ?? "Close and go back"}
+      onClick={onClick ?? closePage}
+      aria-label={label ?? "Close"}
+      title={label ?? "Close"}
       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--surface)] text-[var(--text)] shadow-sm"
     >
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden focusable="false">
@@ -5395,6 +5407,27 @@ export function App() {
     }
   });
   const [accessOpen, setAccessOpen] = useState(false);
+  const accessRef = useRef<HTMLDivElement | null>(null);
+  /* Close the Accessibility dropdown when the person taps or clicks
+     anywhere outside it, or presses Escape, so it never stays open
+     after they have moved on. */
+  useEffect(() => {
+    if (!accessOpen) return;
+    const onPointerDown = (e: MouseEvent | TouchEvent) => {
+      if (accessRef.current && !accessRef.current.contains(e.target as Node)) setAccessOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setAccessOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("touchstart", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("touchstart", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [accessOpen]);
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.large = prefs.large ? "true" : "false";
@@ -5665,7 +5698,7 @@ export function App() {
                 </svg>
               )}
             </button>
-            <div className="relative">
+            <div className="relative" ref={accessRef}>
               <button
                 type="button"
                 aria-expanded={accessOpen}
