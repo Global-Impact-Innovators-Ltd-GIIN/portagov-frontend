@@ -1,4 +1,5 @@
-const api = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000").trim();
+const api = (process.env.NEXT_PUBLIC_API_URL || "https://eliberia-backend.onrender.com").trim();
+const apiOrigin = api.replace(/\/$/, "");
 const dev = process.env.NODE_ENV !== "production";
 
 const csp = [
@@ -18,6 +19,19 @@ const csp = [
 const nextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  async rewrites() {
+    // Same-origin proxy to the Flask backend on Render. The browser calls
+    // /pg-api/* on this site and Next.js forwards it to Render, so the
+    // live site never hits Render CORS directly. Direct calls to Render
+    // from the live Vercel origin are still blocked by the backend's
+    // CORS_ORIGINS, which must also be set in the Render dashboard.
+    return [
+      {
+        source: "/pg-api/:path*",
+        destination: `${apiOrigin}/api/:path*`,
+      },
+    ];
+  },
   async headers() {
     return [
       {
