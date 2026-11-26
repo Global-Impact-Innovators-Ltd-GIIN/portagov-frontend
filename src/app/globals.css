@@ -52,6 +52,16 @@ body {
   font-family: var(--font-body, "Public Sans", system-ui, sans-serif);
 }
 
+/* No sideways scroll on a phone, ever: one wide element must never push
+   the whole page off screen and make fields look cut off at the edges.
+   `clip` (not `hidden`) keeps the sticky header working, because it does
+   not create a scroll container. Individual overflow is still fixed at
+   its source; this is only the safety net. */
+html,
+body {
+  overflow-x: clip;
+}
+
 h1,
 h2,
 h3,

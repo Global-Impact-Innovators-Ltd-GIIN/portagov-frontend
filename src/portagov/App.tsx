@@ -662,18 +662,20 @@ function PrimaryButton({
   onClick,
   disabled,
   type,
+  className,
 }: {
   children: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
   type?: "submit" | "button";
+  className?: string;
 }) {
   return (
     <button
       type={type ?? "button"}
       onClick={onClick}
       disabled={disabled}
-      className="shrink-0 whitespace-nowrap rounded-lg bg-[var(--navy)] px-5 py-2.5 font-semibold text-white disabled:opacity-50"
+      className={`shrink-0 whitespace-nowrap rounded-lg bg-[var(--navy)] px-5 py-2.5 font-semibold text-white disabled:opacity-50 ${className ?? ""}`}
       style={{ backgroundColor: "#0a2a5e" }}
     >
       {children}
@@ -925,7 +927,7 @@ function PhoneInput({
           setCountry(e.target.value);
           emit(e.target.value, digits);
         }}
-        className="w-28 min-w-0 shrink-0 truncate rounded-l-lg border border-r-0 border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-[var(--text)] sm:w-40"
+        className="w-24 min-w-0 shrink-0 truncate rounded-l-lg border border-r-0 border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-[var(--text)] sm:w-28"
       >
         {PHONE_COUNTRIES.map((c) => (
           <option key={c} value={c}>
@@ -2165,7 +2167,7 @@ function ProfileForm({
 
   return (
     <form onSubmit={onSubmit} className="min-w-0 w-full space-y-4">
-      <div className="grid min-w-0 gap-4 [>&*]:min-w-0 sm:grid-cols-2">
+      <div className="grid min-w-0 grid-cols-1 gap-4 [&>*]:min-w-0 sm:grid-cols-2">
         <div>
           <FieldLabel htmlFor="pf-first-name">First name</FieldLabel>
           <input id="pf-first-name" {...FIELDS.createProfile.fullName} className={inputCls} value={draft.firstName}
@@ -2219,7 +2221,7 @@ function ProfileForm({
           <FieldLabel htmlFor="pf-pob">Place of birth</FieldLabel>
           <select id="pf-pob" className={inputCls} value={draft.placeOfBirth}
             onChange={(e) => set({ placeOfBirth: e.target.value })}>
-            <option value="">Choose the country you were born in</option>
+            <option value="">Choose your country</option>
             {draft.placeOfBirth && !COUNTRIES.includes(draft.placeOfBirth) ? (
               <option value={draft.placeOfBirth}>{draft.placeOfBirth}</option>
             ) : null}
@@ -2232,7 +2234,7 @@ function ProfileForm({
           <FieldLabel htmlFor="pf-nationality">Nationality</FieldLabel>
           <select id="pf-nationality" className={inputCls} value={draft.nationality}
             onChange={(e) => set({ nationality: e.target.value })}>
-            <option value="">Choose the country you are from</option>
+            <option value="">Choose your country</option>
             {draft.nationality && !COUNTRIES.includes(draft.nationality) ? (
               <option value={draft.nationality}>{draft.nationality}</option>
             ) : null}
@@ -2330,7 +2332,7 @@ function ProfileForm({
               <FieldLabel htmlFor="pf-street">Street (optional)</FieldLabel>
               <input id="pf-street" className={inputCls} value={draft.street}
                 onChange={(e) => set({ street: e.target.value })}
-                placeholder="Street name or street number, if you have one" />
+                placeholder="Street name or number" />
               <p className="mt-1 text-xs text-[var(--dim)]">
                 Street is good to add, but it is not required like county,
                 district, and community.
@@ -2439,7 +2441,7 @@ function ProfileForm({
           </div>
         ) : null}
         {draft.idChoice === "none" ? (
-          <div className="mt-3 grid min-w-0 gap-3 [>&*]:min-w-0 sm:grid-cols-2">
+          <div className="mt-3 grid min-w-0 grid-cols-1 gap-3 [&>*]:min-w-0 sm:grid-cols-2">
             <div>
               <FieldLabel htmlFor="pf-alt-type">Document you will use instead</FieldLabel>
               <select id="pf-alt-type" className={inputCls} value={draft.altIdType}
@@ -2487,7 +2489,7 @@ function ProfileForm({
             PortaGov stores it scrambled, never as plain words. Five wrong
             tries at sign-in lock the account for 15 minutes.
           </p>
-          <div className="mt-3 grid min-w-0 gap-3 [>&*]:min-w-0 sm:grid-cols-2">
+          <div className="mt-3 grid min-w-0 grid-cols-1 gap-3 [&>*]:min-w-0 sm:grid-cols-2">
             <div>
               <FieldLabel htmlFor="pf-pw">Password</FieldLabel>
               <input id="pf-pw" {...FIELDS.registerAccount.password} type="password" className={inputCls} value={password}
@@ -2539,18 +2541,22 @@ function ProfileForm({
               ["Home address", r.address || "Not given"],
               [
                 "Emergency contact",
-                `${r.emergencyName}, ${r.emergencyPhone}`,
+                [r.emergencyName, r.emergencyPhone]
+                  .filter(Boolean)
+                  .join(", ") || "Not given",
               ],
               [
                 "Identity",
                 r.hasNationalId
-                  ? `National ID: ${r.nationalId}`
+                  ? r.nationalId
+                    ? `National ID: ${r.nationalId}`
+                    : "Not given"
                   : r.altIdType
                     ? `${r.altIdType}${r.altIdNumber ? `: ${r.altIdNumber}` : ""}`
                     : "No national ID yet",
               ],
               ...(r.witnessName
-                ? ([["Witness", `${r.witnessName}, ${r.witnessPhone}`]] as [string, string][])
+                ? ([["Witness", [r.witnessName, r.witnessPhone].filter(Boolean).join(", ")]] as [string, string][])
                 : []),
               ["Language", r.language],
             ];
@@ -2780,7 +2786,7 @@ function SignInPage({
             </div>
           ) : mode === "choose" ? (
             <>
-            <div className="grid min-w-0 gap-4 [>&*]:min-w-0 sm:grid-cols-2">
+            <div className="grid min-w-0 grid-cols-1 gap-4 [&>*]:min-w-0 sm:grid-cols-2">
               <button
                 type="button"
                 onClick={() => setMode("new")}
@@ -7974,15 +7980,15 @@ export function App() {
     <div className="min-h-screen bg-[var(--bg)] pb-20 md:pb-0">
       <SafeAreaTopScrim backgroundColor="var(--surface)" />
       <header className="sticky top-0 z-40 border-b border-[var(--border)] bg-[var(--surface)] pt-safe">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-2">
+        <div className="mx-auto flex min-w-0 max-w-6xl items-center justify-between gap-2 px-3 py-2 sm:gap-3 sm:px-4">
           <a
             href="#/"
             aria-label="PortaGov home"
-            className="flex shrink-0 items-center gap-2.5"
+            className="flex min-w-0 shrink items-center gap-2 sm:gap-2.5"
           >
-            <img src={logoBadge} alt="" className="h-10 w-10 shrink-0" />
-            <span className="flex flex-col leading-none">
-              <span className="font-display text-[22px] font-bold lowercase tracking-tight text-[var(--text)]">
+            <img src={logoBadge} alt="" className="h-9 w-9 shrink-0 sm:h-10 sm:w-10" />
+            <span className="flex min-w-0 flex-col leading-none">
+              <span className="truncate font-display text-[20px] font-bold lowercase tracking-tight text-[var(--text)] sm:text-[22px]">
                 portagov
               </span>
               <span className="mt-1 hidden text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--warn)] sm:block">
@@ -8188,7 +8194,7 @@ export function App() {
                 ) : null}
               </div>
             ) : (
-              <PrimaryButton onClick={() => nav("#/signin")}>Sign in</PrimaryButton>
+              <PrimaryButton onClick={() => nav("#/signin")} className="px-3 py-2 sm:px-5 sm:py-2.5">Sign in</PrimaryButton>
             )}
           </div>
         </div>
