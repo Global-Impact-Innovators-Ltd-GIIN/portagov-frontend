@@ -2287,70 +2287,6 @@ function SignInPage({
           )}
         </div>
       </div>
-      <StaffEntry />
-    </div>
-  );
-}
-
-/* Staff and institution entry, shown only on the sign-in page. It is not
-   part of the citizen navigation: citizens never see portal links in the
-   header, bottom bar, or footer. No credentials are shown here, ever:
-   staff accounts are created in the platform portal, each with its own
-   password, and that is also how the portals are tested. */
-function StaffEntry() {
-  return (
-    <div className="mt-6 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">
-      <h2 className="font-display text-lg font-bold text-[var(--text)]">
-        Staff or institution officer?
-      </h2>
-      <p className="mt-1 text-sm text-[var(--dim)]">
-        This entry is only on the sign-in page, never in the citizen menus.
-        PortaGov staff sign in to the staff portal, where applications are
-        reviewed and released. Institution officers work in their own
-        institution portal, where released applications arrive.
-      </p>
-      <div className="mt-4 grid gap-4 sm:grid-cols-2">
-        <div className="rounded-xl border border-[var(--border)] p-4">
-          <p className="font-display font-bold text-[var(--text)]">
-            Test the platform side
-          </p>
-          <p className="mt-1 text-sm text-[var(--dim)]">
-            Open the platform portal and create a staff account with the
-            Platform admin role, choosing your own name, phone, and
-            password. Then sign in to the staff portal with them to see the
-            release queue, payments desk, and platform tools.
-          </p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <PrimaryButton onClick={() => nav("#/reports")}>
-              Open the platform portal
-            </PrimaryButton>
-            <GhostButton onClick={() => nav("#/staff")}>
-              Staff portal sign-in
-            </GhostButton>
-          </div>
-        </div>
-        <div className="rounded-xl border border-[var(--border)] p-4">
-          <p className="font-display font-bold text-[var(--text)]">
-            Test an institution portal
-          </p>
-          <p className="mt-1 text-sm text-[var(--dim)]">
-            Open the institution directory and choose an institution, for
-            example the Ministry of Foreign Affairs. Its inbox is where
-            applications land after PortaGov releases them, with the work
-            list, embassy space, and appointments for that institution.
-          </p>
-          <div className="mt-3">
-            <PrimaryButton onClick={() => nav("#/institution")}>
-              Open the institution directory
-            </PrimaryButton>
-          </div>
-        </div>
-      </div>
-      <p className="mt-4 text-sm text-[var(--dim)]">
-        Staff passwords are set when the account is created in the platform
-        portal and are never displayed anywhere. If you forget yours, a
-        platform admin creates a fresh account for you.
-      </p>
     </div>
   );
 }
@@ -2682,12 +2618,8 @@ function AccountPage({
           <YearlySummary profile={profile} />
           <MyTickets phone={profile.phone} />
           <p className="text-sm text-[var(--dim)]">
-            Working for a company or NGO? Open the{" "}
-            <a href="#/business" className="font-semibold underline">business portal</a>.
             Need a person? The <a href="#/help" className="font-semibold underline">help page</a>{" "}
-            reaches a real officer, and{" "}
-            <a href="#/queues" className="font-semibold underline">county queues</a>{" "}
-            show which service centre is quiet today.
+            reaches a real officer.
           </p>
         </div>
       </details>
@@ -12900,8 +12832,8 @@ function OnboardedPortalPage({ slug, profile }: { slug: string; profile: Profile
       <div className="mx-auto max-w-4xl px-4 py-10">
         <h1 className="font-display text-2xl font-bold text-[var(--text)]">Institution not found</h1>
         <p className="mt-2 text-[var(--dim)]">
-          This portal does not exist yet. Institutions join through the{" "}
-          <a href="#/onboarding" className="font-semibold underline">onboarding studio</a>.
+          This portal does not exist yet. Institutions join through
+          PortaGov onboarding.
         </p>
       </div>
     );
