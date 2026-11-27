@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type InputHTMLAttributes, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, bindQueryClient, type ApiResponse } from "./api";
+import { readStaffSession, STAFF_SESSION_KEY, type StaffSession as OfficerSession } from "./remote";
 import { actionFields } from "./fields";
 import { Actions } from "./actions";
 import {
@@ -88,6 +89,154 @@ const storage = {
     return [...found];
   },
 };
+
+/* Live updates, the standard now, not extra: every desk queue, the
+   citizen application page and the citizen messages view refetch on
+   this interval, so a release, a status change, a message or a
+   payment from the other side appears without a reload. React Query
+   pauses interval refetching while the page is hidden, and every
+   live query is disabled when its owner signs out, so polling stops
+   when nobody is watching. */
+const LIVE_POLL_MS = 10000;
+
+/* Officer session, shared by every desk: the institution desk, the
+   per-ministry portal, and the platform console all read the same
+   staff sign-in, so signing in once opens the desks that role may
+   use. The citizen sign-in is separate and untouched. */
+function useOfficerSession(): [
+  OfficerSession | null,
+  (s: OfficerSession | null) => void,
+  () => void,
+] {
+  const [session, setSessionState] = useState<OfficerSession | null>(() => readStaffSession());
+  const setSession = (s: OfficerSession | null) => {
+    setSessionState(s);
+    if (s) {
+      storage.set(STAFF_SESSION_KEY, JSON.stringify(s));
+      storage.set("portagov-officer", s.name);
+    } else {
+      storage.remove(STAFF_SESSION_KEY);
+      storage.remove("portagov-officer");
+    }
+  };
+  const signOut = () => {
+    void (api as any).staffSignOut({}).catch(() => undefined);
+    setSession(null);
+  };
+  return [session, setSession, signOut];
+}
+
+/* Officer sign-in form, used by the institution gate, the
+   per-ministry portal gate, and the platform console prompt. One
+   step (phone and password) unless the backend asks for a code, in
+   which case the code step follows, like the staff portal. A citizen
+   account is refused here, with a plain explanation. */
+function StaffSignInForm({ onSignedIn }: { onSignedIn: (s: OfficerSession) => void }) {
+  const [phone, setPhone] = useState("");
+  const [password, setPassword] = useState("");
+  const [step, setStep] = useState<"password" | "code">("password");
+  const [code, setCode] = useState("");
+  const [demoCode, setDemoCode] = useState("");
+  const [error, setError] = useState("");
+  const signIn = useMutation({
+    mutationFn: async () => await (api as any).staffSignIn({ phone: phone.trim(), password }),
+    onSuccess: (r: any) => {
+      if (!r.ok && !r.need_code) {
+        setError(r.error || "Sign-in failed. Check the phone number and password.");
+        return;
+      }
+      if (r.need_code) {
+        setDemoCode(r.demo_code || "");
+        setCode("");
+        setStep("code");
+        return;
+      }
+      if (r.staff) onSignedIn(r.staff);
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "Sign-in failed. Try again."),
+  });
+  const verifyCode = useMutation({
+    mutationFn: async () => await (api as any).staffVerifyCode({ phone: phone.trim(), code: code.trim() }),
+    onSuccess: (r: any) => {
+      if (!r.ok) {
+        setError(r.error || "That code is not correct, or it has expired.");
+        return;
+      }
+      if (r.staff) onSignedIn(r.staff);
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "That code could not be checked. Try again."),
+  });
+  return (
+    <div className="max-w-xl rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
+      <h2 className="font-display text-xl font-bold text-[var(--text)]">
+        {step === "code" ? "Step 2: enter your code" : "Officer sign-in"}
+      </h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        {step === "code"
+          ? "We sent a 6 number code to your officer phone. In this build the code is shown here: "
+          : "Sign in with the phone number and password the platform gave your institution. Citizen accounts cannot open this desk."}
+        {step === "code" && demoCode ? <strong className="text-[var(--text)]">{demoCode}</strong> : null}
+      </p>
+      {step === "code" ? (
+        <div className="mt-4 space-y-3">
+          <div>
+            <FieldLabel htmlFor="officer-code">Officer sign-in code</FieldLabel>
+            <input id="officer-code" className={inputCls} value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="6 numbers" inputMode="numeric" />
+          </div>
+          {error ? (
+            <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+              {error}
+            </p>
+          ) : null}
+          <div className="flex flex-wrap gap-3">
+            <PrimaryButton
+              onClick={() => {
+                setError("");
+                verifyCode.mutate();
+              }}
+              disabled={verifyCode.isPending}
+            >
+              Finish sign-in
+            </PrimaryButton>
+            <GhostButton onClick={() => { setStep("password"); setError(""); }}>
+              Back
+            </GhostButton>
+          </div>
+        </div>
+      ) : (
+        <form
+          className="mt-4 space-y-3"
+          onSubmit={(e: FormEvent) => {
+            e.preventDefault();
+            setError("");
+            signIn.mutate();
+          }}
+        >
+          <div>
+            <FieldLabel htmlFor="officer-phone">Your phone number (required)</FieldLabel>
+            <input id="officer-phone" className={inputCls} value={phone}
+              onChange={(e) => setPhone(e.target.value)} autoComplete="tel" />
+          </div>
+          <div>
+            <FieldLabel htmlFor="officer-password">Your password (required)</FieldLabel>
+            <input id="officer-password" type="password" className={inputCls} value={password}
+              onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+          </div>
+          {error ? (
+            <p role="alert" className="rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+              {error}
+            </p>
+          ) : null}
+          <PrimaryButton type="submit" disabled={signIn.isPending}>
+            {signIn.isPending ? "Signing in..." : "Continue"}
+          </PrimaryButton>
+        </form>
+      )}
+    </div>
+  );
+}
 
 type ProfileT = NonNullable<
   ApiResponse<typeof api, "findProfileByPhone">["profile"]
@@ -4603,6 +4752,7 @@ function ApplicationDetailPage({
   const apps = useQuery({
     queryKey: ["applications", profile.id],
     queryFn: () => api.listApplications({ profileId: profile.id }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const docs = useQuery({
     queryKey: ["documents", profile.id],
@@ -4611,6 +4761,7 @@ function ApplicationDetailPage({
   const payments = useQuery({
     queryKey: ["payments"],
     queryFn: () => api.listPayments({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const app = apps.data?.applications.find((a: ApplicationT) => a.id === id);
 
@@ -4640,6 +4791,11 @@ function ApplicationDetailPage({
        both lists from the backend to confirm. */
     if (done) {
       const amount = Number(done.amount ?? 0);
+      /* Platform first: payment does NOT release the application.
+         Only the amount paid and the billing status are set here, at
+         once. Whether the application is released is the platform's
+         decision, and the refetch right below shows the true live
+         state (held, or released when automatic release is on). */
       queryClient.setQueryData(
         ["applications", profile.id],
         (old: any) =>
@@ -4652,8 +4808,6 @@ function ApplicationDetailPage({
                         ...a,
                         amount_paid: Math.max(Number(a.amount_paid ?? 0), amount),
                         billing_status: "Paid",
-                        released: true,
-                        status_note: "Paid and released to the institution.",
                       }
                     : a,
                 ),
@@ -6867,6 +7021,7 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
   const siblings = useQuery({
     queryKey: ["institution-apps"],
     queryFn: () => api.listInstitutionApplications({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const duplicate = flag("duplicate_warning")
     ? (siblings.data?.applications ?? []).find(
@@ -6899,6 +7054,7 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
       setSaved(true);
       void queryClient.invalidateQueries({ queryKey: ["institution-apps"] });
       void queryClient.invalidateQueries({ queryKey: ["all-apps"] });
+      void queryClient.invalidateQueries({ queryKey: ["applications"] });
     },
   });
   const details = parseDetails(app.details);
@@ -6963,12 +7119,51 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
 }
 
 function InstitutionPage() {
-  const [ministry, setMinistry] = useState("All institutions");
+  /* Sign-in gate: no application, name, reference or message renders
+     before an officer signs in, exactly like the staff portal. The
+     queue query is disabled until then, so nothing is even fetched. */
+  const [session, setSession, signOut] = useOfficerSession();
+  const [ministry, setMinistry] = useState(() =>
+    session?.institution && MINISTRIES.some((m) => m.name === session.institution)
+      ? session.institution
+      : "All institutions",
+  );
   const [search, setSearch] = useState("");
   const apps = useQuery({
     queryKey: ["institution-apps"],
     queryFn: () => api.listInstitutionApplications({ limit: 100 }),
+    enabled: !!session,
+    refetchInterval: LIVE_POLL_MS,
   });
+  const authFailed =
+    !!apps.error &&
+    ((apps.error as any)?.status === 401 || (apps.error as any)?.status === 403);
+  if (!session || authFailed) {
+    return (
+      <div className="mx-auto max-w-5xl px-4 py-8">
+        <p className="text-sm font-bold uppercase tracking-widest" style={{ color: "#92580a" }}>
+          Institution portal
+        </p>
+        <h1 className="mt-1 font-display text-3xl font-extrabold text-[var(--text)]">
+          Institution desk
+        </h1>
+        <p className="mt-2 max-w-3xl text-[var(--dim)]">
+          This desk is for officers of ministries and agencies. Sign in
+          with the officer account the platform gave your institution.
+          Nothing on this desk, no application, name, reference or
+          message, is shown before sign-in.
+        </p>
+        {authFailed ? (
+          <p role="alert" className="mt-4 max-w-xl rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+            Your officer sign-in expired. Sign in again to see the desk.
+          </p>
+        ) : null}
+        <div className="mt-5">
+          <StaffSignInForm onSignedIn={setSession} />
+        </div>
+      </div>
+    );
+  }
   const all = apps.data?.applications ?? [];
   const filtered = all.filter(
     (a: ApplicationT) =>
@@ -6992,6 +7187,20 @@ function InstitutionPage() {
         here, by design: PortaGov is the intermediary, and release is its
         decision.
       </p>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl p-4 text-white" style={{ backgroundColor: "#0a2a5e" }}>
+        <p className="text-sm">
+          Signed in as <strong>{session.name}</strong>, {session.role}
+          {session.institution ? `, ${session.institution}` : ""}. The queue
+          below is live: new releases appear here without a reload.
+        </p>
+        <button
+          type="button"
+          className="rounded-lg border border-white/50 px-4 py-2 text-sm font-semibold"
+          onClick={signOut}
+        >
+          Sign out
+        </button>
+      </div>
       <details className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)]">
         <summary className="cursor-pointer p-4 font-display font-bold text-[var(--text)]">
           Embassy space: diaspora applications and embassy updates
@@ -7066,6 +7275,7 @@ function PlatformRow({ app }: { app: ApplicationT }) {
     void queryClient.invalidateQueries({ queryKey: ["all-apps"] });
     void queryClient.invalidateQueries({ queryKey: ["institution-apps"] });
     void queryClient.invalidateQueries({ queryKey: ["report"] });
+    void queryClient.invalidateQueries({ queryKey: ["applications"] });
   };
   const release = useMutation({
     mutationFn: async () => await api.releaseApplication({ id: app.id, statusNote: note }),
@@ -7149,27 +7359,39 @@ function PlatformRow({ app }: { app: ApplicationT }) {
 
 function PlatformPage() {
   const queryClient = useQueryClient();
+  /* The platform console shares the officer session: signing in on
+     the institution desk signs the console in too, and signing in
+     here signs the desk in. Without a session the console still
+     shows, from the local demo data, and says so plainly. */
+  const [session, setSession, signOut] = useOfficerSession();
   const mode = useQuery({
     queryKey: ["release-mode"],
     queryFn: () => api.getReleaseMode({}),
+    refetchInterval: LIVE_POLL_MS,
   });
   const report = useQuery({
     queryKey: ["report"],
     queryFn: () => api.getReport({}),
+    refetchInterval: LIVE_POLL_MS,
   });
   const apps = useQuery({
     queryKey: ["all-apps"],
     queryFn: () => api.listAllApplications({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const payments = useQuery({
     queryKey: ["payments"],
     queryFn: () => api.listPayments({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const setMode = useMutation({
     mutationFn: async (m: "automatic" | "manual") =>
       await api.setReleaseMode({ mode: m }),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ["release-mode"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["release-mode"] });
+      void queryClient.invalidateQueries({ queryKey: ["all-apps"] });
+      void queryClient.invalidateQueries({ queryKey: ["institution-apps"] });
+    },
   });
   const [copied, setCopied] = useState(false);
 
@@ -7239,6 +7461,40 @@ function PlatformPage() {
         />
       </section>
       <div className="mx-auto max-w-5xl px-4 py-8">
+      {!session ? (
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+          <h2 className="font-display text-lg font-bold text-[var(--text)]">
+            Sign in to manage live releases
+          </h2>
+          <p className="mt-1 text-sm text-[var(--dim)]">
+            This console is the first desk in the flow: applications land
+            here, held, and only go to a ministry when this console
+            releases them. Without an officer or administrator sign-in
+            it shows the local demo data below. Sign in to see the live
+            queue and to release, recall, and switch the release mode
+            on the real platform.
+          </p>
+          <div className="mt-4">
+            <StaffSignInForm onSignedIn={setSession} />
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl p-4 text-white" style={{ backgroundColor: "#0a2a5e" }}>
+          <p className="text-sm">
+            Signed in as <strong>{session.name}</strong>, {session.role}
+            {session.institution ? `, ${session.institution}` : ""}. The
+            queues below are live: new applications appear here held,
+            without a reload.
+          </p>
+          <button
+            type="button"
+            className="rounded-lg border border-white/50 px-4 py-2 text-sm font-semibold"
+            onClick={signOut}
+          >
+            Sign out
+          </button>
+        </div>
+      )}
       <div>
         <DailySummaryPanel />
       </div>
@@ -8532,6 +8788,7 @@ function MessagesFeed({
   const msgs = useQuery({
     queryKey: ["messages", profileId],
     queryFn: () => api.listMessages({ profileId }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const all = msgs.data?.messages ?? [];
   const list = applicationId
@@ -8580,6 +8837,7 @@ function TimelineWithDates({
   const events = useQuery({
     queryKey: ["events", applicationId],
     queryFn: () => api.listStatusEvents({ applicationId }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const evs = events.data?.events ?? [];
   const dateFor = (step: string) => {
@@ -8663,6 +8921,7 @@ function ApplicationActivity({ app }: { app: ApplicationT }) {
   const activity = useQuery({
     queryKey: ["application-activity", app.id],
     queryFn: () => api.listApplicationActivity({ applicationId: app.id }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const entries = activity.data?.entries ?? [];
   return (
@@ -9199,9 +9458,17 @@ function ThreadPanel({
   profile: ProfileT;
 }) {
   const queryClient = useQueryClient();
+  /* Live thread with the institution, from the backend: the officer's
+     reply and the next step appear here without a reload. */
   const msgs = useQuery({
-    queryKey: ["messages", profile.id],
-    queryFn: () => api.listMessages({ profileId: profile.id }),
+    queryKey: ["app-messages", app.id],
+    queryFn: () =>
+      (api as any).listApplicationMessages({
+        applicationId: app.id,
+        profileId: profile.id,
+        institution: app.institution,
+      }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const [body, setBody] = useState("");
   const [error, setError] = useState("");
@@ -9215,6 +9482,7 @@ function ThreadPanel({
     onSuccess: () => {
       setBody("");
       void queryClient.invalidateQueries({ queryKey: ["messages"] });
+      void queryClient.invalidateQueries({ queryKey: ["app-messages", app.id] });
     },
     onError: (e) =>
       setError(e instanceof Error ? e.message : "Message could not be sent."),
@@ -9225,7 +9493,7 @@ function ThreadPanel({
         m.application_id === app.id &&
         (m.kind.startsWith("Direct from") || m.kind.startsWith("Citizen to")),
     )
-    .reverse();
+    .sort((a: MessageT, b: MessageT) => String(a.created_at).localeCompare(String(b.created_at)));
   if (!app.released) return null;
   return (
     <div className="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
@@ -13294,10 +13562,12 @@ function InboxPanel({ profile }: { profile: ProfileT }) {
   const msgs = useQuery({
     queryKey: ["messages", profile.id],
     queryFn: () => api.listMessages({ profileId: profile.id }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const apps = useQuery({
     queryKey: ["applications", profile.id],
     queryFn: () => api.listApplications({ profileId: profile.id }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const all = msgs.data?.messages ?? [];
   const byApp = new Map<number, MessageT[]>();
@@ -14111,6 +14381,7 @@ function OfficerWorkList({ institution }: { institution: string }) {
   const apps = useQuery({
     queryKey: ["institution-apps"],
     queryFn: () => api.listInstitutionApplications({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const appts = useQuery({
     queryKey: ["inst-appointments", institution],
@@ -14119,10 +14390,12 @@ function OfficerWorkList({ institution }: { institution: string }) {
   const staff = useQuery({
     queryKey: ["staff", institution],
     queryFn: () => api.listStaff({ institution }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const audit = useQuery({
     queryKey: ["audit-log", institution],
     queryFn: () => api.listAuditLog({ institution, limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const today = new Date().toISOString().slice(0, 10);
   const mine = (apps.data?.applications ?? []).filter(
@@ -14760,6 +15033,7 @@ function ReadyQueue({ institution }: { institution?: string }) {
   const apps = useQuery({
     queryKey: ["institution-apps"],
     queryFn: () => api.listInstitutionApplications({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
   const ready = (apps.data?.applications ?? []).filter(
     (a: ApplicationT) =>
@@ -15651,21 +15925,30 @@ function InstitutionServicesEditor({ institution }: { institution: string }) {
 
 function InstitutionPortalPage({ ministryId, profile }: { ministryId: string; profile: ProfileT | null }) {
   const ministry = MINISTRIES.find((m) => m.id === ministryId);
+  /* Same sign-in gate as the combined desk: this portal shows
+     released applications, names and references, so it opens only to
+     a signed-in officer. */
+  const [session, setSession, signOut] = useOfficerSession();
   const [tab, setTab] = useState<"inbox" | "embassy" | "appointments" | "payments" | "services" | "officers" | "announcements" | "reports">("inbox");
   const apps = useQuery({
     queryKey: ["institution-apps"],
     queryFn: () => api.listInstitutionApplications({ limit: 100 }),
+    enabled: !!session,
+    refetchInterval: LIVE_POLL_MS,
   });
   const appts = useQuery({
     queryKey: ["inst-appointments", ministry?.name ?? ""],
     queryFn: () => api.listInstitutionAppointments({ institution: ministry?.name ?? "" }),
-    enabled: !!ministry,
+    enabled: !!ministry && !!session,
   });
   const pays = useQuery({
     queryKey: ["inst-payments", ministry?.name ?? ""],
     queryFn: () => api.listInstitutionPayments({ institution: ministry?.name ?? "" }),
-    enabled: !!ministry,
+    enabled: !!ministry && !!session,
   });
+  const authFailed =
+    !!apps.error &&
+    ((apps.error as any)?.status === 401 || (apps.error as any)?.status === 403);
   if (!ministry) {
     return <OnboardedPortalPage slug={ministryId} profile={profile} />;
   }
@@ -15706,7 +15989,37 @@ function InstitutionPortalPage({ ministryId, profile }: { ministryId: string; pr
         </div>
         <div style={{ backgroundColor: "#d9a821" }} className="h-1.5" />
       </section>
+      {!session || authFailed ? (
+        <div className="mx-auto max-w-6xl px-4 py-6">
+          <p className="mt-2 max-w-3xl text-sm text-[var(--dim)]">
+            This portal is for officers of {ministry.name}. Sign in with the
+            officer account the platform gave your institution. No
+            application, name, reference or message is shown before sign-in.
+          </p>
+          {authFailed ? (
+            <p role="alert" className="mt-4 max-w-xl rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+              Your officer sign-in expired. Sign in again to see the portal.
+            </p>
+          ) : null}
+          <div className="mt-5">
+            <StaffSignInForm onSignedIn={setSession} />
+          </div>
+        </div>
+      ) : (
       <div className="mx-auto max-w-6xl px-4 py-6">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl p-3 text-sm text-white" style={{ backgroundColor: "#0a2a5e" }}>
+          <p>
+            Signed in as <strong>{session.name}</strong>, {session.role}. You
+            only see applications PortaGov has released to {ministry.name}.
+          </p>
+          <button
+            type="button"
+            className="rounded-lg border border-white/50 px-3 py-1.5 text-sm font-semibold"
+            onClick={signOut}
+          >
+            Sign out
+          </button>
+        </div>
         <nav aria-label={`${ministry.name} portal`} className="flex gap-1 overflow-x-auto pb-2">
           {tabs.map(([key, label]) => (
             <button key={key} type="button" onClick={() => setTab(key)}
@@ -15842,6 +16155,7 @@ function InstitutionPortalPage({ ministryId, profile }: { ministryId: string; pr
           </div>
         ) : null}
       </div>
+      )}
     </div>
   );
 }
@@ -17424,6 +17738,7 @@ function StaffPortalPage() {
     queryKey: ["all-apps"],
     queryFn: () => api.listAllApplications({ limit: 100 }),
     enabled: !!session,
+    refetchInterval: LIVE_POLL_MS,
   });
   const held = (apps.data?.applications ?? []).filter((a: ApplicationT) => !a.released);
   const role = session?.role ?? "";
@@ -18473,6 +18788,66 @@ function InstitutionDirectoryPage() {
   );
 }
 
+/* Live message thread on the institution desk: the officer sees the
+   citizen's replies the moment they arrive, without a reload. The
+   thread only fetches while it is open, so a long queue does not
+   poll one thread per row. */
+function OfficerThread({ app }: { app: ApplicationT }) {
+  const [open, setOpen] = useState(false);
+  const thread = useQuery({
+    queryKey: ["app-messages", app.id],
+    queryFn: () =>
+      (api as any).listApplicationMessages({
+        applicationId: app.id,
+        institution: app.institution,
+      }),
+    enabled: open,
+    refetchInterval: LIVE_POLL_MS,
+  });
+  const messages = [...(thread.data?.messages ?? [])]
+    .filter((m: MessageT) => m.application_id === app.id)
+    .sort((a: MessageT, b: MessageT) => String(a.created_at).localeCompare(String(b.created_at)));
+  return (
+    <div>
+      <GhostButton onClick={() => setOpen(!open)}>
+        {open ? "Hide the message thread" : "Message thread with the citizen"}
+      </GhostButton>
+      {open ? (
+        <div className="mt-2 space-y-2">
+          {thread.isPending ? (
+            <p className="text-sm text-[var(--dim)]">Loading the thread...</p>
+          ) : messages.length > 0 ? (
+            messages.map((m: MessageT) => (
+              <div
+                key={m.id}
+                className={
+                  m.kind.startsWith("Citizen to")
+                    ? "ml-8 rounded-lg p-3 text-sm text-white"
+                    : "mr-8 rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]"
+                }
+                style={
+                  m.kind.startsWith("Citizen to")
+                    ? { backgroundColor: "#0a2a5e" }
+                    : undefined
+                }
+              >
+                <p className="text-xs font-bold uppercase tracking-wide opacity-70">
+                  {m.kind}, {fmtDateTime(m.created_at)}
+                </p>
+                <p className="mt-1">{m.body}</p>
+              </div>
+            ))
+          ) : (
+            <p className="text-sm text-[var(--dim)]">
+              No messages yet on this application. When the citizen writes, it shows here.
+            </p>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function InstitutionRowExtras({ app }: { app: ApplicationT }) {
   const queryClient = useQueryClient();
   const officerName =
@@ -18486,6 +18861,7 @@ function InstitutionRowExtras({ app }: { app: ApplicationT }) {
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ["institution-apps"] });
     void queryClient.invalidateQueries({ queryKey: ["all-apps"] });
+    void queryClient.invalidateQueries({ queryKey: ["applications"] });
   };
   const confirm = useMutation({
     mutationFn: async () => await api.confirmReceipt({ id: app.id, officerName }),
@@ -18510,6 +18886,8 @@ function InstitutionRowExtras({ app }: { app: ApplicationT }) {
     onSuccess: () => {
       setDone("Message sent directly to the citizen, by email and SMS, under this tracking number.");
       setDirectMsg("");
+      void queryClient.invalidateQueries({ queryKey: ["app-messages", app.id] });
+      void queryClient.invalidateQueries({ queryKey: ["messages"] });
     },
   });
   return (
@@ -18571,6 +18949,7 @@ function InstitutionRowExtras({ app }: { app: ApplicationT }) {
           >
             Send the missing list with deadline
           </GhostButton>
+          <OfficerThread app={app} />
           <DocumentVerification app={app} />
           <VideoCallPanel app={app} asInstitution />
         </div>

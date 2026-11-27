@@ -7040,7 +7040,12 @@ ${args.text}`,
         .select()
         .from(schema.applications)
         .where(eq(schema.applications.institution, args.institution));
-      const byId = new Map(apps.map((a) => [a.id, a]));
+      /* Platform first: an institution only ever sees applications
+         PortaGov has released to it. An appointment booked on an
+         application the platform is still holding must not leak the
+         applicant to the institution through the calendar, so only
+         released applications are in the map at all. */
+      const byId = new Map(apps.filter((a) => a.released).map((a) => [a.id, a]));
       const rows = await db.select().from(schema.appointments);
       return {
         appointments: rows
@@ -7083,7 +7088,11 @@ ${args.text}`,
         .select()
         .from(schema.applications)
         .where(eq(schema.applications.institution, args.institution));
-      const byId = new Map(apps.map((a) => [a.id, a]));
+      /* Platform first, same rule as the appointment calendar: payment
+         happens BEFORE release, so a payment on a held application
+         must not leak the applicant to the institution. Only released
+         applications are in the map at all. */
+      const byId = new Map(apps.filter((a) => a.released).map((a) => [a.id, a]));
       const rows = await db
         .select()
         .from(schema.payments)

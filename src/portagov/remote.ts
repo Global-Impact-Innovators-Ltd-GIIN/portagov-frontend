@@ -24,9 +24,28 @@
 //   kept in the cached profile on this device and sent to the backend
 //   only where it has a field for them. The wallet stays device-local;
 //   picked wallet documents are uploaded to the backend at submit time.
-// - Everything not listed in `remote` below still runs against the local
-//   actions, including staff / institution / platform desks, family,
-//   business, help desk and the assistant. Those are not yet wired.
+// - The staff, institution and platform desks are wired here too:
+//   the institution queue from GET /api/staff/applications, status
+//   changes through POST /api/staff/applications/<id>/action, direct
+//   messages through /api/applications/<id>/messages, and platform
+//   release/recall through /api/admin/applications/<id>/release and
+//   /recall, with the release mode read from the admin settings.
+//   Desk calls use a SEPARATE staff token (portagov-staff-token-v1),
+//   never the citizen token: a citizen token is refused for staff
+//   routes, and signing in as an officer never signs the citizen out.
+//   Everything else still runs against the local actions, including
+//   family, business, help desk and the assistant. Those are not yet
+//   wired.
+//
+// Fallback rule for the desks, stated once so every function below
+// follows it: the backend is always tried first, and the local store
+// is used ONLY when the backend call fails. A 401 or 403 (not signed
+// in as an officer, or the session expired) is never papered over
+// with local data: it surfaces, so the desk asks the officer to sign
+// in again instead of showing stale local rows as if they were live.
+// A network failure or a 5xx, or a 404 for an endpoint the backend
+// has not deployed yet (the release endpoints are still landing),
+// falls back to the local action, and the code says so where it does.
 
 import { Actions } from "./actions";
 
@@ -248,7 +267,19 @@ export const SERVICE_CODE_MAP: Record<string, string> = {
 const CODE_TO_FRONTEND: Record<string, string> = {};
 for (const [k, v] of Object.entries(SERVICE_CODE_MAP)) CODE_TO_FRONTEND[v] = k;
 
-const STATUS_MAP: Record<string, string> = {
+/* ---------- shared backend status mapping (one helper, every desk) ----------
+   Backend status -> the frontend words the citizen sees. This is the
+   ONLY place that translation lives: the citizen flow, the institution
+   queue, the platform queue and the daily summary all go through it,
+   so no desk invents its own wording.
+   Platform first: a submitted application the platform is still
+   holding is NOT released, and the citizen sees it as held, never as
+   sent to the institution. The backend release gate adds a held /
+   awaiting-release state; whichever form it returns, the citizen sees
+   "Under review by PortaGov" (or "Awaiting release" when the backend
+   says so explicitly), and the institution never sees the row at all:
+   the institution queue filters released rows only. */
+export const BACKEND_STATUS_MAP: Record<string, string> = {
   draft: "Under review by PortaGov",
   submitted: "Released to institution",
   in_review: "In review at institution",
@@ -258,10 +289,22 @@ const STATUS_MAP: Record<string, string> = {
   ready_for_collection: "Ready for collection",
   completed: "Completed",
   rejected: "Rejected",
+  held: "Under review by PortaGov",
+  awaiting_release: "Awaiting release",
+  pending_release: "Under review by PortaGov",
+  under_review: "Under review by PortaGov",
 };
 
+export function mapBackendStatus(raw: string, released?: boolean): string {
+  const s = String(raw || "").toLowerCase();
+  // Submitted but held by the platform: the citizen sees the held
+  // state, not "Released to institution".
+  if (s === "submitted" && released === false) return "Under review by PortaGov";
+  return BACKEND_STATUS_MAP[s] ?? String(raw || "");
+}
+
 function mapStatus(s: string): string {
-  return STATUS_MAP[s] || s;
+  return mapBackendStatus(s);
 }
 
 const serviceCache = new Map<string, any>();
@@ -362,7 +405,20 @@ function toFrontendApplication(b: any, extra?: any): any {
     Object.entries(b.data || {}).map(([k, v]) => ({ label: k, value: String(v ?? "") })),
   );
   const docIds = saved.document_ids || "[]";
-  const status = mapStatus(b.status);
+  /* Platform first: the backend release gate decides `released`. A
+     submitted application the platform is still holding is NOT
+     released, whatever its status string says, and the citizen sees
+     the held state (see mapBackendStatus). Only fall back to the old
+     status-based rule when the backend sends no flag at all. */
+  const heldState = ["held", "awaiting_release", "pending_release", "under_review"].includes(
+    String(b.status || "").toLowerCase(),
+  );
+  const released = b.released ?? (b.status !== "draft" && !heldState);
+  const status = mapBackendStatus(b.status, released);
+  const heldNote =
+    !released && (b.status === "submitted" || heldState)
+      ? "Paid and received by PortaGov. The platform is reviewing it and will release it to the institution."
+      : "";
   const fee = Number(b.fee_usd ?? saved.service_fee ?? 0);
   const priorityFee = Number(saved.priority_fee || 0);
   const deliveryFee = Number(saved.delivery_fee || 0);
@@ -375,7 +431,7 @@ function toFrontendApplication(b: any, extra?: any): any {
     service_name: b.service?.name || saved.service_name || "",
     institution: b.service?.institution?.name || saved.institution || "",
     status,
-    released: b.status !== "draft",
+    released,
     on_behalf_of: saved.on_behalf_of || "",
     priority: saved.priority || "Standard",
     priority_fee: priorityFee,
@@ -400,6 +456,7 @@ function toFrontendApplication(b: any, extra?: any): any {
     details,
     document_ids: docIds,
     status_note:
+      heldNote ||
       saved.status_note ||
       (b.paid
         ? "Paid and released to the institution."
@@ -431,6 +488,297 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
     reader.onerror = () => reject(new Error("Could not read the document."));
     reader.readAsDataURL(blob);
   });
+}
+
+/* ---------- staff / officer sessions: a separate token, never the citizen one ----------
+   Desk sign-in uses POST /api/auth/login, then a role check: only
+   officer, inst_admin or admin may work a desk. A citizen token is
+   refused for staff routes, and signing in as an officer never signs
+   the citizen out of this browser, because the two tokens live under
+   different keys. */
+export const STAFF_TOKEN_KEY = "portagov-staff-token-v1";
+export const STAFF_SESSION_KEY = "portagov-staff-session-v1";
+export const STAFF_ROLES = ["officer", "inst_admin", "admin"] as const;
+
+export type StaffSession = {
+  id: number;
+  name: string;
+  role: string;
+  institution: string;
+  phone: string;
+};
+
+function getStaffToken(): string {
+  return storeGet(STAFF_TOKEN_KEY) || "";
+}
+
+function setStaffToken(token: string): void {
+  if (token) storeSet(STAFF_TOKEN_KEY, token);
+  else storeRemove(STAFF_TOKEN_KEY);
+}
+
+export function readStaffSession(): StaffSession | null {
+  try {
+    const raw = storeGet(STAFF_SESSION_KEY);
+    return raw ? (JSON.parse(raw) as StaffSession) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveStaffSession(s: StaffSession | null): void {
+  if (s) storeSet(STAFF_SESSION_KEY, JSON.stringify(s));
+  else storeRemove(STAFF_SESSION_KEY);
+}
+
+function clearStaffAuth(): void {
+  setStaffToken("");
+  saveStaffSession(null);
+  storeRemove("portagov-officer");
+}
+
+function sessionFromUser(u: any): StaffSession {
+  return {
+    id: Number(u.id ?? 0),
+    name: String(u.full_name || u.name || ""),
+    role: String(u.role || ""),
+    institution: String(u.institution?.name || u.institution || u.institution_name || ""),
+    phone: String(u.phone || ""),
+  };
+}
+
+/** Finish a staff login once the backend has returned a token: read
+    the role (from the login reply, or from /api/auth/me with the new
+    staff token), refuse anything that is not an officer, inst_admin
+    or admin, and store the session. A citizen account is refused
+    here, before any desk data is fetched. */
+async function finishStaffLogin(res: any, phone: string): Promise<any> {
+  if (!res?.token) return { ok: false, error: "Sign-in did not return a session. Try again." };
+  setStaffToken(res.token);
+  let user = res.user || null;
+  if (!user?.role) {
+    try {
+      user = await staffApiCall("/api/auth/me", {});
+    } catch {
+      user = null;
+    }
+  }
+  const role = String(user?.role || "");
+  if (!(STAFF_ROLES as readonly string[]).includes(role)) {
+    clearStaffAuth();
+    return {
+      ok: false,
+      error: "That account is a citizen account, not an officer account. Officers sign in here with the phone and password the platform gave them.",
+    };
+  }
+  const staff = sessionFromUser({ ...(user || {}), phone: user?.phone || phone });
+  saveStaffSession(staff);
+  storeSet("portagov-officer", staff.name);
+  return { ok: true, staff };
+}
+
+/** Same as apiCall, but with the staff token. A 401 clears the staff
+    auth and throws: the session is expired, and the desk must ask the
+    officer to sign in again, never paper over it with local data. A
+    403 is different: the token is valid but the role may not use that
+    endpoint (for example an officer asking for the admin list), so it
+    throws without signing the officer out. */
+async function staffApiCall(path: string, opts: { method?: string; body?: any; form?: FormData } = {}): Promise<any> {
+  const headers: Record<string, string> = {};
+  const token = getStaffToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  let body: any = undefined;
+  if (opts.form) {
+    body = opts.form;
+  } else if (opts.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(opts.body);
+  }
+  const res = await fetch(`${apiBase()}${path}`, {
+    method: opts.method || "GET",
+    headers,
+    body,
+  });
+  const text = await res.text();
+  let data: any = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  if (!res.ok) {
+    if (res.status === 401) clearStaffAuth();
+    const msg = (data && (data.error || data.message)) || `Request failed (${res.status}). Try again.`;
+    const err = new Error(String(msg)) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+/** A 401/403 means "not an officer" and is never a reason to show
+    local data. Everything else (dropped connection, 5xx, an endpoint
+    the backend has not deployed yet) may fall back to the local
+    action, and the callers below say so where they do. */
+function isAuthError(e: any): boolean {
+  return e?.status === 401 || e?.status === 403;
+}
+
+/** Backend lists come back in more than one shape: a bare array, or
+    {applications: [...]}, or {data: [...]}. Accept all three. */
+function staffRows(res: any, key?: string): any[] {
+  if (Array.isArray(res)) return res;
+  if (res && Array.isArray(res[key || "applications"])) return res[key || "applications"];
+  if (res && Array.isArray(res.data)) return res.data;
+  if (res && Array.isArray(res.items)) return res.items;
+  return [];
+}
+
+/** Normalise one backend staff application into the frontend
+    ApplicationT shape, using the ONE shared status mapping. The
+    backend row may be the citizen shape (service/applicant objects)
+    or a flatter one; both are read. */
+function toStaffApplication(b: any): any {
+  const svc = b.service || {};
+  const applicant = b.applicant || {};
+  const heldState = ["held", "awaiting_release", "pending_release", "under_review"].includes(
+    String(b.status || "").toLowerCase(),
+  );
+  const released = b.released ?? (b.status !== "draft" && !heldState);
+  const status = mapBackendStatus(b.status, released);
+  const fee = Number(b.fee_usd ?? b.fee ?? 0);
+  const details = JSON.stringify(
+    Object.entries(b.data || {}).map(([k, v]) => ({ label: k, value: String(v ?? "") })),
+  );
+  return {
+    id: Number(b.id ?? 0),
+    reference: String(b.reference || ""),
+    profile_id: Number(applicant.id ?? b.profile_id ?? b.applicant_id ?? 0),
+    applicant_name: String(applicant.full_name || b.applicant_name || ""),
+    service_id: CODE_TO_FRONTEND[svc.code] || svc.code || String(b.service_id || b.service_code || ""),
+    service_name: String(svc.name || b.service_name || ""),
+    institution: String(svc.institution?.name || b.institution || b.institution_name || ""),
+    status,
+    released: Boolean(released),
+    on_behalf_of: String(b.beneficiary?.name || b.on_behalf_of || ""),
+    priority: String(b.priority || "Standard"),
+    priority_fee: 0,
+    service_fee: fee,
+    collection_choice: String(b.collection_choice || ""),
+    embassy: String(b.embassy || ""),
+    delivery_fee: 0,
+    billing_number: String(b.bill_id || b.billing_number || ""),
+    billing_status: b.paid ? "Paid" : "Unpaid",
+    amount_paid: b.paid ? fee : 0,
+    business_id: 0,
+    payment_plan: false,
+    total_due: fee,
+    pickup_code: String(b.pickup_code || ""),
+    proxy_name: "",
+    proxy_id: "",
+    proxy_code: "",
+    channel: String(b.channel || "Self service"),
+    diaspora_country: String(b.diaspora_country || ""),
+    agent_name: "",
+    notes: String(b.notes || ""),
+    details,
+    document_ids: "[]",
+    status_note: String(b.status_note || b.note || ""),
+    created_at: String(b.created_at || new Date().toISOString()),
+    updated_at: String(b.updated_at || b.created_at || new Date().toISOString()),
+  };
+}
+
+/** The institution queue: ONLY applications the platform has
+    released. A held row is never returned here, even if the backend
+    ever sends one: the institution never sees an application before
+    the platform releases it. */
+async function fetchStaffApplications(): Promise<any[]> {
+  const res = await staffApiCall("/api/staff/applications", {});
+  return staffRows(res).map(toStaffApplication).filter((a: any) => a.released);
+}
+
+/** The platform queue: every application, held and released. Tries
+    the admin list first, then the staff list (an officer token is
+    refused the admin list with 403, and the staff list is the right
+    live queue for that officer). */
+async function fetchAdminApplications(): Promise<any[]> {
+  try {
+    const res = await staffApiCall("/api/admin/applications", {});
+    return staffRows(res).map(toStaffApplication);
+  } catch (e: any) {
+    if (e?.status === 404 || e?.status === 403) {
+      const res = await staffApiCall("/api/staff/applications", {});
+      return staffRows(res).map(toStaffApplication);
+    }
+    throw e;
+  }
+}
+
+/** Normalise one backend thread message into the frontend MessageT
+    shape. The backend may call the text body, message or content,
+    and the sender may be a role, a name, or a user object. */
+function normalizeThreadMessage(m: any, applicationId: number, institution: string, index: number): any {
+  const sender = String(m.sender_role || m.role || m.sender?.role || m.sender || m.author || "");
+  const fromCitizen = /citizen|applicant|user/i.test(sender) && !/officer|institution|staff|admin|portagov/i.test(sender);
+  const numId = Number(m.id);
+  return {
+    id: Number.isFinite(numId) && numId > 0 ? numId : 1000000 + applicationId * 1000 + index,
+    application_id: applicationId,
+    channel: String(m.channel || "PortaGov"),
+    kind: fromCitizen ? `Citizen to ${institution}` : `Direct from ${institution}`,
+    body: String(m.body || m.message || m.content || ""),
+    created_at: String(m.created_at || m.createdAt || new Date().toISOString()),
+  };
+}
+
+async function fetchThreadMessages(applicationId: number, institution: string): Promise<any[]> {
+  const res = await staffApiCall(`/api/applications/${applicationId}/messages`, {});
+  const rows = staffRows(res, "messages");
+  return rows.map((m: any, i: number) => normalizeThreadMessage(m, applicationId, institution, i));
+}
+
+/** The release-mode setting lives on the admin side, and the exact
+    path is still landing with the backend release gate, so probe the
+    two candidate paths: /api/admin/release-mode first, then
+    /api/admin/settings. The first path that answers wins and is
+    remembered for the session, so the live poll does not probe twice
+    every 10 seconds. */
+let releaseModePath: string | null = null;
+
+async function readReleaseMode(): Promise<"automatic" | "manual" | null> {
+  const paths = releaseModePath ? [releaseModePath] : ["/api/admin/release-mode", "/api/admin/settings"];
+  for (const p of paths) {
+    try {
+      const res = await staffApiCall(p, {});
+      const mode = String(res?.mode || res?.release_mode || res?.value || "").toLowerCase();
+      if (mode === "automatic" || mode === "manual") {
+        releaseModePath = p;
+        return mode;
+      }
+      return null;
+    } catch (e: any) {
+      if (e?.status === 404) continue;
+      throw e;
+    }
+  }
+  return null;
+}
+
+async function writeReleaseMode(mode: "automatic" | "manual"): Promise<boolean> {
+  const paths = releaseModePath ? [releaseModePath] : ["/api/admin/release-mode", "/api/admin/settings"];
+  for (const p of paths) {
+    try {
+      const body = p.endsWith("/settings") ? { release_mode: mode } : { mode };
+      await staffApiCall(p, { method: "POST", body });
+      releaseModePath = p;
+      return true;
+    } catch (e: any) {
+      if (e?.status === 404) continue;
+      throw e;
+    }
+  }
+  return false;
 }
 
 /* ---------- remote overrides: same names and shapes as Actions ---------- */
@@ -1083,11 +1431,18 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     const after = await apiCall(`/api/applications/${args.applicationId}`, {});
     if (!after.paid) throw new Error("PortaGov could not confirm this payment. The money may still arrive; check the payment status before paying again.");
     if (saved) {
-      saved.status_note = "Paid and released to the institution.";
+      // Platform first: payment does NOT release the application.
+      // The platform reviews it and releases it to the institution,
+      // at once when automatic release is on. Clear the cached note
+      // so the next refetch shows the true live state (held or
+      // released) instead of a stale "released" claim.
+      delete saved.status_note;
       saveAppCache(cache);
     }
-    // Submit now that the fee is paid: this is the release to the
-    // institution in the backend flow.
+    // Submit now that the fee is paid: this hands the application to
+    // the PLATFORM, not to the institution. Release to the
+    // institution is the platform's decision, at once when automatic
+    // release is on, or by a person on the platform console.
     await apiCall(`/api/applications/${args.applicationId}/submit`, { method: "POST", body: {} });
     return {
       id: pending.id || 0,
@@ -1279,6 +1634,482 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       return { answer: "", route: "Help desk", needs_ticket: true };
     } catch {
       return (Actions as any).askAssistant(args);
+    }
+  },
+
+  /* ---------- staff, institution and platform desks (live backend) ----------
+     Platform first, the approved intermediary flow: citizen information
+     lands with the PLATFORM, the platform holds it and checks payment,
+     then the platform releases it to the ministry. The institution
+     never sees an application before release: the institution queue
+     (fetchStaffApplications) returns released rows only, and the two
+     local institution views that could leak a held row (appointments
+     and payments) now filter to released applications too.
+     Institution onboarding (template form, service studio, preview,
+     sandbox test, approval to go live) has NO backend endpoint in the
+     API list, so the studio and the approval flow stay on the local
+     store for now. What the backend does support is institution team
+     management, so the officer roster below (listStaff / addStaff) is
+     wired to /api/admin/officers. When the backend adds onboarding
+     endpoints, createInstitution / setInstitutionStatus /
+     listOnboardedInstitutions are the three functions to wire. */
+
+  async getStaffSession(_args: any) {
+    return { staff: readStaffSession() };
+  },
+
+  async staffSignIn(args: any) {
+    let res: any;
+    try {
+      res = await apiCall("/api/auth/login", {
+        method: "POST",
+        auth: false,
+        body: { phone: args.phone, password: args.password },
+      });
+    } catch (e: any) {
+      if (e?.status === 401) return { ok: false, error: "No officer account matches that phone and password." };
+      if (e?.status === 423) return { ok: false, error: "That account is locked for 15 minutes after too many wrong passwords." };
+      throw e;
+    }
+    if (res.two_factor) {
+      return { ok: false, need_code: true, demo_code: res.dev_otp || "", phone: args.phone };
+    }
+    return finishStaffLogin(res, args.phone);
+  },
+
+  async staffVerifyCode(args: any) {
+    let res: any;
+    try {
+      res = await apiCall("/api/auth/login/verify", {
+        method: "POST",
+        auth: false,
+        body: { phone: args.phone, otp: args.code },
+      });
+    } catch (e: any) {
+      if (e?.status === 401) return { ok: false, error: "That code is not correct, or it has expired. Sign in again for a fresh code." };
+      if (e?.status === 423) return { ok: false, error: "That account is locked for 15 minutes after too many wrong codes." };
+      throw e;
+    }
+    return finishStaffLogin(res, args.phone);
+  },
+
+  async staffSignOut(_args: any) {
+    try {
+      await staffApiCall("/api/auth/logout", { method: "POST", body: {} });
+    } catch {
+      // The token is cleared locally either way.
+    }
+    clearStaffAuth();
+    return { ok: true };
+  },
+
+  async listInstitutionApplications(args: any) {
+    if (!getStaffToken()) return (Actions as any).listInstitutionApplications(args);
+    try {
+      const applications = await fetchStaffApplications();
+      return { applications: applications.slice(0, args?.limit || 100) };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      // Backend unreachable: local desk only, and the local action
+      // itself only ever returns released applications.
+      return (Actions as any).listInstitutionApplications(args);
+    }
+  },
+
+  async listDiasporaApplications(args: any) {
+    if (!getStaffToken()) return (Actions as any).listDiasporaApplications(args);
+    try {
+      const apps = await fetchStaffApplications();
+      return { applications: apps.filter((a: any) => a.channel === "Diaspora").slice(0, args?.limit || 100) };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).listDiasporaApplications(args);
+    }
+  },
+
+  async listAllApplications(args: any) {
+    if (!getStaffToken()) return (Actions as any).listAllApplications(args);
+    try {
+      const applications = await fetchAdminApplications();
+      return { applications: applications.slice(0, args?.limit || 100) };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).listAllApplications(args);
+    }
+  },
+
+  async updateApplicationStatus(args: any) {
+    /* Frontend status word -> backend action. The desk picker speaks
+       frontend words; the backend speaks actions. "In review" and
+       "Received" both start the review: the backend moves a submitted
+       application to in_review, and an already in-review one stays
+       there. Ready / Completed / More information / Appointment map
+       straight onto ready / complete / request_info /
+       request_biometrics. */
+    const actionMap: Record<string, string> = {
+      "Received by institution": "start_review",
+      "In review at institution": "start_review",
+      "Appointment set": "request_biometrics",
+      "Ready for collection": "ready",
+      Completed: "complete",
+      "More information needed": "request_info",
+      "Released to institution": "start_review",
+      "Under review by PortaGov": "send_back",
+      "Submitted to PortaGov": "send_back",
+    };
+    const action = actionMap[args.status];
+    if (!action || !getStaffToken()) return (Actions as any).updateApplicationStatus(args);
+    try {
+      await staffApiCall(`/api/staff/applications/${args.id}/action`, {
+        method: "POST",
+        body: { action, note: args.statusNote || "", message: args.statusNote || "" },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      return (Actions as any).updateApplicationStatus(args);
+    }
+  },
+
+  async confirmReceipt(args: any) {
+    if (!getStaffToken()) return (Actions as any).confirmReceipt(args);
+    try {
+      await staffApiCall(`/api/staff/applications/${args.id}/action`, {
+        method: "POST",
+        body: {
+          action: "start_review",
+          note: `Receipt confirmed by ${args.officerName || "the institution"}.`,
+          message: `Receipt confirmed by ${args.officerName || "the institution"}.`,
+        },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      return (Actions as any).confirmReceipt(args);
+    }
+  },
+
+  async requestMoreInfo(args: any) {
+    if (!getStaffToken()) return (Actions as any).requestMoreInfo(args);
+    try {
+      await staffApiCall(`/api/staff/applications/${args.id}/action`, {
+        method: "POST",
+        body: {
+          action: "request_info",
+          note: `Missing: ${args.missing}. Deadline: ${args.deadline}.`,
+          message: `Missing: ${args.missing}. Deadline: ${args.deadline}.`,
+        },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      return (Actions as any).requestMoreInfo(args);
+    }
+  },
+
+  async sendInstitutionMessage(args: any) {
+    if (!getStaffToken()) return (Actions as any).sendInstitutionMessage(args);
+    try {
+      await staffApiCall(`/api/applications/${args.applicationId}/messages`, {
+        method: "POST",
+        body: { body: args.body, message: args.body },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      return (Actions as any).sendInstitutionMessage(args);
+    }
+  },
+
+  async replyToInstitution(args: any) {
+    try {
+      await apiCall(`/api/applications/${args.applicationId}/messages`, {
+        method: "POST",
+        body: { body: args.body, message: args.body },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      return (Actions as any).replyToInstitution(args);
+    }
+  },
+
+  async listApplicationMessages(args: any) {
+    // Officer side first when a staff session exists: the desk thread.
+    if (getStaffToken()) {
+      try {
+        const messages = await fetchThreadMessages(args.applicationId, args.institution || "");
+        return { messages };
+      } catch (e: any) {
+        if (isAuthError(e)) throw e;
+        // Fall through to the citizen token path below.
+      }
+    }
+    try {
+      const res = await apiCall(`/api/applications/${args.applicationId}/messages`, {});
+      const rows = staffRows(res, "messages");
+      return {
+        messages: rows.map((m: any, i: number) =>
+          normalizeThreadMessage(m, args.applicationId, args.institution || "", i),
+        ),
+      };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      // Backend thread not reachable: the local messages for this
+      // application, if this browser has any.
+      if (args.profileId) {
+        const local = await (Actions as any)
+          .listMessages({ profileId: args.profileId })
+          .catch(() => ({ messages: [] }));
+        return { messages: (local.messages || []).filter((m: any) => m.application_id === args.applicationId) };
+      }
+      return { messages: [] };
+    }
+  },
+
+  async listMessages(args: any) {
+    const local = await (Actions as any).listMessages(args).catch(() => ({ messages: [] }));
+    const mine = local.messages || [];
+    try {
+      // The backend has no "my messages" endpoint, so read the thread
+      // of each of the citizen's own backend applications and merge
+      // them with the local SMS/WhatsApp updates. Backend ids live in
+      // a different space from local ids, so they are offset and can
+      // never collide with a local row in the rendered list.
+      const rows = await apiCall("/api/applications", {});
+      const apps = Array.isArray(rows) ? rows : [];
+      const merged = [...mine];
+      const seen = new Set(mine.map((m: any) => `${m.application_id}|${m.kind}|${m.body}`));
+      for (const r of apps) {
+        if (!r?.id || !r?.reference) continue;
+        const institution = String(r.service?.institution?.name || r.institution || "");
+        let thread: any[] = [];
+        try {
+          const res = await apiCall(`/api/applications/${r.id}/messages`, {});
+          thread = staffRows(res, "messages");
+        } catch {
+          continue;
+        }
+        thread.forEach((m: any, i: number) => {
+          const norm = normalizeThreadMessage(m, Number(r.id), institution, i);
+          norm.id = 1000000000 + Number(r.id) * 100000 + (Number(m.id) || i);
+          const key = `${norm.application_id}|${norm.kind}|${norm.body}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push(norm);
+          }
+        });
+      }
+      merged.sort((a: any, b: any) => String(b.created_at).localeCompare(String(a.created_at)));
+      return { messages: merged };
+    } catch {
+      return { messages: mine };
+    }
+  },
+
+  async releaseApplication(args: any) {
+    if (!getStaffToken()) return (Actions as any).releaseApplication(args);
+    try {
+      await staffApiCall(`/api/admin/applications/${args.id}/release`, {
+        method: "POST",
+        body: { note: args.statusNote || "" },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      // 404: the release endpoint has not landed on the backend yet.
+      return (Actions as any).releaseApplication(args);
+    }
+  },
+
+  async recallApplication(args: any) {
+    if (!getStaffToken()) return (Actions as any).recallApplication(args);
+    try {
+      await staffApiCall(`/api/admin/applications/${args.id}/recall`, {
+        method: "POST",
+        body: { note: args.statusNote || "" },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      // 404: the recall endpoint has not landed on the backend yet.
+      return (Actions as any).recallApplication(args);
+    }
+  },
+
+  async getReleaseMode(_args: any) {
+    if (!getStaffToken()) return (Actions as any).getReleaseMode({});
+    try {
+      const mode = await readReleaseMode();
+      if (mode) return { mode };
+      return (Actions as any).getReleaseMode({});
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).getReleaseMode({});
+    }
+  },
+
+  async setReleaseMode(args: any) {
+    if (!getStaffToken()) return (Actions as any).setReleaseMode(args);
+    try {
+      const done = await writeReleaseMode(args.mode);
+      if (done) return { ok: true };
+      return (Actions as any).setReleaseMode(args);
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      return (Actions as any).setReleaseMode(args);
+    }
+  },
+
+  async getReport(_args: any) {
+    if (!getStaffToken()) return (Actions as any).getReport({});
+    try {
+      const s = await staffApiCall("/api/admin/stats", {});
+      const tally = (values: string[]) => {
+        const map = new Map<string, number>();
+        for (const v of values) map.set(v, (map.get(v) ?? 0) + 1);
+        return [...map.entries()]
+          .map(([label, count]) => ({ label, count }))
+          .sort((a, b) => b.count - a.count);
+      };
+      const arr = (v: any) =>
+        Array.isArray(v)
+          ? v
+              .map((r: any) => ({ label: String(r.label ?? r.name ?? ""), count: Number(r.count ?? r.value ?? 0) }))
+              .filter((r: any) => r.label)
+          : [];
+      let byInstitution = arr(s.by_institution);
+      let byStatus = arr(s.by_status);
+      let byChannel = arr(s.by_channel);
+      let byService = arr(s.by_service);
+      let totalApplications = Number(s.total_applications ?? s.applications ?? s.total ?? 0);
+      // If the stats reply carries no breakdowns, tally them from the
+      // live admin queue instead of showing empty tables.
+      if (!byInstitution.length || !byStatus.length || !byChannel.length || !byService.length) {
+        try {
+          const apps = await fetchAdminApplications();
+          if (!byInstitution.length) byInstitution = tally(apps.map((a: any) => a.institution).filter(Boolean));
+          if (!byStatus.length) byStatus = tally(apps.map((a: any) => a.status));
+          if (!byChannel.length) byChannel = tally(apps.map((a: any) => a.channel).filter(Boolean));
+          if (!byService.length) byService = tally(apps.map((a: any) => a.service_name).filter(Boolean));
+          if (!totalApplications) totalApplications = apps.length;
+        } catch {
+          // Keep whatever the stats reply gave.
+        }
+      }
+      return {
+        total_applications: totalApplications,
+        total_profiles: Number(s.total_profiles ?? s.users ?? s.citizens ?? 0),
+        total_payments: Number(s.total_payments ?? s.payments ?? 0),
+        total_appointments: Number(s.total_appointments ?? s.appointments ?? 0),
+        by_status: byStatus,
+        by_institution: byInstitution,
+        by_service: byService,
+        by_channel: byChannel,
+      };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).getReport({});
+    }
+  },
+
+  async listAuditLog(args: any) {
+    if (!getStaffToken()) return (Actions as any).listAuditLog(args);
+    try {
+      const q = new URLSearchParams();
+      if (args?.institution) q.set("institution", args.institution);
+      if (args?.limit) q.set("limit", String(args.limit));
+      const qs = q.toString();
+      const res = await staffApiCall(`/api/admin/audit${qs ? `?${qs}` : ""}`, {});
+      const rows = staffRows(res, "entries");
+      const entries = rows
+        .map((r: any, i: number) => ({
+          id: Number(r.id) || i + 1,
+          actor: String(r.actor || r.actor_name || r.user || ""),
+          institution: String(r.institution || r.institution_name || ""),
+          action: String(r.action || r.event || ""),
+          application_ref: String(r.application_ref || r.reference || ""),
+          created_at: String(r.created_at || r.createdAt || new Date().toISOString()),
+        }))
+        .filter((e: any) => !args?.institution || e.institution === args.institution);
+      return { entries };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).listAuditLog(args);
+    }
+  },
+
+  async getInstitutionDailySummary(args: any) {
+    if (!getStaffToken()) return (Actions as any).getInstitutionDailySummary(args);
+    try {
+      // Counted from the live released queue, not the local store.
+      const apps = await fetchStaffApplications();
+      const mine = apps.filter((a: any) => a.institution === args.institution);
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      return {
+        date_label: start.toLocaleDateString("en-GB", {
+          weekday: "long",
+          day: "numeric",
+          month: "long",
+          year: "numeric",
+        }),
+        date: start.toISOString().slice(0, 10),
+        institution: args.institution,
+        came_in_today: mine.filter((a: any) => new Date(a.created_at) >= start).length,
+        finished_today: mine.filter(
+          (a: any) => a.status === "Completed" && new Date(a.updated_at) >= start,
+        ).length,
+        still_waiting: mine.filter(
+          (a: any) => a.released && a.status !== "Completed" && a.status !== "Rejected",
+        ).length,
+        ready_for_collection: mine.filter((a: any) => a.status === "Ready for collection").length,
+      };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).getInstitutionDailySummary(args);
+    }
+  },
+
+  async listStaff(args: any) {
+    if (!getStaffToken()) return (Actions as any).listStaff(args);
+    try {
+      const res = await staffApiCall("/api/admin/officers", {});
+      const rows = staffRows(res, "officers");
+      const staff = rows
+        .map((r: any, i: number) => ({
+          id: Number(r.id) || i + 1,
+          institution: String(r.institution?.name || r.institution || r.institution_name || ""),
+          name: String(r.full_name || r.name || ""),
+          role: String(r.role || ""),
+          phone: String(r.phone || ""),
+        }))
+        .filter((s: any) => !args?.institution || s.institution === args.institution);
+      return { staff };
+    } catch {
+      // The roster is secondary: any backend failure shows the local
+      // roster rather than breaking the desk.
+      return (Actions as any).listStaff(args);
+    }
+  },
+
+  async addStaff(args: any) {
+    if (!getStaffToken()) return (Actions as any).addStaff(args);
+    try {
+      await staffApiCall("/api/admin/officers", {
+        method: "POST",
+        body: {
+          full_name: args.name,
+          name: args.name,
+          phone: args.phone,
+          role: args.role,
+          institution: args.institution,
+        },
+      });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      return (Actions as any).addStaff(args);
     }
   },
 };
