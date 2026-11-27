@@ -144,12 +144,13 @@ function cachedProfile(): any | null {
   }
 }
 
-/* Phone of the most recent sign-in attempt (loginStart). The code step
-   must verify against THIS phone, not the cached profile: the cached
-   profile can belong to a different person signed in earlier on this
-   device (for example an admin signing in after a citizen), and the
-   backend issues the code for the attempted phone only. */
-let lastLoginPhone = "";
+/* Identifier (email or phone number) of the most recent sign-in attempt
+   (loginStart). The code step must verify against THIS identifier, not
+   the cached profile: the cached profile can belong to a different
+   person signed in earlier on this device (for example an admin signing
+   in after a citizen), and the backend issues the code for the attempted
+   identifier only. */
+let lastLoginIdentifier = "";
 
 function saveProfile(p: any): void {
   storeSet(PROFILE_KEY, JSON.stringify(p));
@@ -627,7 +628,7 @@ async function finishStaffLogin(res: any, phone: string): Promise<any> {
     clearStaffAuth();
     return {
       ok: false,
-      error: "That account is a citizen account, not an officer account. Officers sign in here with the phone and password the platform gave them.",
+      error: "That account is a citizen account, not an officer account. Officers sign in here with the email or phone number and password the platform gave them.",
     };
   }
   const staff = sessionFromUser({ ...(user || {}), phone: user?.phone || phone });
@@ -952,13 +953,17 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
   },
 
   async loginStart(args: any) {
-    const empty = { profile_id: 0, demo_code: "", new_device: false, minutes_left: 0, profile: null };
+    const empty = { profile_id: 0, demo_code: "", code_channels: [] as string[], new_device: false, minutes_left: 0, profile: null };
+    // One field takes an email address or a phone number. The backend
+    // looks the account up by either one; phone is sent along too so
+    // an older backend that only knows phone still works.
+    const identifier = String(args.identifier ?? args.phone ?? "").trim();
     let res: any;
     try {
       res = await apiCall("/api/auth/login", {
         method: "POST",
         auth: false,
-        body: { phone: args.phone, password: args.password },
+        body: { identifier, phone: args.phone ?? identifier, password: args.password },
       });
     } catch (e: any) {
       if (e?.status === 401) return { result: "bad_credentials", ...empty };
@@ -967,13 +972,14 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       throw e;
     }
     if (res.two_factor) {
-      lastLoginPhone = args.phone || "";
+      lastLoginIdentifier = identifier;
       const profile = cachedProfile();
       return {
         result: "need_code",
         ...empty,
         profile_id: profile?.id || 0,
         demo_code: res.dev_otp || "",
+        code_channels: res.code_channels || ["sms"],
         new_device: true,
       };
     }
@@ -985,17 +991,20 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
 
   async verifyLoginCode(args: any) {
     const profile = cachedProfile();
-    // Prefer the phone passed in for this attempt, then the phone of
-    // the most recent loginStart that asked for a code, and only then
-    // the cached profile phone. The cached profile may belong to a
-    // different person signed in earlier on this device.
-    const phone = args.phone || lastLoginPhone || profile?.phone || "";
+    // Prefer the identifier passed in for this attempt, then the
+    // identifier of the most recent loginStart that asked for a code,
+    // and only then the cached profile phone. The cached profile may
+    // belong to a different person signed in earlier on this device.
+    // An email sign-in must verify against the email account, not
+    // against a phone from an earlier session.
+    const identifier = args.identifier || lastLoginIdentifier || profile?.phone || "";
+    const phone = args.phone || (identifier.includes("@") ? "" : identifier);
     const res = await apiCall("/api/auth/login/verify", {
       method: "POST",
       auth: false,
-      body: { phone, otp: args.code },
+      body: { identifier, phone, otp: args.code },
     });
-    lastLoginPhone = "";
+    lastLoginIdentifier = "";
     if (res.token) setToken(res.token);
     const updated = userToProfile(res.user, profile);
     saveProfile(updated);
@@ -1831,38 +1840,45 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
   },
 
   async staffSignIn(args: any) {
+    // One field takes an email address or a phone number, the same as
+    // the citizen sign-in. The backend looks the account up by either
+    // one; phone is sent along too so an older backend that only
+    // knows phone still works.
+    const identifier = String(args.identifier ?? args.phone ?? "").trim();
     let res: any;
     try {
       res = await apiCall("/api/auth/login", {
         method: "POST",
         auth: false,
-        body: { phone: args.phone, password: args.password },
+        body: { identifier, phone: args.phone ?? identifier, password: args.password },
       });
     } catch (e: any) {
-      if (e?.status === 401) return { ok: false, error: "No officer account matches that phone and password." };
+      if (e?.status === 401) return { ok: false, error: "No officer account matches that email or phone number and password." };
       if (e?.status === 423) return { ok: false, error: "That account is locked for 15 minutes after too many wrong passwords." };
       throw e;
     }
     if (res.two_factor) {
-      return { ok: false, need_code: true, demo_code: res.dev_otp || "", phone: args.phone };
+      return { ok: false, need_code: true, demo_code: res.dev_otp || "", code_channels: res.code_channels || ["sms"], identifier, phone: args.phone ?? identifier };
     }
-    return finishStaffLogin(res, args.phone);
+    return finishStaffLogin(res, identifier);
   },
 
   async staffVerifyCode(args: any) {
+    const identifier = String(args.identifier ?? args.phone ?? "").trim();
+    const phone = args.phone || (identifier.includes("@") ? "" : identifier);
     let res: any;
     try {
       res = await apiCall("/api/auth/login/verify", {
         method: "POST",
         auth: false,
-        body: { phone: args.phone, otp: args.code },
+        body: { identifier, phone, otp: args.code },
       });
     } catch (e: any) {
       if (e?.status === 401) return { ok: false, error: "That code is not correct, or it has expired. Sign in again for a fresh code." };
       if (e?.status === 423) return { ok: false, error: "That account is locked for 15 minutes after too many wrong codes." };
       throw e;
     }
-    return finishStaffLogin(res, args.phone);
+    return finishStaffLogin(res, identifier);
   },
 
   async staffSignOut(_args: any) {

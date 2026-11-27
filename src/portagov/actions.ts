@@ -3720,7 +3720,8 @@ export const Actions = {
     description:
       "Starts sign-in: checks lockout and password, then decides whether a code is needed (new device, two-factor on, or a password still to set).",
     request: z.object({
-      phone: z.string().trim().min(7).max(20),
+      identifier: z.string().trim().min(3).max(150),
+      phone: z.string().trim().max(20).default(""),
       password: z.string().max(100).default(""),
       deviceId: z.string().trim().min(4).max(80),
       deviceLabel: z.string().trim().max(120).default(""),
@@ -3729,21 +3730,36 @@ export const Actions = {
       result: z.enum(["ok", "need_code", "bad_credentials", "locked", "not_found"]),
       profile_id: z.number(),
       demo_code: z.string(),
+      code_channels: z.array(z.string()),
       new_device: z.boolean(),
       minutes_left: z.number(),
       profile: profileShape.nullable(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.profiles)
-        .where(eq(schema.profiles.phone, args.phone))
-        .limit(1);
+      // One field takes an email address or a phone number, the same
+      // as the live backend login. An email is matched
+      // case-insensitively against the stored address; a phone
+      // number matches the stored number exactly.
+      const identifier = args.identifier || args.phone;
+      let rows;
+      if (identifier.includes("@")) {
+        const all = await db.select().from(schema.profiles);
+        const wanted = identifier.toLowerCase();
+        const match = all.find((p: any) => String(p.email || "").toLowerCase() === wanted);
+        rows = match ? [match] : [];
+      } else {
+        rows = await db
+          .select()
+          .from(schema.profiles)
+          .where(eq(schema.profiles.phone, identifier))
+          .limit(1);
+      }
       const row = rows[0];
       const empty = {
         profile_id: 0,
         demo_code: "",
+        code_channels: [] as string[],
         new_device: false,
         minutes_left: 0,
         profile: null,
@@ -3831,6 +3847,7 @@ export const Actions = {
       "Finishes sign-in with the code: registers the device, warns when the device is new, and lets a password be set for accounts that do not have one yet.",
     request: z.object({
       profileId: z.number().int().positive(),
+      identifier: z.string().trim().max(150).default(""),
       phone: z.string().trim().max(30).default(""),
       code: z.string().trim().min(6).max(6),
       deviceId: z.string().trim().min(4).max(80),

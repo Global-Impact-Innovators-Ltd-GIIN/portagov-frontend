@@ -152,21 +152,23 @@ function useOfficerSession(): [
    which case the code step follows, like the staff portal. A citizen
    account is refused here, with a plain explanation. */
 function StaffSignInForm({ onSignedIn }: { onSignedIn: (s: OfficerSession) => void }) {
-  const [phone, setPhone] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [step, setStep] = useState<"password" | "code">("password");
   const [code, setCode] = useState("");
   const [demoCode, setDemoCode] = useState("");
+  const [codeChannels, setCodeChannels] = useState<string[]>(["sms"]);
   const [error, setError] = useState("");
   const signIn = useMutation({
-    mutationFn: async () => await (api as any).staffSignIn({ phone: phone.trim(), password }),
+    mutationFn: async () => await (api as any).staffSignIn({ identifier: identifier.trim(), phone: identifier.trim(), password }),
     onSuccess: (r: any) => {
       if (!r.ok && !r.need_code) {
-        setError(r.error || "Sign-in failed. Check the phone number and password.");
+        setError(r.error || "Sign-in failed. Check the email or phone number and password.");
         return;
       }
       if (r.need_code) {
         setDemoCode(r.demo_code || "");
+        setCodeChannels(r.code_channels || ["sms"]);
         setCode("");
         setStep("code");
         return;
@@ -176,7 +178,7 @@ function StaffSignInForm({ onSignedIn }: { onSignedIn: (s: OfficerSession) => vo
     onError: (e) => setError(e instanceof Error ? e.message : "Sign-in failed. Try again."),
   });
   const verifyCode = useMutation({
-    mutationFn: async () => await (api as any).staffVerifyCode({ phone: phone.trim(), code: code.trim() }),
+    mutationFn: async () => await (api as any).staffVerifyCode({ identifier: identifier.trim(), phone: identifier.trim(), code: code.trim() }),
     onSuccess: (r: any) => {
       if (!r.ok) {
         setError(r.error || "That code is not correct, or it has expired.");
@@ -193,8 +195,12 @@ function StaffSignInForm({ onSignedIn }: { onSignedIn: (s: OfficerSession) => vo
       </h2>
       <p className="mt-1 text-sm text-[var(--dim)]">
         {step === "code"
-          ? "We sent a 6 number code to your officer phone. In this build the code is shown here: "
-          : "Sign in with the phone number and password the platform gave your institution. Citizen accounts cannot open this desk."}
+          ? codeChannels.includes("email") && codeChannels.includes("sms")
+            ? "We sent a 6 number code by SMS to your phone and by email to your email address. Enter the code from either one. In this build the code is shown here: "
+            : codeChannels.includes("email")
+              ? "We sent a 6 number code by email to your email address. In this build the code is shown here: "
+              : "We sent a 6 number code to your officer phone. In this build the code is shown here: "
+          : "Sign in with the email or phone number and password the platform gave your institution. Citizen accounts cannot open this desk."}
         {step === "code" && demoCode ? <strong className="text-[var(--text)]">{demoCode}</strong> : null}
       </p>
       {step === "code" ? (
@@ -235,9 +241,10 @@ function StaffSignInForm({ onSignedIn }: { onSignedIn: (s: OfficerSession) => vo
           }}
         >
           <div>
-            <FieldLabel htmlFor="officer-phone">Your phone number (required)</FieldLabel>
-            <input id="officer-phone" className={inputCls} value={phone}
-              onChange={(e) => setPhone(e.target.value)} autoComplete="tel" />
+            <FieldLabel htmlFor="officer-identifier">Your email or phone number (required)</FieldLabel>
+            <input id="officer-identifier" className={inputCls} value={identifier}
+              onChange={(e) => setIdentifier(e.target.value)} autoComplete="username"
+              placeholder="you@example.com or 770 000 000" />
           </div>
           <div>
             <FieldLabel htmlFor="officer-password">Your password (required)</FieldLabel>
@@ -3035,7 +3042,7 @@ function SignInPage({
               >
                 <p className="font-display text-lg font-bold text-[var(--text)]">I'm not new here</p>
                 <p className="mt-1 text-sm text-[var(--dim)]">
-                  Sign in with your phone and password. New device? PortaGov
+                  Sign in with your email or phone number and password. New device? PortaGov
                   asks for a code and warns you, so nobody can quietly use
                   your account.
                 </p>
@@ -3091,11 +3098,12 @@ function LoginForm({
   after: string;
   onBack: () => void;
 }) {
-  const [phone, setPhone] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [step, setStep] = useState<"credentials" | "code">("credentials");
   const [profileId, setProfileId] = useState(0);
   const [demoCode, setDemoCode] = useState("");
+  const [codeChannels, setCodeChannels] = useState<string[]>(["sms"]);
   const [newDevice, setNewDevice] = useState(false);
   const [code, setCode] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -3104,16 +3112,19 @@ function LoginForm({
   const start = useMutation({
     mutationFn: async () => {
       const d = deviceInfo();
-      const primary = phone.trim();
+      const primary = identifier.trim();
       const first = await api.loginStart({
+        identifier: primary,
         phone: primary,
         password,
         deviceId: d.deviceId,
         deviceLabel: d.label,
       });
       if (first.result !== "not_found") return first;
-      // Accounts saved before the country picker may hold the local form
-      // of the number (0770 000 000). Try that form once before giving up.
+      // A phone number only: accounts saved before the country picker
+      // may hold the local form of the number (0770 000 000). Try that
+      // form once before giving up. An email address never takes this path.
+      if (primary.includes("@")) return first;
       const parts = splitPhone(primary);
       const legacy =
         parts.country === "Liberia" && parts.digits
@@ -3121,6 +3132,7 @@ function LoginForm({
           : "";
       if (legacy && legacy !== primary) {
         return await api.loginStart({
+          identifier: legacy,
           phone: legacy,
           password,
           deviceId: d.deviceId,
@@ -3136,6 +3148,7 @@ function LoginForm({
       } else if (r.result === "need_code") {
         setProfileId(r.profile_id);
         setDemoCode(r.demo_code);
+        setCodeChannels(r.code_channels || ["sms"]);
         setNewDevice(r.new_device);
         setStep("code");
       } else if (r.result === "locked") {
@@ -3144,11 +3157,11 @@ function LoginForm({
         );
       } else if (r.result === "bad_credentials") {
         setError(
-          "Phone or password is not correct. After 5 wrong tries the account locks for 15 minutes.",
+          "Email, phone number or password is not correct. After 5 wrong tries the account locks for 15 minutes.",
         );
       } else {
         setError(
-          "No account was found for that phone number. If this is your first time, choose I'm new here.",
+          "No account was found for that email or phone number. If this is your first time, choose I'm new here.",
         );
       }
     },
@@ -3161,7 +3174,8 @@ function LoginForm({
       const d = deviceInfo();
       return await api.verifyLoginCode({
         profileId,
-        phone: phone.trim(),
+        identifier: identifier.trim(),
+        phone: identifier.trim(),
         code: code.trim(),
         deviceId: d.deviceId,
         deviceLabel: d.label,
@@ -3202,8 +3216,12 @@ function LoginForm({
           {newDevice
             ? "This device is new to your account, so PortaGov needs a code before it trusts it. "
             : "Your account asks for a code at sign-in. "}
-          We sent a 6 number code by SMS. In this build the code is shown
-          here: <strong className="text-[var(--text)]">{demoCode}</strong>
+          {codeChannels.includes("email") && codeChannels.includes("sms")
+            ? "We sent a 6 number code by SMS to your phone and by email to your email address. Enter the code from either one."
+            : codeChannels.includes("email")
+              ? "We sent a 6 number code by email to your email address."
+              : "We sent a 6 number code by SMS to your phone."}{" "}
+          In this build the code is shown here: <strong className="text-[var(--text)]">{demoCode}</strong>
         </p>
         <div>
           <FieldLabel htmlFor="li-code">Sign-in code</FieldLabel>
@@ -3250,13 +3268,14 @@ function LoginForm({
       }}
     >
       <div>
-        <FieldLabel htmlFor="li-phone">Your phone number</FieldLabel>
-        <PhoneInput id="li-phone" fieldProps={FIELDS.findProfileByPhone.phone}
-          value={phone} onChange={setPhone}
-          placeholder="770 000 000" />
+        <FieldLabel htmlFor="li-identifier">Your email or phone number</FieldLabel>
+        <input id="li-identifier" className={inputCls} value={identifier}
+          onChange={(e) => setIdentifier(e.target.value)}
+          autoComplete="username"
+          placeholder="you@example.com or 770 000 000" />
         <p className="mt-1 text-xs text-[var(--dim)]">
-          Pick your country and the dialling code appears. Then type the
-          rest of your number.
+          Use the email or phone number on your account. If your phone is
+          off or missing, the sign-in code goes to your email instead.
         </p>
       </div>
       <div>
