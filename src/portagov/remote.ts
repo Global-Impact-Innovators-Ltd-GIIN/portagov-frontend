@@ -153,6 +153,40 @@ let lastLoginPhone = "";
 
 function saveProfile(p: any): void {
   storeSet(PROFILE_KEY, JSON.stringify(p));
+  // Keep one cached profile per person, keyed by user id, so a
+  // returning citizen keeps the details the backend does not store
+  // (place of birth, sex, address, emergency contact) even after
+  // someone else signed in on this device. userToProfile below only
+  // ever reads the entry for the person signing in, so one person's
+  // details can never leak onto another person's account page.
+  try {
+    const map = profilesById();
+    map[String(p.id)] = p;
+    storeSet(PROFILES_KEY, JSON.stringify(map));
+  } catch {
+    // The per-person backup is best effort; the current profile
+    // above is the source of truth.
+  }
+}
+
+const PROFILES_KEY = "portagov-remote-profiles-v1";
+
+function profilesById(): Record<string, any> {
+  try {
+    const raw = storeGet(PROFILES_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Forget the cached citizen profile on this device (sign-out). The
+    per-person backup above is keyed by user id, so clearing the
+    current profile never touches another person's saved details,
+    and the next sign-in rebuilds the profile from that person's own
+    backend record. */
+export function clearCachedProfile(): void {
+  storeRemove(PROFILE_KEY);
 }
 
 function appCache(): Record<string, any> {
@@ -222,7 +256,25 @@ function emptyProfile(id: number, phone: string): any {
 }
 
 function userToProfile(u: any, fallback?: any): any {
-  const base = fallback || cachedProfile() || emptyProfile(u.id, u.phone || "");
+  // A cached profile from an earlier sign-in may belong to a
+  // different person on this device (for example an admin signing in
+  // after a citizen). The backend user object does not carry place
+  // of birth, sex, address, or emergency contact, so those fields
+  // used to be filled from the cached profile, and the previous
+  // person's details leaked onto the new sign-in's account page.
+  // Only ever reuse saved details that belong to THIS user id: the
+  // fallback, then the current cached profile, then that person's
+  // own per-person backup. Anyone else starts from a blank profile.
+  let base: any;
+  if (fallback && Number(fallback.id) === Number(u.id)) {
+    base = fallback;
+  } else {
+    const cached = cachedProfile();
+    base =
+      cached && Number(cached.id) === Number(u.id)
+        ? cached
+        : profilesById()[String(u.id)] || emptyProfile(u.id, u.phone || "");
+  }
   return {
     ...base,
     id: u.id,
@@ -705,21 +757,40 @@ async function fetchStaffApplications(): Promise<any[]> {
   return staffRows(res).map(toStaffApplication).filter((a: any) => a.released);
 }
 
-/** The platform queue: every application, held and released. Tries
-    the admin list first, then the staff list (an officer token is
-    refused the admin list with 403, and the staff list is the right
-    live queue for that officer). */
+/** The platform queue: every application, held and released. The
+    backend has no GET /api/admin/applications list (it 404s): held
+    applications live at GET /api/admin/applications/held and
+    released ones at GET /api/staff/applications, and the two lists
+    are merged here. Calling only the staff list hid every held
+    application from the console, so nothing could ever be released
+    from it (verified live 2026-11-27: the old path 404s, the staff
+    list returns only the 7 released rows, the held list returns
+    application 14). A 403/404 on the held list means this token may
+    not use the admin queue (an officer token), so the released
+    staff list alone is the right queue for that officer. Anything
+    else (a dropped connection, a 5xx) is thrown: the console must
+    show an error and a retry, never silent demo data. */
 async function fetchAdminApplications(): Promise<any[]> {
+  let held: any[] = [];
   try {
-    const res = await staffApiCall("/api/admin/applications", {});
-    return staffRows(res).map(toStaffApplication);
+    const res = await staffApiCall("/api/admin/applications/held", {});
+    held = staffRows(res).map(toStaffApplication);
   } catch (e: any) {
-    if (e?.status === 404 || e?.status === 403) {
-      const res = await staffApiCall("/api/staff/applications", {});
-      return staffRows(res).map(toStaffApplication);
+    if (e?.status === 403 || e?.status === 404) {
+      // Not an admin token: the released staff list below is the queue.
+    } else {
+      throw e;
     }
-    throw e;
   }
+  const released = await fetchStaffApplications();
+  const seen = new Set<number>();
+  const merged: any[] = [];
+  for (const a of [...held, ...released]) {
+    if (seen.has(a.id)) continue;
+    seen.add(a.id);
+    merged.push(a);
+  }
+  return merged;
 }
 
 /** Normalise one backend thread message into the frontend MessageT
@@ -952,7 +1023,18 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       // Signing out locally is still the right thing when the token is gone.
     }
     setToken("");
+    // Forget this device's cached profile too, so the next sign-in
+    // never shows the previous person's details on the account page.
+    clearCachedProfile();
     return { ok: true, devices_signed_out: 1 };
+  },
+
+  /** Forget the cached citizen profile on this device (plain
+      sign-out). The next sign-in rebuilds it from that person's own
+      backend record. */
+  async clearCachedProfile(_args: any) {
+    clearCachedProfile();
+    return { ok: true };
   },
 
   async changePassword(args: any) {
@@ -1504,6 +1586,40 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     }
   },
 
+  /** Platform-wide payments for the console, from the live backend
+      reconciliation list. The citizen listPayments above only ever
+      shows the signed-in citizen's own payments (and an admin has
+      none), so the console showed 0 payments. The backend list
+      carries no payer phone (only the paying device knows it), so
+      that field stays blank here. Signed in and the live call fails:
+      throw, never show seed payments. */
+  async listPlatformPayments(_args: any) {
+    if (!getStaffToken()) return (Actions as any).listPayments({ limit: 100 });
+    const res = await staffApiCall("/api/staff/payments", {});
+    const items = staffRows(res, "items");
+    return {
+      payments: items.map((p: any) => ({
+        id: Number(p.id ?? 0),
+        application_id: 0,
+        application_ref: String(p.reference || ""),
+        billing_number: String(p.bill_id || ""),
+        service_name: String(p.service || ""),
+        method:
+          p.method === "mtn_momo"
+            ? "MTN MoMo"
+            : p.method === "orange_money"
+              ? "Orange Money"
+              : String(p.method || ""),
+        amount: Number(p.amount_usd ?? 0),
+        payer_phone: "",
+        transaction_ref: String(p.txn_ref || ""),
+        status: p.status === "success" ? "Confirmed" : p.status === "refunded" ? "Refunded" : "Recorded",
+        refund_reason: String(p.refund_reason || ""),
+        created_at: String(p.created_at || ""),
+      })),
+    };
+  },
+
   async bookAppointment(args: any) {
     const OFFICE_TO_CENTER: Record<string, string> = {
       "PortaGov Service Centre, Capitol Hill, Monrovia": "Monrovia (Capitol Hill) Service Center",
@@ -1742,13 +1858,11 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
 
   async listAllApplications(args: any) {
     if (!getStaffToken()) return (Actions as any).listAllApplications(args);
-    try {
-      const applications = await fetchAdminApplications();
-      return { applications: applications.slice(0, args?.limit || 100) };
-    } catch (e: any) {
-      if (isAuthError(e)) throw e;
-      return (Actions as any).listAllApplications(args);
-    }
+    // Signed in: the live queue, or a plain error. Never silently
+    // substitute the local demo queue: that hid held applications
+    // from the console and showed seed rows instead.
+    const applications = await fetchAdminApplications();
+    return { applications: applications.slice(0, args?.limit || 100) };
   },
 
   async updateApplicationStatus(args: any) {
@@ -1922,56 +2036,41 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
 
   async releaseApplication(args: any) {
     if (!getStaffToken()) return (Actions as any).releaseApplication(args);
-    try {
-      await staffApiCall(`/api/admin/applications/${args.id}/release`, {
-        method: "POST",
-        body: { note: args.statusNote || "" },
-      });
-      return { ok: true };
-    } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
-      // 404: the release endpoint has not landed on the backend yet.
-      return (Actions as any).releaseApplication(args);
-    }
+    // The release endpoint is live on the backend. A failure here
+    // is a real failure: never silently "release" in the local demo
+    // store while the live application stays held.
+    await staffApiCall(`/api/admin/applications/${args.id}/release`, {
+      method: "POST",
+      body: { note: args.statusNote || "" },
+    });
+    return { ok: true };
   },
 
   async recallApplication(args: any) {
     if (!getStaffToken()) return (Actions as any).recallApplication(args);
-    try {
-      await staffApiCall(`/api/admin/applications/${args.id}/recall`, {
-        method: "POST",
-        body: { note: args.statusNote || "" },
-      });
-      return { ok: true };
-    } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
-      // 404: the recall endpoint has not landed on the backend yet.
-      return (Actions as any).recallApplication(args);
-    }
+    await staffApiCall(`/api/admin/applications/${args.id}/recall`, {
+      method: "POST",
+      body: { note: args.statusNote || "" },
+    });
+    return { ok: true };
   },
 
   async getReleaseMode(_args: any) {
     if (!getStaffToken()) return (Actions as any).getReleaseMode({});
-    try {
-      const mode = await readReleaseMode();
-      if (mode) return { mode };
-      return (Actions as any).getReleaseMode({});
-    } catch (e: any) {
-      if (isAuthError(e)) throw e;
-      return (Actions as any).getReleaseMode({});
-    }
+    // Signed in: the live setting, or a plain error. Never show the
+    // local demo mode as if it were the platform's real rule.
+    const mode = await readReleaseMode();
+    if (mode) return { mode };
+    throw new Error("The platform could not read the release mode. Try again.");
   },
 
   async setReleaseMode(args: any) {
     if (!getStaffToken()) return (Actions as any).setReleaseMode(args);
-    try {
-      const done = await writeReleaseMode(args.mode);
-      if (done) return { ok: true };
-      return (Actions as any).setReleaseMode(args);
-    } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
-      return (Actions as any).setReleaseMode(args);
-    }
+    // Signed in: the live setting, or a plain error. Never flip the
+    // local demo mode and show it as the platform's real rule.
+    const done = await writeReleaseMode(args.mode);
+    if (!done) throw new Error("The platform could not change the release mode. Try again.");
+    return { ok: true };
   },
 
   async getReport(_args: any) {
@@ -2021,8 +2120,9 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
         by_channel: byChannel,
       };
     } catch (e: any) {
-      if (isAuthError(e)) throw e;
-      return (Actions as any).getReport({});
+      // Signed in: a failed live report is an error, not a reason to
+      // show the local demo report with seed counts.
+      throw e;
     }
   },
 
