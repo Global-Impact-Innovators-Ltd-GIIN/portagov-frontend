@@ -1604,7 +1604,7 @@ export const Actions = {
 
   releaseApplication: defineAction({
     description:
-      "Platform portal action: releases a held application to its institution after PortaGov review, or holds it back for more information.",
+      "Console action: releases a held application to its institution after PortaGov review, or holds it back for more information.",
     request: z.object({
       id: z.number().int().positive(),
       statusNote: z.string().trim().max(500).default(""),
@@ -1701,7 +1701,7 @@ export const Actions = {
 
   recallApplication: defineAction({
     description:
-      "Platform portal action: recalls a released application back to PortaGov, so the institution no longer sees it until it is released again.",
+      "Console action: recalls a released application back to PortaGov, so the institution no longer sees it until it is released again.",
     request: z.object({
       id: z.number().int().positive(),
       statusNote: z.string().trim().max(500).default(""),
@@ -5529,7 +5529,7 @@ export const Actions = {
 
   createStaffAccount: defineAction({
     description:
-      "Staff portals: the platform portal creates a PortaGov staff account with a role, permissions, and a sign-in password, so many people can help services run smoothly. The password is stored only as a salted hash.",
+      "Staff portals: the PortaGov Console creates a PortaGov staff account with a role, permissions, and a sign-in password, so many people can help services run smoothly. The password is stored only as a salted hash.",
     request: z.object({
       name: z.string().trim().min(2).max(120),
       phone: z.string().trim().min(7).max(20),
