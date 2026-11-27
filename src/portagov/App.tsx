@@ -118,6 +118,14 @@ function useOfficerSession(): [
       storage.remove(STAFF_SESSION_KEY);
       storage.remove("portagov-officer");
     }
+    /* Tell every other desk on this page about the change, so the
+       console header and the console body never disagree about who is
+       signed in. */
+    try {
+      window.dispatchEvent(new Event("portagov-officer-session"));
+    } catch {
+      /* No window in this shell; the session still changed above. */
+    }
   };
   const signOut = () => {
     void (api as any).staffSignOut({}).catch(() => undefined);
@@ -143,8 +151,39 @@ function useOfficerSession(): [
     // Only on mount: the session state itself is the guard.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  /* Keep this desk in step when another desk on the same page signs
+     in or out: re-read the stored session instead of holding a stale
+     one. */
+  useEffect(() => {
+    const sync = () => setSessionState(readStaffSession());
+    window.addEventListener("portagov-officer-session", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("portagov-officer-session", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+
   return [session, setSession, signOut];
 }
+/* Staff roles, in the words the person sees: the backend stores
+   "admin", "officer" and "inst_admin", and the console never shows a
+   bare "admin". */
+function staffRoleLabel(role: string): string {
+  switch (role.trim().toLowerCase()) {
+    case "admin":
+    case "platform admin":
+      return "Super Admin";
+    case "inst_admin":
+    case "institution admin":
+      return "Institution Admin";
+    case "officer":
+      return "Officer";
+    default:
+      return role;
+  }
+}
+
 
 /* Officer sign-in form, used by the institution gate, the
    per-ministry portal gate, and the platform console prompt. One
@@ -7338,7 +7377,7 @@ function InstitutionPage() {
       </p>
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl p-4 text-white" style={{ backgroundColor: "#0a2a5e" }}>
         <p className="text-sm">
-          Signed in as <strong>{session.name}</strong>, {session.role}
+          Signed in as <strong>{session.name}</strong>, {staffRoleLabel(session.role)}
           {session.institution ? `, ${session.institution}` : ""}. The queue
           below is live: new releases appear here without a reload.
         </p>
@@ -7403,7 +7442,50 @@ function InstitutionPage() {
   );
 }
 
-/* ---------- platform portal (PortaGov council / super-admin) ---------- */
+/* ---------- PortaGov Console sections ----------
+   The console is one page (#/reports) with sections in the address:
+   #/reports is the dashboard, #/reports/queues is the queues section,
+   and so on. The router reads only the first part, so a section link
+   stays on the console, and Back walks the sections the person
+   visited. The header, the footer and the phone nav all read this one
+   list, so the console never shows a citizen or institution link. */
+const CONSOLE_SECTIONS = [
+  { key: "dashboard", label: "Dashboard", href: "#/reports" },
+  { key: "queues", label: "Queues", href: "#/reports/queues" },
+  { key: "institutions", label: "Institutions", href: "#/reports/institutions" },
+  { key: "officers", label: "Officers", href: "#/reports/officers" },
+  { key: "services", label: "Services and fees", href: "#/reports/services" },
+  { key: "payments", label: "Payments", href: "#/reports/payments" },
+  { key: "reports", label: "Reports", href: "#/reports/reports" },
+  { key: "helpdesk", label: "Help desk", href: "#/reports/helpdesk" },
+  { key: "mail", label: "Mail", href: "#/reports/mail" },
+  { key: "system", label: "System", href: "#/reports/system" },
+] as const;
+
+type ConsoleSection = (typeof CONSOLE_SECTIONS)[number]["key"];
+
+function consoleSectionFromHash(): ConsoleSection {
+  try {
+    const parts = window.location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+    const key = parts[0] === "reports" ? parts[1] : undefined;
+    if (key && CONSOLE_SECTIONS.some((s) => s.key === key)) return key as ConsoleSection;
+  } catch {
+    /* Address bar unavailable in this shell; the dashboard stays. */
+  }
+  return "dashboard";
+}
+
+function useConsoleSection(): ConsoleSection {
+  const [section, setSection] = useState<ConsoleSection>(() => consoleSectionFromHash());
+  useEffect(() => {
+    const onChange = () => setSection(consoleSectionFromHash());
+    window.addEventListener("hashchange", onChange);
+    return () => window.removeEventListener("hashchange", onChange);
+  }, []);
+  return section;
+}
+
+/* ---------- PortaGov Console (super-admin) ---------- */
 
 function downloadCsv(filename: string, rows: string[][]) {
   const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
@@ -7569,6 +7651,9 @@ function PlatformPage() {
     },
   });
   const [copied, setCopied] = useState(false);
+  const section = useConsoleSection();
+  const sectionLabel =
+    CONSOLE_SECTIONS.find((s) => s.key === section)?.label ?? "Dashboard";
 
   const all = apps.data?.applications ?? [];
   const held = all.filter((a: ApplicationT) => !a.released);
@@ -7619,10 +7704,10 @@ function PlatformPage() {
             className="text-sm font-bold uppercase tracking-widest"
             style={{ color: "#d9a821" }}
           >
-            Platform portal, PortaGov council
+            PortaGov Console
           </p>
           <h1 className="mt-1 font-display text-3xl font-extrabold">
-            Platform console
+            {sectionLabel}
           </h1>
           <p className="mt-2 max-w-3xl leading-relaxed text-white/85">
             PortaGov is the intermediary between citizens and institutions. Every
@@ -7656,7 +7741,7 @@ function PlatformPage() {
       ) : (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl p-4 text-white" style={{ backgroundColor: "#0a2a5e" }}>
           <p className="text-sm">
-            Signed in as <strong>{session.name}</strong>, {session.role}
+            Signed in as <strong>{session.name}</strong>, {staffRoleLabel(session.role)}
             {session.institution ? `, ${session.institution}` : ""}. The
             queues below are live: new applications appear here held,
             without a reload.
@@ -7684,10 +7769,29 @@ function PlatformPage() {
           </div>
         </div>
       ) : null}
+      {section === "dashboard" ? (
+        <div className="mt-6 space-y-6">
       <div>
         <DailySummaryPanel />
       </div>
-
+      <div className="mt-6 grid gap-3 sm:grid-cols-4">
+        {[
+          ["Applications", report.isError ? "-" : report.data?.total_applications ?? 0],
+          ["Held by PortaGov", apps.isError ? "-" : held.length],
+          ["Released", apps.isError ? "-" : released.length],
+          ["Citizen profiles", report.isError ? "-" : report.data?.total_profiles ?? 0],
+        ].map(([label, value]) => (
+          <div key={label} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 text-center">
+            <p className="font-display text-3xl font-extrabold text-[var(--text)]">{value}</p>
+            <p className="mt-1 text-sm font-semibold text-[var(--dim)]">{label}</p>
+          </div>
+        ))}
+      </div>
+          <MoneyPanel />
+        </div>
+      ) : null}
+      {section === "queues" ? (
+        <div className="mt-6 space-y-8">
       <div className="mt-6 rounded-xl p-6 text-white" style={{ backgroundColor: "#0a2a5e" }}>
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="max-w-xl">
@@ -7723,7 +7827,7 @@ function PlatformPage() {
         </div>
         <p className="mt-3 text-sm text-white/70">
           The switch is the global rule. Below it, every single application
-          also carries its own release control, so the council can release or
+          also carries its own release control, so a Super Admin can release or
           recall one application whatever the global rule says.
         </p>
         {setMode.isError ? (
@@ -7733,24 +7837,9 @@ function PlatformPage() {
           </p>
         ) : null}
       </div>
-
-      <div className="mt-6 grid gap-3 sm:grid-cols-4">
-        {[
-          ["Applications", report.isError ? "–" : report.data?.total_applications ?? 0],
-          ["Held by PortaGov", apps.isError ? "–" : held.length],
-          ["Released", apps.isError ? "–" : released.length],
-          ["Citizen profiles", report.isError ? "–" : report.data?.total_profiles ?? 0],
-        ].map(([label, value]) => (
-          <div key={label} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 text-center">
-            <p className="font-display text-3xl font-extrabold text-[var(--text)]">{value}</p>
-            <p className="mt-1 text-sm font-semibold text-[var(--dim)]">{label}</p>
-          </div>
-        ))}
-      </div>
-
       <div className="mt-8">
         <SectionTitle sub="Applications waiting on PortaGov. Release each one to its institution, or ask the citizen for more information first.">
-          Review queue: held by PortaGov ({apps.isError ? "–" : held.length}){" "}
+          Review queue: held by PortaGov ({apps.isError ? "-" : held.length}){" "}
           {!session ? <Chip tone="plain">Demo data</Chip> : null}
         </SectionTitle>
         <div className="space-y-3">
@@ -7777,10 +7866,9 @@ function PlatformPage() {
           )}
         </div>
       </div>
-
       <div className="mt-8">
         <SectionTitle sub="Every application on the platform, with its own release control. Recalling one removes it from the institution's desk until it is released again.">
-          All applications ({apps.isError ? "–" : all.length}){" "}
+          All applications ({apps.isError ? "-" : all.length}){" "}
           {!session ? <Chip tone="plain">Demo data</Chip> : null}
         </SectionTitle>
         <div className="space-y-3">
@@ -7802,8 +7890,85 @@ function PlatformPage() {
           )}
         </div>
       </div>
-
-      <div className="mt-8 grid gap-5 md:grid-cols-2">
+        </div>
+      ) : null}
+      {section === "institutions" ? (
+        <div className="mt-6 space-y-5">
+          <OnboardingApprovals />
+          <InstitutionPipelinePanel />
+        </div>
+      ) : null}
+      {section === "officers" ? (
+        <div className="mt-6 space-y-5">
+          <StaffPortalManager />
+          <StaffCatalogueSearch />
+          <ShiftBoard />
+          <AgentsPanel />
+        </div>
+      ) : null}
+      {section === "services" ? (
+        <ConsoleServicesPanel />
+      ) : null}
+      {section === "payments" ? (
+        <div className="mt-6 space-y-5">
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+          <h2 className="font-display text-lg font-bold text-[var(--text)]">
+            Payments across the platform
+          </h2>
+          <p className="mt-1 text-sm text-[var(--dim)]">
+            {report.isError
+              ? "Payment totals could not be loaded."
+              : `${countLabel(report.data?.total_payments ?? 0, "payment")} recorded, ${countLabel(report.data?.total_appointments ?? 0, "appointment")} booked.`}
+          </p>
+          <div className="mt-3 space-y-2">
+            {payments.isError ? (
+              <p role="alert" className="text-sm font-semibold text-[var(--warn)]">
+                The live payments could not be loaded. {liveErrorMessage}{" "}
+                <button type="button" className="underline" onClick={() => void payments.refetch()}>
+                  Try again
+                </button>
+              </p>
+            ) : (
+              <>
+                {(payments.data?.payments ?? []).slice(0, 8).map((p: PaymentT) => (
+                  <p key={p.id} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
+                    <strong>{p.method}</strong>, {p.application_ref}, ref{" "}
+                    {p.transaction_ref}, {p.status}, {fmtDate(p.created_at)}.
+                  </p>
+                ))}
+                {(payments.data?.payments ?? []).length === 0 ? (
+                  <p className="text-sm text-[var(--dim)]">No payments recorded yet.</p>
+                ) : null}
+              </>
+            )}
+          </div>
+          <div className="mt-4">
+            <GhostButton
+              onClick={() =>
+                downloadCsv("portagov-payments.csv", [
+                  ["Application", "Method", "Payer phone", "Transaction reference", "Status", "Recorded"],
+                  ...(payments.data?.payments ?? []).map((p: PaymentT) => [
+                    p.application_ref,
+                    p.method,
+                    p.payer_phone,
+                    p.transaction_ref,
+                    p.status,
+                    p.created_at,
+                  ]),
+                ])
+              }
+            >
+              Download payments CSV
+            </GhostButton>
+          </div>
+        </div>
+          <PaymentsDeskPanel />
+          <FraudPanel />
+          <ReconciliationPanel />
+        </div>
+      ) : null}
+      {section === "reports" ? (
+        <div className="mt-6 space-y-5">
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
           <h2 className="font-display text-lg font-bold text-[var(--text)]">Government report</h2>
           {report.isError ? (
@@ -7888,114 +8053,46 @@ function PlatformPage() {
             </GhostButton>
           </div>
         </div>
-
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
-          <h2 className="font-display text-lg font-bold text-[var(--text)]">
-            Payments across the platform
-          </h2>
-          <p className="mt-1 text-sm text-[var(--dim)]">
-            {report.isError
-              ? "Payment totals could not be loaded."
-              : `${countLabel(report.data?.total_payments ?? 0, "payment")} recorded, ${countLabel(report.data?.total_appointments ?? 0, "appointment")} booked.`}
-          </p>
-          <div className="mt-3 space-y-2">
-            {payments.isError ? (
-              <p role="alert" className="text-sm font-semibold text-[var(--warn)]">
-                The live payments could not be loaded. {liveErrorMessage}{" "}
-                <button type="button" className="underline" onClick={() => void payments.refetch()}>
-                  Try again
-                </button>
-              </p>
-            ) : (
-              <>
-                {(payments.data?.payments ?? []).slice(0, 8).map((p: PaymentT) => (
-                  <p key={p.id} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-                    <strong>{p.method}</strong>, {p.application_ref}, ref{" "}
-                    {p.transaction_ref}, {p.status}, {fmtDate(p.created_at)}.
-                  </p>
-                ))}
-                {(payments.data?.payments ?? []).length === 0 ? (
-                  <p className="text-sm text-[var(--dim)]">No payments recorded yet.</p>
-                ) : null}
-              </>
-            )}
-          </div>
-          <div className="mt-4">
-            <GhostButton
-              onClick={() =>
-                downloadCsv("portagov-payments.csv", [
-                  ["Application", "Method", "Payer phone", "Transaction reference", "Status", "Recorded"],
-                  ...(payments.data?.payments ?? []).map((p: PaymentT) => [
-                    p.application_ref,
-                    p.method,
-                    p.payer_phone,
-                    p.transaction_ref,
-                    p.status,
-                    p.created_at,
-                  ]),
-                ])
-              }
-            >
-              Download payments CSV
-            </GhostButton>
-          </div>
+          <GovReportsPanel />
+          <WeeklyReportPanel />
+          <TrustScoresPanel />
+          <SlowestAlertsPanel />
         </div>
-      </div>
-
-      <div className="mt-8 space-y-5">
-        <PlatformExtras />
-        <ChatInbox />
-      </div>
-
-      <details className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)]">
-        <summary className="cursor-pointer p-4 font-display font-bold text-[var(--text)]">
-          Staff, help desk, shifts, and the knowledge base
-        </summary>
-        <div className="space-y-5 border-t border-[var(--border)] p-4">
-          <StaffPortalManager />
-              <StaffCatalogueSearch />
+      ) : null}
+      {section === "helpdesk" ? (
+        <div className="mt-6 space-y-5">
           <HelpDeskPanel />
-          <ShiftBoard />
+          <ChatInbox />
+          <ComplaintsPanel />
+          <HelpInboxPanel />
+          <CallbacksPanel />
+          <ComplaintsLearningPanel canAdd />
           <KnowledgeBasePanel addedBy="Platform console" />
           <QualityPanel reviewer="Platform console" />
         </div>
-      </details>
-
-      <details className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)]">
-        <summary className="cursor-pointer p-4 font-display font-bold text-[var(--text)]">
-          Money safety, health, and the audit trail
-        </summary>
-        <div className="space-y-5 border-t border-[var(--border)] p-4">
+      ) : null}
+      {section === "mail" ? (
+        session?.role === "admin" ? (
+          <div className="mt-6">
+            <PlatformMailPanel applications={all} />
+          </div>
+        ) : (
+          <div className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+            <h2 className="font-display text-lg font-bold text-[var(--text)]">Mail</h2>
+            <p className="mt-1 text-sm text-[var(--dim)]">
+              The platform mailbox is for Super Admins. Sign in as a Super
+              Admin to read and send platform mail.
+            </p>
+          </div>
+        )
+      ) : null}
+      {section === "system" ? (
+        <div className="mt-6 space-y-5">
           <PlatformHealth />
-          <FraudPanel />
-          <ReconciliationPanel />
           <AuditPanel />
-        </div>
-      </details>
-
-      <div className="mt-6">
-        <FeatureTogglesPanel />
-      </div>
-
-      {session?.role === "admin" ? (
-        <div className="mt-6">
-          <PlatformMailPanel applications={all} />
+          <FeatureTogglesPanel />
         </div>
       ) : null}
-
-      <details className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)]">
-        <summary className="cursor-pointer p-4 font-display font-bold text-[var(--text)]">
-          Institutions joining, and reports for government
-        </summary>
-        <div className="space-y-5 border-t border-[var(--border)] p-4">
-          <OnboardingApprovals />
-          <InstitutionPipelinePanel />
-          <GovReportsPanel />
-          <MoneyPanel />
-          <SlowestAlertsPanel />
-          <ComplaintsLearningPanel canAdd />
-        </div>
-      </details>
       </div>
     </div>
   );
@@ -8129,8 +8226,8 @@ function HowPage() {
             <strong className="text-[var(--text)]">institution portal</strong>{" "}
             is where ministries and agencies receive released applications and
             process them. The{" "}
-            <strong className="text-[var(--text)]">platform portal</strong> is
-            the PortaGov council side: release decisions, oversight of every
+            <strong className="text-[var(--text)]">PortaGov Console</strong> is
+            the platform side: release decisions, oversight of every
             institution, and reports to government. All three read and write
             the same live records, so a change in one is visible in the others
             at once.
@@ -8319,6 +8416,10 @@ export function App() {
       : route.name === "reports"
         ? "platform"
         : "citizen";
+  /* The console header reads the same staff sign-in as the console
+     body, so the two never disagree about who is signed in. */
+  const [officerSession, , officerSignOut] = useOfficerSession();
+  const consoleSection = useConsoleSection();
 
   const flag = useFlags();
   const [prefs, setPrefs] = useState(() => {
@@ -8580,8 +8681,8 @@ export function App() {
       <header className="sticky top-0 z-40 border-b border-[var(--border)] bg-[var(--surface)] pt-safe">
         <div className="mx-auto flex min-w-0 max-w-6xl items-center justify-between gap-2 px-3 py-2 sm:gap-3 sm:px-4">
           <a
-            href="#/"
-            aria-label="PortaGov home"
+            href={portal === "platform" ? "#/reports" : "#/"}
+            aria-label={portal === "platform" ? "PortaGov Console home" : "PortaGov home"}
             className="flex min-w-0 shrink items-center gap-2 sm:gap-2.5"
           >
             <img src={logoBadge} alt="" className="h-9 w-9 shrink-0 sm:h-10 sm:w-10" />
@@ -8590,15 +8691,15 @@ export function App() {
                 portagov
               </span>
               <span className="mt-1 hidden text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--warn)] sm:block">
-                Citizens. Services. Connected.
+                {portal === "platform" ? "PortaGov Console" : "Citizens. Services. Connected."}
               </span>
             </span>
           </a>
-          {portal !== "citizen" ? (
+          {portal === "institution" ? (
             <div className="hidden items-center gap-1 md:flex">
               {portalLink("Citizen portal", "#/", false)}
-              {portalLink("Institution portal", "#/institution", portal === "institution")}
-              {portalLink("Platform portal", "#/reports", portal === "platform")}
+              {portalLink("Institution portal", "#/institution", true)}
+              {portalLink("PortaGov Console", "#/reports", false)}
             </div>
           ) : null}
           <div className="flex items-center gap-2">
@@ -8730,7 +8831,22 @@ export function App() {
                 </div>
               ) : null}
             </div>
-            {profile ? (
+            {portal === "platform" ? (
+              officerSession ? (
+                <div className="flex min-w-0 items-center gap-2">
+                  <p className="hidden min-w-0 truncate text-sm text-[var(--text)] sm:block">
+                    Signed in as <strong>{officerSession.name}</strong>, {staffRoleLabel(officerSession.role)}
+                  </p>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-3 py-2 text-sm font-semibold text-[var(--text)]"
+                    onClick={() => officerSignOut()}
+                  >
+                    Sign out
+                  </button>
+                </div>
+              ) : null
+            ) : profile ? (
               <div className="relative shrink-0" ref={avatarRef}>
                 <button
                   type="button"
@@ -8796,6 +8912,25 @@ export function App() {
             )}
           </div>
         </div>
+        {portal === "platform" ? (
+          <nav aria-label="Console" className="mx-auto flex max-w-6xl flex-wrap gap-1 px-4 pb-2 md:flex-nowrap md:overflow-x-auto">
+            {CONSOLE_SECTIONS.map((s) => (
+              <a
+                key={s.key}
+                href={s.href}
+                aria-current={consoleSection === s.key ? "page" : undefined}
+                className="whitespace-nowrap rounded-full px-3 py-1.5 text-sm font-semibold"
+                style={
+                  consoleSection === s.key
+                    ? { backgroundColor: "var(--gold-soft)", color: "var(--text)" }
+                    : { color: "var(--dim)" }
+                }
+              >
+                {s.label}
+              </a>
+            ))}
+          </nav>
+        ) : (
         <nav aria-label="Main" className="mx-auto flex max-w-6xl flex-wrap gap-1 px-4 pb-2 md:flex-nowrap md:overflow-x-auto">
           {(
             [
@@ -8829,6 +8964,7 @@ export function App() {
             </a>
           ))}
         </nav>
+        )}
       </header>
 
       {profile && securityAlert ? (
@@ -8856,7 +8992,11 @@ export function App() {
         {route.name !== "home" ? (
           <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-4 pt-3">
             <BackArrow />
-            <CloseX />
+            {portal === "platform" ? (
+              <CloseX onClick={() => nav("#/reports")} label="Close and go to the console dashboard" />
+            ) : (
+              <CloseX />
+            )}
           </div>
         ) : null}
         {body}
@@ -8915,19 +9055,33 @@ export function App() {
             </>
           ) : (
             <>
-              <div className="text-sm leading-relaxed text-white/80">
-                <p className="font-bold text-white">The portals</p>
-                <p className="mt-1">
-                  <a href="#/" className="underline">Citizen portal</a>: apply and
-                  track.
-                  <br />
-                  <a href="#/institution" className="underline">Institution portal</a>:
-                  ministries and agencies receive released applications.
-                  <br />
-                  <a href="#/reports" className="underline">Platform portal</a>: the
-                  PortaGov council, release decisions and government reports.
-                </p>
-              </div>
+              {portal === "platform" ? (
+                <div className="text-sm leading-relaxed text-white/80">
+                  <p className="font-bold text-white">PortaGov Console</p>
+                  <p className="mt-1">
+                    {CONSOLE_SECTIONS.map((s, i) => (
+                      <span key={s.key}>
+                        {i > 0 ? ", " : null}
+                        <a href={s.href} className="underline">{s.label}</a>
+                      </span>
+                    ))}
+                  </p>
+                </div>
+              ) : (
+                <div className="text-sm leading-relaxed text-white/80">
+                  <p className="font-bold text-white">The portals</p>
+                  <p className="mt-1">
+                    <a href="#/" className="underline">Citizen portal</a>: apply and
+                    track.
+                    <br />
+                    <a href="#/institution" className="underline">Institution portal</a>:
+                    ministries and agencies receive released applications.
+                    <br />
+                    <a href="#/reports" className="underline">PortaGov Console</a>: release
+                    decisions and government reports.
+                  </p>
+                </div>
+              )}
               <div className="text-sm leading-relaxed text-white/80">
                 <p className="font-bold text-white">For officers and staff</p>
                 <p className="mt-1">
@@ -8959,7 +9113,7 @@ export function App() {
       </footer>
 
       <nav
-        aria-label={portal === "citizen" ? "Citizen shortcuts" : "Portal switcher"}
+        aria-label={portal === "citizen" ? "Citizen shortcuts" : portal === "platform" ? "Console shortcuts" : "Portal switcher"}
         className="fixed inset-x-0 bottom-0 z-40 border-t border-[var(--border)] bg-[var(--surface)] pb-[env(safe-area-inset-bottom)] md:hidden"
       >
         {portal === "citizen" ? (
@@ -8989,13 +9143,38 @@ export function App() {
               </a>
             ))}
           </div>
+        ) : portal === "platform" ? (
+          <div className="grid grid-cols-4">
+            {(
+              [
+                ["Dashboard", "#/reports", consoleSection === "dashboard"],
+                ["Queues", "#/reports/queues", consoleSection === "queues"],
+                ["Payments", "#/reports/payments", consoleSection === "payments"],
+                ["Help desk", "#/reports/helpdesk", consoleSection === "helpdesk"],
+              ] as const
+            ).map(([label, href, active]) => (
+              <a
+                key={href}
+                href={href}
+                aria-current={active ? "page" : undefined}
+                className="py-3 text-center text-sm font-bold"
+                style={
+                  active
+                    ? { color: "var(--accent)", borderTop: "3px solid #d9a821" }
+                    : { color: "var(--dim)", borderTop: "3px solid transparent" }
+                }
+              >
+                {label}
+              </a>
+            ))}
+          </div>
         ) : (
           <div className="grid grid-cols-3">
             {(
               [
                 ["Citizen", "#/", false],
                 ["Institution", "#/institution", portal === "institution"],
-                ["Platform", "#/reports", portal === "platform"],
+                ["Platform", "#/reports", false],
               ] as const
             ).map(([label, href, active]) => (
               <a
@@ -10795,41 +10974,17 @@ function QueuesPage({ profile }: { profile: ProfileT | null }) {
 
 /* ---------- platform extras: payments desk, complaints, help inbox, agents, trust, weekly reports ---------- */
 
-function PlatformExtras() {
+/* ---------- console panels, split from the old combined extras ----------
+   Each panel below is one piece of the old combined extras: same live
+   queries, same actions, only the grouping changed, so the console
+   sections can show one piece at a time. */
+
+function PaymentsDeskPanel() {
   const queryClient = useQueryClient();
   const payments = useQuery({
     queryKey: ["payments"],
     queryFn: () => api.listPayments({ limit: 100 }),
   });
-  const complaints = useQuery({
-    queryKey: ["complaints"],
-    queryFn: () => api.listComplaints({ limit: 50 }),
-  });
-  const help = useQuery({
-    queryKey: ["help-requests"],
-    queryFn: () => api.listHelpRequests({ limit: 50 }),
-  });
-  const callbacks = useQuery({
-    queryKey: ["callbacks"],
-    queryFn: () => api.listCallbacks({}),
-  });
-  const trust = useQuery({
-    queryKey: ["trust"],
-    queryFn: () => api.getTrustScores({}),
-  });
-  const weekly = useQuery({
-    queryKey: ["weekly"],
-    queryFn: () => api.getWeeklyReport({}),
-  });
-  const snapshots = useQuery({
-    queryKey: ["snapshots"],
-    queryFn: () => api.listReportSnapshots({ limit: 12 }),
-  });
-  const agents = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => api.listAgents({}),
-  });
-
   const payStatus = useMutation({
     mutationFn: async (args: { paymentId: number; status: "Confirmed" | "Refunded" }) =>
       await api.updatePaymentStatus(args),
@@ -10839,11 +10994,138 @@ function PlatformExtras() {
       void queryClient.invalidateQueries({ queryKey: ["applications"] });
     },
   });
+  const toConfirm = (payments.data?.payments ?? []).filter(
+    (p: PaymentT) => p.status === "Recorded",
+  );
+  const refundQueue = (payments.data?.payments ?? []).filter(
+    (p: PaymentT) => p.status === "Refund requested",
+  );
+  return (
+    <div>
+      <SectionTitle sub="Confirming a payment marks its billing number paid, sends the citizen the payment-received confirmation, and releases the application when automatic release is on. Refunds complete the refund path the citizen started.">
+        Payments desk: confirm and refund
+      </SectionTitle>
+      <div className="space-y-3">
+        {toConfirm.length === 0 && refundQueue.length === 0 ? (
+          <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
+            No payments waiting for confirmation and no refunds requested.
+          </p>
+        ) : null}
+        {toConfirm.map((p: PaymentT) => (
+          <div key={p.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <p className="text-sm text-[var(--text)]">
+              <strong>{p.method}</strong>, ${p.amount}, application{" "}
+              {p.application_ref}, transaction {p.transaction_ref}, from{" "}
+              {p.payer_phone}, {fmtDate(p.created_at)}
+            </p>
+            <PrimaryButton
+              onClick={() => payStatus.mutate({ paymentId: p.id, status: "Confirmed" })}
+              disabled={payStatus.isPending}
+            >
+              Confirm payment received
+            </PrimaryButton>
+          </div>
+        ))}
+        {refundQueue.map((p: PaymentT) => (
+          <div key={p.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <p className="text-sm text-[var(--text)]">
+              <strong>Refund requested:</strong> {p.method}, ${p.amount},
+              application {p.application_ref}. Reason: {p.refund_reason}
+            </p>
+            <GhostButton
+              onClick={() => payStatus.mutate({ paymentId: p.id, status: "Refunded" })}
+              disabled={payStatus.isPending}
+            >
+              Mark refund paid back
+            </GhostButton>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ComplaintsPanel() {
+  const queryClient = useQueryClient();
+  const complaints = useQuery({
+    queryKey: ["complaints"],
+    queryFn: () => api.listComplaints({ limit: 50 }),
+  });
   const [complaintReplies, setComplaintReplies] = useState<Record<number, string>>({});
   const resolve = useMutation({
     mutationFn: async (args: { id: number; status: "Under review by PortaGov" | "Resolved"; reply: string }) =>
       await api.resolveComplaint(args),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["complaints"] }),
+  });
+  return (
+    <div>
+      <SectionTitle sub="Appeals and complaints come to PortaGov, not only to the institution. Answer here and the citizen sees it on their application.">
+        Complaints and appeals ({(complaints.data?.complaints ?? []).length})
+      </SectionTitle>
+      <div className="space-y-3">
+        {(complaints.data?.complaints ?? []).map((c) => (
+          <div key={c.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <p className="text-sm text-[var(--text)]">
+              <strong>{c.kind}</strong> on {c.application_ref}, {c.status},{" "}
+              {fmtDate(c.created_at)}
+            </p>
+            <p className="mt-1 text-sm text-[var(--dim)]">{c.reason}</p>
+            {c.reply ? (
+              <p className="mt-1 text-sm text-[var(--dim)]">
+                <strong className="text-[var(--text)]">PortaGov replied:</strong> {c.reply}
+              </p>
+            ) : null}
+            <div className="mt-2 flex flex-wrap gap-2">
+              <input
+                aria-label={`Reply to complaint ${c.id}`}
+                {...FIELDS.resolveComplaint.reply}
+                className={`${inputCls} max-w-md flex-1`}
+                value={complaintReplies[c.id] ?? ""}
+                onChange={(e) =>
+                  setComplaintReplies((r) => ({ ...r, [c.id]: e.target.value }))
+                }
+                placeholder="PortaGov's answer to the citizen"
+              />
+              <GhostButton
+                onClick={() =>
+                  resolve.mutate({
+                    id: c.id,
+                    status: "Under review by PortaGov",
+                    reply: complaintReplies[c.id] ?? c.reply,
+                  })
+                }
+              >
+                Mark under review
+              </GhostButton>
+              <PrimaryButton
+                onClick={() =>
+                  resolve.mutate({
+                    id: c.id,
+                    status: "Resolved",
+                    reply: complaintReplies[c.id] ?? c.reply,
+                  })
+                }
+              >
+                Resolve with this answer
+              </PrimaryButton>
+            </div>
+          </div>
+        ))}
+        {(complaints.data?.complaints ?? []).length === 0 ? (
+          <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
+            No complaints or appeals yet.
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function HelpInboxPanel() {
+  const queryClient = useQueryClient();
+  const help = useQuery({
+    queryKey: ["help-requests"],
+    queryFn: () => api.listHelpRequests({ limit: 50 }),
   });
   const [helpReplies, setHelpReplies] = useState<Record<number, string>>({});
   const replyHelp = useMutation({
@@ -10851,9 +11133,139 @@ function PlatformExtras() {
       await api.replyHelpRequest(args),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["help-requests"] }),
   });
+  return (
+    <div>
+      <SectionTitle sub="Questions from the Help page. A real person answers; the citizen sees the answer on the Help page.">
+        Ask us anything inbox
+      </SectionTitle>
+      <div className="space-y-3">
+        {(help.data?.requests ?? []).map((r) => (
+          <div key={r.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <p className="text-sm font-bold text-[var(--text)]">
+              {r.name}, {r.phone}, {r.topic}, {r.status}
+            </p>
+            <p className="mt-1 text-sm text-[var(--dim)]">{r.message}</p>
+            {r.reply ? (
+              <p className="mt-1 text-sm text-[var(--dim)]">
+                <strong className="text-[var(--text)]">Answered:</strong> {r.reply}
+              </p>
+            ) : (
+              <div className="mt-2 flex gap-2">
+                <input
+                  aria-label={`Reply to ${r.name}`}
+                  {...FIELDS.replyHelpRequest.reply}
+                  className={`${inputCls} flex-1`}
+                  value={helpReplies[r.id] ?? ""}
+                  onChange={(e) =>
+                    setHelpReplies((x) => ({ ...x, [r.id]: e.target.value }))
+                  }
+                  placeholder="Your answer, in simple words"
+                />
+                <PrimaryButton
+                  onClick={() =>
+                    replyHelp.mutate({ id: r.id, reply: helpReplies[r.id] ?? "" })
+                  }
+                  disabled={replyHelp.isPending}
+                >
+                  Answer
+                </PrimaryButton>
+              </div>
+            )}
+          </div>
+        ))}
+        {(help.data?.requests ?? []).length === 0 ? (
+          <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
+            No questions waiting.
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function CallbacksPanel() {
+  const queryClient = useQueryClient();
+  const callbacks = useQuery({
+    queryKey: ["callbacks"],
+    queryFn: () => api.listCallbacks({}),
+  });
   const cbDone = useMutation({
     mutationFn: async (id: number) => await api.markCallbackDone({ id }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["callbacks"] }),
+  });
+  return (
+    <div>
+      <SectionTitle sub="Citizens who asked the help team to call them.">
+        Call-back requests
+      </SectionTitle>
+      <div className="space-y-3">
+        {(callbacks.data?.callbacks ?? []).map((cb) => (
+          <div key={cb.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <p className="text-sm text-[var(--text)]">
+              <strong>{cb.name}</strong>, {cb.phone}, {cb.topic}. {cb.status}
+            </p>
+            {cb.status === "Waiting" ? (
+              <GhostButton onClick={() => cbDone.mutate(cb.id)}>
+                Mark called back
+              </GhostButton>
+            ) : null}
+          </div>
+        ))}
+        {(callbacks.data?.callbacks ?? []).length === 0 ? (
+          <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
+            No call-backs waiting.
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function TrustScoresPanel() {
+  const trust = useQuery({
+    queryKey: ["trust"],
+    queryFn: () => api.getTrustScores({}),
+  });
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-lg font-bold text-[var(--text)]">
+        Institution trust scores
+      </h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        From citizen ratings of speed and clarity, slowest first, so the
+        platform can see slow ministries early.
+      </p>
+      <div className="mt-3 space-y-2">
+        {(trust.data?.scores ?? []).map((s) => (
+          <p key={s.institution} className="flex justify-between gap-3 rounded-lg bg-[var(--surface-alt)] p-3 text-sm">
+            <span className="text-[var(--text)]">
+              <strong>{s.institution}</strong>, {s.ratings_count} ratings
+            </span>
+            <strong style={{ color: s.score < 60 ? "#92580a" : "#0a2a5e" }}>
+              {s.score}/100
+            </strong>
+          </p>
+        ))}
+        {(trust.data?.scores ?? []).length === 0 ? (
+          <p className="text-sm text-[var(--dim)]">
+            No ratings yet. Scores appear when citizens rate completed
+            applications.
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function WeeklyReportPanel() {
+  const queryClient = useQueryClient();
+  const weekly = useQuery({
+    queryKey: ["weekly"],
+    queryFn: () => api.getWeeklyReport({}),
+  });
+  const snapshots = useQuery({
+    queryKey: ["snapshots"],
+    queryFn: () => api.listReportSnapshots({ limit: 12 }),
   });
   const genWeekly = useMutation({
     mutationFn: async () => await api.generateWeeklyReport({}),
@@ -10861,6 +11273,52 @@ function PlatformExtras() {
       void queryClient.invalidateQueries({ queryKey: ["snapshots"] });
       void queryClient.invalidateQueries({ queryKey: ["weekly"] });
     },
+  });
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-lg font-bold text-[var(--text)]">
+        Weekly government report, per ministry
+      </h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        A fresh snapshot is generated automatically every week, and can be
+        generated by hand here. Counts and average processing time per
+        ministry.
+      </p>
+      <div className="mt-3 space-y-2">
+        {(weekly.data?.rows ?? []).map((r) => (
+          <p key={r.institution} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
+            <strong>{r.institution}:</strong> {r.submitted_week} new this
+            week, {r.completed_week} completed this week, {r.total} total,{" "}
+            {r.avg_hours != null
+              ? `average ${countLabel(r.avg_hours, "hour")} to complete`
+              : "no completions yet to time"}
+            .
+          </p>
+        ))}
+        {(weekly.data?.rows ?? []).length === 0 ? (
+          <p className="text-sm text-[var(--dim)]">No applications yet this week.</p>
+        ) : null}
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <PrimaryButton onClick={() => genWeekly.mutate()} disabled={genWeekly.isPending}>
+          {genWeekly.isPending ? "Generating..." : "Generate this week's snapshot now"}
+        </PrimaryButton>
+        <p className="text-sm text-[var(--dim)]">
+          {(snapshots.data?.snapshots ?? []).length} snapshots stored.
+          {(snapshots.data?.snapshots ?? [])[0]
+            ? ` Latest: ${(snapshots.data?.snapshots ?? [])[0]?.period_label}.`
+            : ""}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function AgentsPanel() {
+  const queryClient = useQueryClient();
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api.listAgents({}),
   });
   const [agentName, setAgentName] = useState("");
   const [agentCounty, setAgentCounty] = useState("Montserrado");
@@ -10886,319 +11344,139 @@ function PlatformExtras() {
       await api.setAgentActive(args),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["agents"] }),
   });
-
-  const toConfirm = (payments.data?.payments ?? []).filter(
-    (p: PaymentT) => p.status === "Recorded",
-  );
-  const refundQueue = (payments.data?.payments ?? []).filter(
-    (p: PaymentT) => p.status === "Refund requested",
-  );
-
   return (
-    <div className="mt-10 space-y-8">
-      <div>
-        <SectionTitle sub="Confirming a payment marks its billing number paid, sends the citizen the payment-received confirmation, and releases the application when automatic release is on. Refunds complete the refund path the citizen started.">
-          Payments desk: confirm and refund
-        </SectionTitle>
-        <div className="space-y-3">
-          {toConfirm.length === 0 && refundQueue.length === 0 ? (
-            <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
-              No payments waiting for confirmation and no refunds requested.
-            </p>
-          ) : null}
-          {toConfirm.map((p: PaymentT) => (
-            <div key={p.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-              <p className="text-sm text-[var(--text)]">
-                <strong>{p.method}</strong>, ${p.amount}, application{" "}
-                {p.application_ref}, transaction {p.transaction_ref}, from{" "}
-                {p.payer_phone}, {fmtDate(p.created_at)}
-              </p>
-              <PrimaryButton
-                onClick={() => payStatus.mutate({ paymentId: p.id, status: "Confirmed" })}
-                disabled={payStatus.isPending}
-              >
-                Confirm payment received
-              </PrimaryButton>
-            </div>
-          ))}
-          {refundQueue.map((p: PaymentT) => (
-            <div key={p.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-              <p className="text-sm text-[var(--text)]">
-                <strong>Refund requested:</strong> {p.method}, ${p.amount},
-                application {p.application_ref}. Reason: {p.refund_reason}
-              </p>
-              <GhostButton
-                onClick={() => payStatus.mutate({ paymentId: p.id, status: "Refunded" })}
-                disabled={payStatus.isPending}
-              >
-                Mark refund paid back
-              </GhostButton>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div>
-        <SectionTitle sub="Appeals and complaints come to PortaGov, not only to the institution. Answer here and the citizen sees it on their application.">
-          Complaints and appeals ({(complaints.data?.complaints ?? []).length})
-        </SectionTitle>
-        <div className="space-y-3">
-          {(complaints.data?.complaints ?? []).map((c) => (
-            <div key={c.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-              <p className="text-sm text-[var(--text)]">
-                <strong>{c.kind}</strong> on {c.application_ref}, {c.status},{" "}
-                {fmtDate(c.created_at)}
-              </p>
-              <p className="mt-1 text-sm text-[var(--dim)]">{c.reason}</p>
-              {c.reply ? (
-                <p className="mt-1 text-sm text-[var(--dim)]">
-                  <strong className="text-[var(--text)]">PortaGov replied:</strong> {c.reply}
-                </p>
-              ) : null}
-              <div className="mt-2 flex flex-wrap gap-2">
-                <input
-                  aria-label={`Reply to complaint ${c.id}`}
-                  {...FIELDS.resolveComplaint.reply}
-                  className={`${inputCls} max-w-md flex-1`}
-                  value={complaintReplies[c.id] ?? ""}
-                  onChange={(e) =>
-                    setComplaintReplies((r) => ({ ...r, [c.id]: e.target.value }))
-                  }
-                  placeholder="PortaGov's answer to the citizen"
-                />
-                <GhostButton
-                  onClick={() =>
-                    resolve.mutate({
-                      id: c.id,
-                      status: "Under review by PortaGov",
-                      reply: complaintReplies[c.id] ?? c.reply,
-                    })
-                  }
-                >
-                  Mark under review
-                </GhostButton>
-                <PrimaryButton
-                  onClick={() =>
-                    resolve.mutate({
-                      id: c.id,
-                      status: "Resolved",
-                      reply: complaintReplies[c.id] ?? c.reply,
-                    })
-                  }
-                >
-                  Resolve with this answer
-                </PrimaryButton>
-              </div>
-            </div>
-          ))}
-          {(complaints.data?.complaints ?? []).length === 0 ? (
-            <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
-              No complaints or appeals yet.
-            </p>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="grid gap-5 md:grid-cols-2">
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-lg font-bold text-[var(--text)]">
+        Agent network management
+      </h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        Registered agents appear in the public county directory and are
+        named on the applications they help with.
+      </p>
+      <form
+        className="mt-3 grid gap-3 sm:grid-cols-4 sm:items-end"
+        onSubmit={(e: FormEvent) => {
+          e.preventDefault();
+          addAgent.mutate();
+        }}
+      >
         <div>
-          <SectionTitle sub="Questions from the Help page. A real person answers; the citizen sees the answer on the Help page.">
-            Ask us anything inbox
-          </SectionTitle>
-          <div className="space-y-3">
-            {(help.data?.requests ?? []).map((r) => (
-              <div key={r.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-                <p className="text-sm font-bold text-[var(--text)]">
-                  {r.name}, {r.phone}, {r.topic}, {r.status}
-                </p>
-                <p className="mt-1 text-sm text-[var(--dim)]">{r.message}</p>
-                {r.reply ? (
-                  <p className="mt-1 text-sm text-[var(--dim)]">
-                    <strong className="text-[var(--text)]">Answered:</strong> {r.reply}
-                  </p>
-                ) : (
-                  <div className="mt-2 flex gap-2">
-                    <input
-                      aria-label={`Reply to ${r.name}`}
-                      {...FIELDS.replyHelpRequest.reply}
-                      className={`${inputCls} flex-1`}
-                      value={helpReplies[r.id] ?? ""}
-                      onChange={(e) =>
-                        setHelpReplies((x) => ({ ...x, [r.id]: e.target.value }))
-                      }
-                      placeholder="Your answer, in simple words"
-                    />
-                    <PrimaryButton
-                      onClick={() =>
-                        replyHelp.mutate({ id: r.id, reply: helpReplies[r.id] ?? "" })
-                      }
-                      disabled={replyHelp.isPending}
-                    >
-                      Answer
-                    </PrimaryButton>
-                  </div>
-                )}
-              </div>
-            ))}
-            {(help.data?.requests ?? []).length === 0 ? (
-              <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
-                No questions waiting.
-              </p>
-            ) : null}
-          </div>
+          <FieldLabel htmlFor="ag-name">Agent's full name</FieldLabel>
+          <input id="ag-name" {...FIELDS.addAgent.fullName} className={inputCls} value={agentName}
+            onChange={(e) => setAgentName(e.target.value)} />
         </div>
         <div>
-          <SectionTitle sub="Citizens who asked the help team to call them.">
-            Call-back requests
-          </SectionTitle>
-          <div className="space-y-3">
-            {(callbacks.data?.callbacks ?? []).map((cb) => (
-              <div key={cb.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
-                <p className="text-sm text-[var(--text)]">
-                  <strong>{cb.name}</strong>, {cb.phone}, {cb.topic}. {cb.status}
-                </p>
-                {cb.status === "Waiting" ? (
-                  <GhostButton onClick={() => cbDone.mutate(cb.id)}>
-                    Mark called back
-                  </GhostButton>
-                ) : null}
-              </div>
+          <FieldLabel htmlFor="ag-county">County</FieldLabel>
+          <select id="ag-county" {...FIELDS.addAgent.county} className={inputCls} value={agentCounty}
+            onChange={(e) => setAgentCounty(e.target.value)}>
+            {COUNTIES.map((c) => (
+              <option key={c} value={c}>{c}</option>
             ))}
-            {(callbacks.data?.callbacks ?? []).length === 0 ? (
-              <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
-                No call-backs waiting.
-              </p>
-            ) : null}
-          </div>
+          </select>
         </div>
-      </div>
-
-      <div className="grid gap-5 md:grid-cols-2">
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
-          <h2 className="font-display text-lg font-bold text-[var(--text)]">
-            Institution trust scores
-          </h2>
-          <p className="mt-1 text-sm text-[var(--dim)]">
-            From citizen ratings of speed and clarity, slowest first, so the
-            platform can see slow ministries early.
-          </p>
-          <div className="mt-3 space-y-2">
-            {(trust.data?.scores ?? []).map((s) => (
-              <p key={s.institution} className="flex justify-between gap-3 rounded-lg bg-[var(--surface-alt)] p-3 text-sm">
-                <span className="text-[var(--text)]">
-                  <strong>{s.institution}</strong>, {s.ratings_count} ratings
-                </span>
-                <strong style={{ color: s.score < 60 ? "#92580a" : "#0a2a5e" }}>
-                  {s.score}/100
-                </strong>
-              </p>
-            ))}
-            {(trust.data?.scores ?? []).length === 0 ? (
-              <p className="text-sm text-[var(--dim)]">
-                No ratings yet. Scores appear when citizens rate completed
-                applications.
-              </p>
-            ) : null}
-          </div>
+        <div>
+          <FieldLabel htmlFor="ag-phone">Agent's phone</FieldLabel>
+          <input id="ag-phone" {...FIELDS.addAgent.phone} className={inputCls} value={agentPhone}
+            onChange={(e) => setAgentPhone(e.target.value)} />
         </div>
-
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
-          <h2 className="font-display text-lg font-bold text-[var(--text)]">
-            Weekly government report, per ministry
-          </h2>
-          <p className="mt-1 text-sm text-[var(--dim)]">
-            A fresh snapshot is generated automatically every week, and can be
-            generated by hand here. Counts and average processing time per
-            ministry.
-          </p>
-          <div className="mt-3 space-y-2">
-            {(weekly.data?.rows ?? []).map((r) => (
-              <p key={r.institution} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-                <strong>{r.institution}:</strong> {r.submitted_week} new this
-                week, {r.completed_week} completed this week, {r.total} total,{" "}
-                {r.avg_hours != null
-                  ? `average ${countLabel(r.avg_hours, "hour")} to complete`
-                  : "no completions yet to time"}
-                .
-              </p>
-            ))}
-            {(weekly.data?.rows ?? []).length === 0 ? (
-              <p className="text-sm text-[var(--dim)]">No applications yet this week.</p>
-            ) : null}
-          </div>
-          <div className="mt-3 flex flex-wrap items-center gap-3">
-            <PrimaryButton onClick={() => genWeekly.mutate()} disabled={genWeekly.isPending}>
-              {genWeekly.isPending ? "Generating..." : "Generate this week's snapshot now"}
-            </PrimaryButton>
-            <p className="text-sm text-[var(--dim)]">
-              {(snapshots.data?.snapshots ?? []).length} snapshots stored.
-              {(snapshots.data?.snapshots ?? [])[0]
-                ? ` Latest: ${(snapshots.data?.snapshots ?? [])[0]?.period_label}.`
-                : ""}
+        <div>
+          <FieldLabel htmlFor="ag-centre">Service centre</FieldLabel>
+          <input id="ag-centre" {...FIELDS.addAgent.serviceCentre} className={inputCls} value={agentCentre}
+            onChange={(e) => setAgentCentre(e.target.value)} />
+        </div>
+        <PrimaryButton type="submit" disabled={addAgent.isPending}>
+          Register agent
+        </PrimaryButton>
+      </form>
+      <div className="mt-3 space-y-2">
+        {(agents.data?.agents ?? []).map((a: AgentT) => (
+          <div key={a.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--surface-alt)] p-3 text-sm">
+            <p className="text-[var(--text)]">
+              <strong>{a.full_name}</strong>, {a.county} County, {a.phone}
+              {a.service_centre ? `, ${a.service_centre}` : ""}.{" "}
+              {a.active ? "Active" : "Inactive"}
             </p>
+            <GhostButton
+              onClick={() => setAgent.mutate({ id: a.id, active: !a.active })}
+            >
+              {a.active ? "Deactivate" : "Activate"}
+            </GhostButton>
           </div>
-        </div>
+        ))}
       </div>
+    </div>
+  );
+}
 
+/* ---------- console services and fees ----------
+   No platform-wide fee editor exists, so this section shows the real
+   catalogue fees per service, and the real per-institution editor for
+   the institution picked below. */
+
+function ConsoleServicesPanel() {
+  const [ministryId, setMinistryId] = useState(MINISTRIES[0]?.id ?? "");
+  const ministry = MINISTRIES.find((m) => m.id === ministryId);
+  return (
+    <div className="mt-6 space-y-5">
+      <SectionTitle sub="Every service, its catalogue fee, and its promised time. An institution can set its own fee and time in its own portal, and that replaces the catalogue fee for its citizens.">
+        Services and fees
+      </SectionTitle>
       <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
         <h2 className="font-display text-lg font-bold text-[var(--text)]">
-          Agent network management
+          Set a fee and time
         </h2>
         <p className="mt-1 text-sm text-[var(--dim)]">
-          Registered agents appear in the public county directory and are
-          named on the applications they help with.
+          Pick an institution to set its fee and time for each of its
+          services. The change applies to that institution only.
         </p>
-        <form
-          className="mt-3 grid gap-3 sm:grid-cols-4 sm:items-end"
-          onSubmit={(e: FormEvent) => {
-            e.preventDefault();
-            addAgent.mutate();
-          }}
-        >
-          <div>
-            <FieldLabel htmlFor="ag-name">Agent's full name</FieldLabel>
-            <input id="ag-name" {...FIELDS.addAgent.fullName} className={inputCls} value={agentName}
-              onChange={(e) => setAgentName(e.target.value)} />
-          </div>
-          <div>
-            <FieldLabel htmlFor="ag-county">County</FieldLabel>
-            <select id="ag-county" {...FIELDS.addAgent.county} className={inputCls} value={agentCounty}
-              onChange={(e) => setAgentCounty(e.target.value)}>
-              {COUNTIES.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <FieldLabel htmlFor="ag-phone">Agent's phone</FieldLabel>
-            <input id="ag-phone" {...FIELDS.addAgent.phone} className={inputCls} value={agentPhone}
-              onChange={(e) => setAgentPhone(e.target.value)} />
-          </div>
-          <div>
-            <FieldLabel htmlFor="ag-centre">Service centre</FieldLabel>
-            <input id="ag-centre" {...FIELDS.addAgent.serviceCentre} className={inputCls} value={agentCentre}
-              onChange={(e) => setAgentCentre(e.target.value)} />
-          </div>
-          <PrimaryButton type="submit" disabled={addAgent.isPending}>
-            Register agent
-          </PrimaryButton>
-        </form>
-        <div className="mt-3 space-y-2">
-          {(agents.data?.agents ?? []).map((a: AgentT) => (
-            <div key={a.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--surface-alt)] p-3 text-sm">
-              <p className="text-[var(--text)]">
-                <strong>{a.full_name}</strong>, {a.county} County, {a.phone}
-                {a.service_centre ? `, ${a.service_centre}` : ""}.{" "}
-                {a.active ? "Active" : "Inactive"}
-              </p>
-              <GhostButton
-                onClick={() => setAgent.mutate({ id: a.id, active: !a.active })}
-              >
-                {a.active ? "Deactivate" : "Activate"}
-              </GhostButton>
-            </div>
-          ))}
+        <div className="mt-3 max-w-md">
+          <FieldLabel htmlFor="console-service-ministry">Institution</FieldLabel>
+          <select
+            id="console-service-ministry"
+            className={inputCls}
+            value={ministryId}
+            onChange={(e) => setMinistryId(e.target.value)}
+          >
+            {MINISTRIES.map((m) => (
+              <option key={m.id} value={m.id}>{m.name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="mt-4">
+          {ministry ? <InstitutionServicesEditor institution={ministry.name} /> : null}
         </div>
       </div>
+      <div className="space-y-3">
+        {MINISTRIES.map((m) => {
+          const services = servicesForMinistry(m.id);
+          if (services.length === 0) return null;
+          return (
+            <details key={m.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)]">
+              <summary className="cursor-pointer p-4 font-display font-bold text-[var(--text)]">
+                {m.name}: {countLabel(services.length, "service")}
+              </summary>
+              <ul className="space-y-1 border-t border-[var(--border)] p-4 text-sm">
+                {services.map((s) => {
+                  const d = serviceDetails(s.id);
+                  return (
+                    <li key={s.id} className="flex flex-wrap justify-between gap-3 rounded-lg bg-[var(--surface-alt)] p-3">
+                      <span className="font-bold text-[var(--text)]">{s.name}</span>
+                      <span className="text-[var(--dim)]">
+                        Catalogue fee ${d.feeUsd}, {d.processingTime}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </details>
+          );
+        })}
+      </div>
+      <p className="text-sm text-[var(--dim)]">
+        There is no platform-wide fee editor: each institution sets its own
+        fee and time in its portal, above. The catalogue fees here are the
+        starting point.
+      </p>
     </div>
   );
 }
@@ -16274,7 +16552,7 @@ function InstitutionPortalPage({ ministryId, profile }: { ministryId: string; pr
       <div className="mx-auto max-w-6xl px-4 py-6">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl p-3 text-sm text-white" style={{ backgroundColor: "#0a2a5e" }}>
           <p>
-            Signed in as <strong>{session.name}</strong>, {session.role}. You
+            Signed in as <strong>{session.name}</strong>, {staffRoleLabel(session.role)}. You
             only see applications PortaGov has released to {ministry.name}.
           </p>
           <button
@@ -18017,7 +18295,7 @@ function StaffPortalPage() {
         return;
       }
       if (!r.need_code) {
-        setError("No active staff account matches that name, phone, and password. Staff accounts are created in the platform portal, with a password set there. Five wrong passwords lock the account for 15 minutes.");
+        setError("No active staff account matches that name, phone, and password. Staff accounts are created in the PortaGov Console, with a password set there. Five wrong passwords lock the account for 15 minutes.");
         return;
       }
       setStaffId(r.staff_id);
@@ -18069,7 +18347,7 @@ function StaffPortalPage() {
       {!session ? (
         <div className="mt-5 max-w-xl rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
           <p className="text-sm text-[var(--dim)]">
-            Staff accounts are created by the platform portal, with a role,
+            Staff accounts are created by the PortaGov Console, with a role,
             permissions, and a password. Sign-in has two steps: your
             password, then a one-time code. Your name appears on the work
             you do, in the audit trail.
@@ -18153,7 +18431,7 @@ function StaffPortalPage() {
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl p-5 text-white" style={{ backgroundColor: "#0a2a5e" }}>
             <div>
               <p className="font-display text-lg font-bold">
-                {session.role}
+                {staffRoleLabel(session.role)}
                 {session.scope ? `, scope: ${session.scope}` : ""}
               </p>
               <p className="text-sm text-white/85">{ROLE_PERMISSIONS[session.role] ?? ""}</p>
@@ -18201,7 +18479,7 @@ function StaffPortalPage() {
           {!canHelp && !canRelease && !canPay && !canSuper ? (
             <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
               Your role has no queues yet. Ask a platform admin to check
-              your role in the platform portal.
+              your role in the PortaGov Console.
             </p>
           ) : null}
         </div>
