@@ -572,6 +572,14 @@ function getStaffToken(): string {
   return storeGet(STAFF_TOKEN_KEY) || "";
 }
 
+/** Admin mail calls have no local fallback: without a staff
+    session there is nothing to show, so throw plainly. */
+function requireStaffToken(): void {
+  if (!getStaffToken()) {
+    throw new Error("Sign in as an admin to use email.");
+  }
+}
+
 function setStaffToken(token: string): void {
   if (token) storeSet(STAFF_TOKEN_KEY, token);
   else storeRemove(STAFF_TOKEN_KEY);
@@ -2382,5 +2390,188 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       if (isAuthError(e) || (e?.status >= 400 && e?.status < 500)) throw e;
       return (Actions as any).addStaff(args);
     }
+  },
+
+  /* ---------- platform console email: /api/admin/mail ----------
+     Admin-only. There is no local mail store, so every call here
+     throws when it fails (including when the backend has not
+     deployed the endpoint yet): the console shows a plain error
+     with a retry, never invented mail. */
+  async getMailStatus(_args: any) {
+    requireStaffToken();
+    const res = await staffApiCall("/api/admin/mail/status", {});
+    return {
+      imap_configured: Boolean(res?.imap_configured),
+      smtp_configured: Boolean(res?.smtp_configured),
+      last_run_at: res?.last_run_at ? String(res.last_run_at) : null,
+    };
+  },
+
+  async listMailInbox(_args: any) {
+    requireStaffToken();
+    const res = await staffApiCall("/api/admin/mail/inbox", {});
+    const items = staffRows(res, "items").map((r: any, i: number) => ({
+      id: String(r.id ?? i + 1),
+      from: String(r.from || r.sender || ""),
+      subject: String(r.subject || "(No subject)"),
+      snippet: String(r.snippet || r.body || ""),
+      body: String(r.body || r.snippet || ""),
+      received_at: String(r.received_at || r.created_at || ""),
+      read: Boolean(r.read),
+      application_ref: String(r.application_ref || r.reference || ""),
+    }));
+    return {
+      configured: res?.configured !== false,
+      message: String(res?.message || ""),
+      items,
+    };
+  },
+
+  async markMailRead(args: any) {
+    requireStaffToken();
+    await staffApiCall(`/api/admin/mail/inbox/${encodeURIComponent(String(args.id))}/read`, {
+      method: "POST",
+      body: {},
+    });
+    return { ok: true };
+  },
+
+  async listMailSent(_args: any) {
+    requireStaffToken();
+    const res = await staffApiCall("/api/admin/mail/sent", {});
+    const items = staffRows(res, "items").map((r: any, i: number) => ({
+      id: String(r.id ?? i + 1),
+      to: String(r.to || r.recipient || ""),
+      subject: String(r.subject || "(No subject)"),
+      created_at: String(r.created_at || r.sent_at || ""),
+      source: String(r.source || "manual"),
+    }));
+    return { items };
+  },
+
+  async sendMail(args: any) {
+    requireStaffToken();
+    const body: Record<string, any> = {
+      subject: args.subject,
+      body: args.body,
+    };
+    if (args.to) body.to = args.to;
+    if (args.application_id) body.application_id = args.application_id;
+    if (args.user_id) body.user_id = args.user_id;
+    const res = await staffApiCall("/api/admin/mail/send", {
+      method: "POST",
+      body,
+    });
+    return { ok: true, id: res?.id ? String(res.id) : null };
+  },
+
+  /* The institution registry, so compose can send to an institution's
+     contact email on file. The backend send endpoint does NOT resolve
+     an institution name, it only accepts a real email address (or an
+     application/user id), so the panel resolves the name here. The
+     catalog endpoint is public and returns contact_email per
+     institution. */
+  async listMailInstitutions(_args: any) {
+    const res = await apiCall("/api/institutions", {});
+    const rows = Array.isArray(res) ? res : [];
+    return {
+      institutions: rows.map((r: any) => ({
+        id: Number(r.id ?? 0),
+        code: String(r.code || ""),
+        name: String(r.name || ""),
+        contact_email: String(r.contact_email || ""),
+      })),
+    };
+  },
+
+  async listMailRules(_args: any) {
+    requireStaffToken();
+    const res = await staffApiCall("/api/admin/mail/rules", {});
+    const rules = staffRows(res, "rules").map((r: any, i: number) => ({
+      id: String(r.id ?? i + 1),
+      name: String(r.name || ""),
+      trigger: String(r.trigger || ""),
+      hours: Number(r.hours ?? 0),
+      subject_template: String(r.subject_template || ""),
+      body_template: String(r.body_template || ""),
+      enabled: Boolean(r.enabled),
+      last_run_at: r?.last_run_at ? String(r.last_run_at) : null,
+    }));
+    return { rules };
+  },
+
+  async createMailRule(args: any) {
+    requireStaffToken();
+    const res = await staffApiCall("/api/admin/mail/rules", {
+      method: "POST",
+      body: {
+        name: args.name,
+        trigger: args.trigger,
+        hours: args.hours,
+        subject_template: args.subject_template,
+        body_template: args.body_template,
+        enabled: args.enabled !== false,
+      },
+    });
+    return { ok: true, id: res?.id ? String(res.id) : null };
+  },
+
+  async updateMailRule(args: any) {
+    requireStaffToken();
+    const patch: Record<string, any> = {};
+    if (args.name !== undefined) patch.name = args.name;
+    if (args.trigger !== undefined) patch.trigger = args.trigger;
+    if (args.hours !== undefined) patch.hours = args.hours;
+    if (args.subject_template !== undefined) patch.subject_template = args.subject_template;
+    if (args.body_template !== undefined) patch.body_template = args.body_template;
+    if (args.enabled !== undefined) patch.enabled = args.enabled;
+    await staffApiCall(`/api/admin/mail/rules/${encodeURIComponent(String(args.id))}`, {
+      method: "PATCH",
+      body: patch,
+    });
+    return { ok: true };
+  },
+
+  async deleteMailRule(args: any) {
+    requireStaffToken();
+    await staffApiCall(`/api/admin/mail/rules/${encodeURIComponent(String(args.id))}`, {
+      method: "DELETE",
+    });
+    return { ok: true };
+  },
+
+  async runMailRule(args: any) {
+    requireStaffToken();
+    const res = await staffApiCall(
+      `/api/admin/mail/rules/${encodeURIComponent(String(args.id))}/run`,
+      { method: "POST", body: {} },
+    );
+    return { ok: true, sent: Number(res?.sent ?? res?.count ?? 0) };
+  },
+
+  async runAllMailRules(_args: any) {
+    requireStaffToken();
+    const res = await staffApiCall("/api/admin/mail/run", {
+      method: "POST",
+      body: {},
+    });
+    return { ok: true, sent: Number(res?.sent ?? res?.count ?? 0) };
+  },
+
+  async listMailRuns(args: any) {
+    requireStaffToken();
+    const qs = args?.rule_id
+      ? `?rule_id=${encodeURIComponent(String(args.rule_id))}`
+      : "";
+    const res = await staffApiCall(`/api/admin/mail/runs${qs}`, {});
+    const runs = staffRows(res, "runs").map((r: any, i: number) => ({
+      id: String(r.id ?? i + 1),
+      rule_id: String(r.rule_id ?? r.ruleId ?? ""),
+      rule_name: String(r.rule_name || r.rule || ""),
+      application_ref: String(r.application_ref || r.reference || ""),
+      subject: String(r.subject || ""),
+      sent_at: String(r.sent_at || r.created_at || ""),
+    }));
+    return { runs };
   },
 };

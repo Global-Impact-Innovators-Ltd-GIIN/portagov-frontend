@@ -7977,6 +7977,12 @@ function PlatformPage() {
         <FeatureTogglesPanel />
       </div>
 
+      {session?.role === "admin" ? (
+        <div className="mt-6">
+          <PlatformMailPanel applications={all} />
+        </div>
+      ) : null}
+
       <details className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)]">
         <summary className="cursor-pointer p-4 font-display font-bold text-[var(--text)]">
           Institutions joining, and reports for government
@@ -18703,6 +18709,812 @@ function ComplaintsLearningPanel({ canAdd }: { canAdd: boolean }) {
             placeholder="What did PortaGov change because of a complaint?" />
           <PrimaryButton type="submit" disabled={add.isPending}>Record the change</PrimaryButton>
         </form>
+      ) : null}
+    </div>
+  );
+}
+
+/* ---------- platform console email: inbox, sent, compose, automations ----------
+   Admin-only. Every call is live through /api/admin/mail (staff
+   token); a failed call is a plain error with a retry, never demo
+   mail. The inbox needs the mail settings connected: when the
+   backend reports configured false, the inbox says so plainly. */
+const MAIL_TRIGGERS: { value: string; label: string }[] = [
+  { value: "held_overdue", label: "Application held too long" },
+  { value: "document_missing", label: "A document is missing" },
+  { value: "appointment_tomorrow", label: "Appointment is tomorrow" },
+  { value: "payment_pending", label: "Payment is still pending" },
+  { value: "signup_incomplete", label: "Sign-up was not finished" },
+];
+
+function mailTriggerLabel(trigger: string): string {
+  return MAIL_TRIGGERS.find((t) => t.value === trigger)?.label ?? trigger;
+}
+
+type MailInboxItemT = {
+  id: string;
+  from: string;
+  subject: string;
+  snippet: string;
+  body: string;
+  received_at: string;
+  read: boolean;
+  application_ref: string;
+};
+
+type MailSentItemT = {
+  id: string;
+  to: string;
+  subject: string;
+  created_at: string;
+  source: string;
+};
+
+type MailRuleT = {
+  id: string;
+  name: string;
+  trigger: string;
+  hours: number;
+  subject_template: string;
+  body_template: string;
+  enabled: boolean;
+  last_run_at: string | null;
+};
+
+type MailRunT = {
+  id: string;
+  rule_id: string;
+  rule_name: string;
+  application_ref: string;
+  subject: string;
+  sent_at: string;
+};
+
+type MailInboxResult = { configured: boolean; message: string; items: MailInboxItemT[] };
+type MailSentResult = { items: MailSentItemT[] };
+type MailRulesResult = { rules: MailRuleT[] };
+type MailRunsResult = { runs: MailRunT[] };
+type MailStatusResult = { imap_configured: boolean; smtp_configured: boolean; last_run_at: string | null };
+type MailInstitutionT = { id: number; code: string; name: string; contact_email: string };
+type MailInstitutionsResult = { institutions: MailInstitutionT[] };
+
+function MailErrorBox({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  return (
+    <div role="alert" className="rounded-xl border border-[var(--border)] bg-[var(--gold-soft)] p-4">
+      <p className="text-sm font-semibold text-[var(--text)]">
+        The mail could not be loaded.{" "}
+        {error instanceof Error ? error.message : "Try again."}
+      </p>
+      <div className="mt-3">
+        <PrimaryButton onClick={onRetry}>Try again</PrimaryButton>
+      </div>
+    </div>
+  );
+}
+
+function PlatformMailPanel({ applications }: { applications: ApplicationT[] }) {
+  const queryClient = useQueryClient();
+  const [tab, setTab] = useState<"inbox" | "sent" | "compose" | "automations">("inbox");
+  const [openId, setOpenId] = useState<string | null>(null);
+
+  const status = useQuery({
+    queryKey: ["mail-status"],
+    queryFn: () => (api as any).getMailStatus({}) as Promise<MailStatusResult>,
+  });
+  const inbox = useQuery({
+    queryKey: ["mail-inbox"],
+    queryFn: () => (api as any).listMailInbox({}) as Promise<MailInboxResult>,
+    enabled: tab === "inbox",
+  });
+  const sent = useQuery({
+    queryKey: ["mail-sent"],
+    queryFn: () => (api as any).listMailSent({}) as Promise<MailSentResult>,
+    enabled: tab === "sent",
+  });
+  const rules = useQuery({
+    queryKey: ["mail-rules"],
+    queryFn: () => (api as any).listMailRules({}) as Promise<MailRulesResult>,
+    enabled: tab === "automations",
+  });
+  const runs = useQuery({
+    queryKey: ["mail-runs"],
+    queryFn: () => (api as any).listMailRuns({}) as Promise<MailRunsResult>,
+    enabled: tab === "automations",
+  });
+
+  const markRead = useMutation({
+    mutationFn: async (id: string) => await (api as any).markMailRead({ id }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["mail-inbox"] }),
+  });
+
+  const openMessage = (item: MailInboxItemT) => {
+    setOpenId(openId === item.id ? null : item.id);
+    if (!item.read) markRead.mutate(item.id);
+  };
+
+  /* Compose */
+  const [recipientKind, setRecipientKind] = useState<"application" | "citizen" | "institution" | "address">("application");
+  const [applicationRef, setApplicationRef] = useState("");
+  const [citizenContact, setCitizenContact] = useState("");
+  const [institution, setInstitution] = useState("");
+  const [address, setAddress] = useState("");
+  const [subject, setSubject] = useState("");
+  const [body, setBody] = useState("");
+  const [sendResult, setSendResult] = useState("");
+  const [sendError, setSendError] = useState("");
+  const institutions = Array.from(
+    new Set(applications.map((a) => a.institution).filter(Boolean)),
+  ).sort();
+  /* The registry, so an institution can be reached at its contact
+     email on file. The backend send endpoint does NOT resolve an
+     institution name, it only accepts a real email address. */
+  const registry = useQuery({
+    queryKey: ["mail-institutions"],
+    queryFn: () => (api as any).listMailInstitutions({}) as Promise<MailInstitutionsResult>,
+    enabled: tab === "compose",
+  });
+  const sendMail = useMutation({
+    mutationFn: async () => {
+      const payload: Record<string, any> = { subject: subject.trim(), body: body.trim() };
+      if (recipientKind === "application") {
+        const app = applications.find((a) => a.reference === applicationRef.trim());
+        if (!app) throw new Error("That application reference was not found in the console list.");
+        payload.application_id = app.id;
+      } else if (recipientKind === "citizen") {
+        if (!citizenContact.trim()) throw new Error("Enter the citizen phone number or email address on file.");
+        payload.to = citizenContact.trim();
+      } else if (recipientKind === "institution") {
+        if (!institution) throw new Error("Choose an institution.");
+        const contact = (registry.data?.institutions ?? []).find((i) => i.name === institution);
+        const email = contact?.contact_email?.trim() ?? "";
+        if (!email) throw new Error("That institution has no contact email on file. Type the address instead, using the 'An email address' choice.");
+        payload.to = email;
+      } else {
+        if (!address.trim()) throw new Error("Enter an email address.");
+        payload.to = address.trim();
+      }
+      return (await (api as any).sendMail(payload)) as { ok: boolean };
+    },
+    onSuccess: () => {
+      setSendResult("The mail was sent.");
+      setSendError("");
+      setSubject("");
+      setBody("");
+      void queryClient.invalidateQueries({ queryKey: ["mail-sent"] });
+    },
+    onError: (e) => {
+      setSendError(e instanceof Error ? e.message : "The mail could not be sent. Try again.");
+      setSendResult("");
+    },
+  });
+  const sendDisabled =
+    sendMail.isPending || !subject.trim() || !body.trim() ||
+    (recipientKind === "application" && !applicationRef.trim()) ||
+    (recipientKind === "citizen" && !citizenContact.trim()) ||
+    (recipientKind === "institution" && !institution) ||
+    (recipientKind === "address" && !address.trim());
+
+  /* Automations */
+  const [showCreate, setShowCreate] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newTrigger, setNewTrigger] = useState(MAIL_TRIGGERS[0].value);
+  const [newHours, setNewHours] = useState("24");
+  const [newSubject, setNewSubject] = useState("");
+  const [newBody, setNewBody] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editTrigger, setEditTrigger] = useState(MAIL_TRIGGERS[0].value);
+  const [editHours, setEditHours] = useState("24");
+  const [editSubject, setEditSubject] = useState("");
+  const [editBody, setEditBody] = useState("");
+  const [ruleMsg, setRuleMsg] = useState("");
+  const [ruleError, setRuleError] = useState("");
+  const refreshRules = () => {
+    void queryClient.invalidateQueries({ queryKey: ["mail-rules"] });
+    void queryClient.invalidateQueries({ queryKey: ["mail-runs"] });
+    void queryClient.invalidateQueries({ queryKey: ["mail-status"] });
+  };
+  const createRule = useMutation({
+    mutationFn: async () =>
+      (await (api as any).createMailRule({
+        name: newName.trim(),
+        trigger: newTrigger,
+        hours: Number(newHours) || 0,
+        subject_template: newSubject.trim(),
+        body_template: newBody.trim(),
+        enabled: true,
+      })) as { ok: boolean },
+    onSuccess: () => {
+      setRuleMsg("The automation was added.");
+      setRuleError("");
+      setShowCreate(false);
+      setNewName("");
+      setNewSubject("");
+      setNewBody("");
+      refreshRules();
+    },
+    onError: (e) => {
+      setRuleError(e instanceof Error ? e.message : "The automation could not be added. Try again.");
+      setRuleMsg("");
+    },
+  });
+  const updateRule = useMutation({
+    mutationFn: async (v: { id: string; patch: Record<string, any> }) =>
+      (await (api as any).updateMailRule({ id: v.id, ...v.patch })) as { ok: boolean },
+    onSuccess: () => {
+      setRuleMsg("The automation was saved.");
+      setRuleError("");
+      setEditingId(null);
+      refreshRules();
+    },
+    onError: (e) => {
+      setRuleError(e instanceof Error ? e.message : "The automation could not be saved. Try again.");
+      setRuleMsg("");
+    },
+  });
+  const deleteRule = useMutation({
+    mutationFn: async (id: string) => (await (api as any).deleteMailRule({ id })) as { ok: boolean },
+    onSuccess: () => {
+      setRuleMsg("The automation was deleted.");
+      setRuleError("");
+      refreshRules();
+    },
+    onError: (e) => {
+      setRuleError(e instanceof Error ? e.message : "The automation could not be deleted. Try again.");
+      setRuleMsg("");
+    },
+  });
+  const runRule = useMutation({
+    mutationFn: async (id: string) =>
+      (await (api as any).runMailRule({ id })) as { ok: boolean; sent: number },
+    onSuccess: (r) => {
+      setRuleMsg(`Run finished. ${r.sent} mail sent.`);
+      setRuleError("");
+      refreshRules();
+    },
+    onError: (e) => {
+      setRuleError(e instanceof Error ? e.message : "The run could not start. Try again.");
+      setRuleMsg("");
+    },
+  });
+  const runAll = useMutation({
+    mutationFn: async () => (await (api as any).runAllMailRules({})) as { ok: boolean; sent: number },
+    onSuccess: (r) => {
+      setRuleMsg(`Run finished. ${r.sent} mail sent.`);
+      setRuleError("");
+      refreshRules();
+    },
+    onError: (e) => {
+      setRuleError(e instanceof Error ? e.message : "The run could not start. Try again.");
+      setRuleMsg("");
+    },
+  });
+  const startEdit = (rule: MailRuleT) => {
+    setEditingId(rule.id);
+    setEditName(rule.name);
+    setEditTrigger(rule.trigger);
+    setEditHours(String(rule.hours));
+    setEditSubject(rule.subject_template);
+    setEditBody(rule.body_template);
+    setRuleMsg("");
+    setRuleError("");
+  };
+
+  const tabs: { key: typeof tab; label: string }[] = [
+    { key: "inbox", label: "Inbox" },
+    { key: "sent", label: "Sent" },
+    { key: "compose", label: "Compose" },
+    { key: "automations", label: "Automations" },
+  ];
+
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-lg font-bold text-[var(--text)]">Email</h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        Mail the platform sends and receives. Only admins see this section.
+      </p>
+      {status.data ? (
+        <p className="mt-2 text-sm text-[var(--dim)]">
+          Mail sending is {status.data.smtp_configured ? "connected" : "not connected yet"}
+          {status.data.last_run_at ? `, last automation run ${fmtDateTime(status.data.last_run_at)}` : ""}.
+        </p>
+      ) : null}
+      <div className="mt-4 flex flex-wrap gap-2" role="tablist" aria-label="Email sections">
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.key}
+            onClick={() => setTab(t.key)}
+            className={`rounded-full border px-4 py-1.5 text-sm font-bold ${
+              tab === t.key
+                ? "border-transparent text-white"
+                : "border-[var(--border)] text-[var(--text)]"
+            }`}
+            style={tab === t.key ? { backgroundColor: "#0a2a5e" } : undefined}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "inbox" ? (
+        <div className="mt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm text-[var(--dim)]">
+              Mail sent to PortaGov. Tap a row to read it.
+            </p>
+            <GhostButton onClick={() => void inbox.refetch()} disabled={inbox.isFetching}>
+              Refresh
+            </GhostButton>
+          </div>
+          {inbox.isPending ? (
+            <p className="mt-3 text-sm text-[var(--dim)]">Loading the inbox...</p>
+          ) : inbox.isError ? (
+            <div className="mt-3">
+              <MailErrorBox error={inbox.error} onRetry={() => void inbox.refetch()} />
+            </div>
+          ) : inbox.data && !inbox.data.configured ? (
+            <p className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--surface-alt)] p-4 text-sm text-[var(--text)]">
+              Mail reading is not connected yet. The inbox needs the mail
+              settings connected before mail can be read here.
+              {inbox.data.message ? ` ${inbox.data.message}` : ""}
+            </p>
+          ) : (inbox.data?.items ?? []).length === 0 ? (
+            <p className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--surface-alt)] p-4 text-sm text-[var(--dim)]">
+              No mail in the inbox.
+            </p>
+          ) : (
+            <ul className="mt-3 space-y-2">
+              {(inbox.data?.items ?? []).map((item) => (
+                <li key={item.id} className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)]">
+                  <button
+                    type="button"
+                    onClick={() => openMessage(item)}
+                    aria-expanded={openId === item.id}
+                    className="w-full p-3 text-left"
+                  >
+                    <span className="flex flex-wrap items-baseline justify-between gap-2">
+                      <span className="text-sm font-bold text-[var(--text)]">
+                        {item.read ? null : <span aria-label="Unread">● </span>}
+                        {item.from || "(No sender)"}
+                      </span>
+                      <span className="text-xs text-[var(--dim)]">
+                        {item.received_at ? fmtDateTime(item.received_at) : ""}
+                      </span>
+                    </span>
+                    <span className="mt-0.5 block text-sm font-semibold text-[var(--text)]">
+                      {item.subject}
+                    </span>
+                    <span className="mt-0.5 block text-sm text-[var(--dim)]">
+                      {item.snippet}
+                      {item.application_ref ? ` (${item.application_ref})` : ""}
+                    </span>
+                  </button>
+                  {openId === item.id ? (
+                    <div className="border-t border-[var(--border)] p-3">
+                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-[var(--text)]">
+                        {item.body || item.snippet || "No message text."}
+                      </p>
+                      {item.application_ref ? (
+                        <p className="mt-2 text-sm text-[var(--dim)]">
+                          Application: {item.application_ref}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+
+      {tab === "sent" ? (
+        <div className="mt-4">
+          <p className="text-sm text-[var(--dim)]">
+            Mail sent from the console, by hand or by an automation.
+            One-time sign-in codes are not listed here.
+          </p>
+          {sent.isPending ? (
+            <p className="mt-3 text-sm text-[var(--dim)]">Loading sent mail...</p>
+          ) : sent.isError ? (
+            <div className="mt-3">
+              <MailErrorBox error={sent.error} onRetry={() => void sent.refetch()} />
+            </div>
+          ) : (sent.data?.items ?? []).length === 0 ? (
+            <p className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--surface-alt)] p-4 text-sm text-[var(--dim)]">
+              Nothing sent yet.
+            </p>
+          ) : (
+            <ul className="mt-3 space-y-2">
+              {(sent.data?.items ?? []).map((item) => (
+                <li key={item.id} className="flex flex-wrap items-baseline justify-between gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-3">
+                  <span>
+                    <span className="block text-sm font-bold text-[var(--text)]">{item.to || "(No recipient)"}</span>
+                    <span className="block text-sm text-[var(--dim)]">{item.subject}</span>
+                  </span>
+                  <span className="text-right">
+                    <span className="block text-xs text-[var(--dim)]">
+                      {item.created_at ? fmtDateTime(item.created_at) : ""}
+                    </span>
+                    <span className="mt-0.5 inline-block">
+                      <Chip tone="plain">{item.source === "automation" ? "Automation" : "Manual"}</Chip>
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+
+      {tab === "compose" ? (
+        <div className="mt-4 space-y-3">
+          <div>
+            <FieldLabel htmlFor="mail-to-kind">Send to</FieldLabel>
+            <select
+              id="mail-to-kind"
+              value={recipientKind}
+              onChange={(e) => setRecipientKind(e.target.value as typeof recipientKind)}
+              className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+            >
+              <option value="application">An application (by reference)</option>
+              <option value="citizen">A citizen (phone or email on file)</option>
+              <option value="institution">An institution</option>
+              <option value="address">A typed email address</option>
+            </select>
+          </div>
+          {recipientKind === "application" ? (
+            <div>
+              <FieldLabel htmlFor="mail-application">Application reference</FieldLabel>
+              <input
+                id="mail-application"
+                value={applicationRef}
+                onChange={(e) => setApplicationRef(e.target.value)}
+                placeholder="For example PG-2026-0001"
+                list="mail-application-refs"
+                className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+              />
+              <datalist id="mail-application-refs">
+                {applications.map((a) => (
+                  <option key={a.id} value={a.reference} />
+                ))}
+              </datalist>
+            </div>
+          ) : null}
+          {recipientKind === "citizen" ? (
+            <div>
+              <FieldLabel htmlFor="mail-citizen">Citizen phone or email on file</FieldLabel>
+              <input
+                id="mail-citizen"
+                value={citizenContact}
+                onChange={(e) => setCitizenContact(e.target.value)}
+                placeholder="Phone number or email address"
+                className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+              />
+            </div>
+          ) : null}
+          {recipientKind === "institution" ? (
+            <div>
+              <FieldLabel htmlFor="mail-institution">Institution</FieldLabel>
+              <select
+                id="mail-institution"
+                value={institution}
+                onChange={(e) => setInstitution(e.target.value)}
+                className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+              >
+                <option value="">Choose an institution</option>
+                {institutions.map((name) => (
+                  <option key={name} value={name}>{name}</option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+          {recipientKind === "address" ? (
+            <div>
+              <FieldLabel htmlFor="mail-address">Email address</FieldLabel>
+              <input
+                id="mail-address"
+                type="email"
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                placeholder="name@example.com"
+                className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+              />
+            </div>
+          ) : null}
+          <div>
+            <FieldLabel htmlFor="mail-subject">Subject</FieldLabel>
+            <input
+              id="mail-subject"
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+            />
+          </div>
+          <div>
+            <FieldLabel htmlFor="mail-body">Message</FieldLabel>
+            <textarea
+              id="mail-body"
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              rows={5}
+              className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+            />
+          </div>
+          <div>
+            <PrimaryButton onClick={() => sendMail.mutate()} disabled={sendDisabled}>
+              {sendMail.isPending ? "Sending..." : "Send mail"}
+            </PrimaryButton>
+          </div>
+          {sendResult ? (
+            <p role="status" className="text-sm font-semibold text-[var(--text)]">{sendResult}</p>
+          ) : null}
+          {sendError ? (
+            <p role="alert" className="text-sm font-semibold text-[var(--warn)]">{sendError}</p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {tab === "automations" ? (
+        <div className="mt-4">
+          <p className="text-sm text-[var(--dim)]">
+            Automations run with the daily job and when an admin opens this
+            section. Mail is sent when the job runs, not the moment a rule
+            is switched on.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <PrimaryButton onClick={() => setShowCreate(!showCreate)}>
+              {showCreate ? "Close the form" : "New automation"}
+            </PrimaryButton>
+            <GhostButton onClick={() => runAll.mutate()} disabled={runAll.isPending}>
+              {runAll.isPending ? "Running..." : "Run all now"}
+            </GhostButton>
+          </div>
+          {ruleMsg ? (
+            <p role="status" className="mt-3 text-sm font-semibold text-[var(--text)]">{ruleMsg}</p>
+          ) : null}
+          {ruleError ? (
+            <p role="alert" className="mt-3 text-sm font-semibold text-[var(--warn)]">{ruleError}</p>
+          ) : null}
+          {showCreate ? (
+            <div className="mt-3 space-y-3 rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-4">
+              <div>
+                <FieldLabel htmlFor="mail-rule-name">Name</FieldLabel>
+                <input
+                  id="mail-rule-name"
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <FieldLabel htmlFor="mail-rule-trigger">When this happens</FieldLabel>
+                  <select
+                    id="mail-rule-trigger"
+                    value={newTrigger}
+                    onChange={(e) => setNewTrigger(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                  >
+                    {MAIL_TRIGGERS.map((t) => (
+                      <option key={t.value} value={t.value}>{t.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <FieldLabel htmlFor="mail-rule-hours">After how many hours</FieldLabel>
+                  <input
+                    id="mail-rule-hours"
+                    type="number"
+                    min={0}
+                    value={newHours}
+                    onChange={(e) => setNewHours(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                  />
+                </div>
+              </div>
+              <div>
+                <FieldLabel htmlFor="mail-rule-subject">Subject</FieldLabel>
+                <input
+                  id="mail-rule-subject"
+                  value={newSubject}
+                  onChange={(e) => setNewSubject(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                />
+              </div>
+              <div>
+                <FieldLabel htmlFor="mail-rule-body">Message</FieldLabel>
+                <textarea
+                  id="mail-rule-body"
+                  value={newBody}
+                  onChange={(e) => setNewBody(e.target.value)}
+                  rows={4}
+                  className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                />
+              </div>
+              <p className="text-sm text-[var(--dim)]">
+                Use {"{name}"}, {"{reference}"}, {"{service}"} and {"{hours}"} in the
+                subject and message. PortaGov fills them in for each person.
+              </p>
+              <div>
+                <PrimaryButton
+                  onClick={() => createRule.mutate()}
+                  disabled={createRule.isPending || !newName.trim() || !newSubject.trim() || !newBody.trim()}
+                >
+                  {createRule.isPending ? "Adding..." : "Add automation"}
+                </PrimaryButton>
+              </div>
+            </div>
+          ) : null}
+          {rules.isPending ? (
+            <p className="mt-3 text-sm text-[var(--dim)]">Loading automations...</p>
+          ) : rules.isError ? (
+            <div className="mt-3">
+              <MailErrorBox error={rules.error} onRetry={() => void rules.refetch()} />
+            </div>
+          ) : (rules.data?.rules ?? []).length === 0 ? (
+            <p className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--surface-alt)] p-4 text-sm text-[var(--dim)]">
+              No automations yet. Add one above.
+            </p>
+          ) : (
+            <ul className="mt-3 space-y-2">
+              {(rules.data?.rules ?? []).map((rule) => (
+                <li key={rule.id} className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-52 flex-1">
+                      <p className="text-sm font-bold text-[var(--text)]">{rule.name}</p>
+                      <p className="text-sm text-[var(--dim)]">
+                        {mailTriggerLabel(rule.trigger)}, after {rule.hours} hours.
+                        Last run: {rule.last_run_at ? fmtDateTime(rule.last_run_at) : "never"}.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={rule.enabled}
+                      aria-label={`${rule.name} on or off`}
+                      disabled={updateRule.isPending}
+                      onClick={() => updateRule.mutate({ id: rule.id, patch: { enabled: !rule.enabled } })}
+                      className="flex items-center gap-2 rounded-full border border-[var(--border)] px-3 py-1.5 text-sm font-bold"
+                      style={rule.enabled ? { backgroundColor: "#0a2a5e", color: "#fff" } : { color: "var(--dim)" }}
+                    >
+                      <span
+                        className="relative inline-block h-5 w-9 rounded-full"
+                        style={{ backgroundColor: rule.enabled ? "#d9a821" : "var(--border)" }}
+                      >
+                        <span
+                          className="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all"
+                          style={{ left: rule.enabled ? 18 : 2 }}
+                        />
+                      </span>
+                      {rule.enabled ? "On" : "Off"}
+                    </button>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <GhostButton onClick={() => startEdit(rule)}>Edit</GhostButton>
+                    <GhostButton onClick={() => runRule.mutate(rule.id)} disabled={runRule.isPending}>
+                      Run now
+                    </GhostButton>
+                    <GhostButton
+                      onClick={() => {
+                        if (window.confirm(`Delete the automation "${rule.name}"?`)) {
+                          deleteRule.mutate(rule.id);
+                        }
+                      }}
+                      disabled={deleteRule.isPending}
+                    >
+                      Delete
+                    </GhostButton>
+                  </div>
+                  {editingId === rule.id ? (
+                    <div className="mt-3 space-y-3 border-t border-[var(--border)] pt-3">
+                      <div>
+                        <FieldLabel htmlFor={`mail-edit-name-${rule.id}`}>Name</FieldLabel>
+                        <input
+                          id={`mail-edit-name-${rule.id}`}
+                          value={editName}
+                          onChange={(e) => setEditName(e.target.value)}
+                          className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                        />
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div>
+                          <FieldLabel htmlFor={`mail-edit-trigger-${rule.id}`}>When this happens</FieldLabel>
+                          <select
+                            id={`mail-edit-trigger-${rule.id}`}
+                            value={editTrigger}
+                            onChange={(e) => setEditTrigger(e.target.value)}
+                            className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                          >
+                            {MAIL_TRIGGERS.map((t) => (
+                              <option key={t.value} value={t.value}>{t.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <FieldLabel htmlFor={`mail-edit-hours-${rule.id}`}>After how many hours</FieldLabel>
+                          <input
+                            id={`mail-edit-hours-${rule.id}`}
+                            type="number"
+                            min={0}
+                            value={editHours}
+                            onChange={(e) => setEditHours(e.target.value)}
+                            className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <FieldLabel htmlFor={`mail-edit-subject-${rule.id}`}>Subject</FieldLabel>
+                        <input
+                          id={`mail-edit-subject-${rule.id}`}
+                          value={editSubject}
+                          onChange={(e) => setEditSubject(e.target.value)}
+                          className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                        />
+                      </div>
+                      <div>
+                        <FieldLabel htmlFor={`mail-edit-body-${rule.id}`}>Message</FieldLabel>
+                        <textarea
+                          id={`mail-edit-body-${rule.id}`}
+                          value={editBody}
+                          onChange={(e) => setEditBody(e.target.value)}
+                          rows={4}
+                          className="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]"
+                        />
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <PrimaryButton
+                          onClick={() =>
+                            updateRule.mutate({
+                              id: rule.id,
+                              patch: {
+                                name: editName.trim(),
+                                trigger: editTrigger,
+                                hours: Number(editHours) || 0,
+                                subject_template: editSubject.trim(),
+                                body_template: editBody.trim(),
+                              },
+                            })
+                          }
+                          disabled={updateRule.isPending || !editName.trim() || !editSubject.trim() || !editBody.trim()}
+                        >
+                          Save
+                        </PrimaryButton>
+                        <GhostButton onClick={() => setEditingId(null)}>Cancel</GhostButton>
+                      </div>
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+          <h3 className="mt-5 font-display text-base font-bold text-[var(--text)]">Run log</h3>
+          {runs.isPending ? (
+            <p className="mt-2 text-sm text-[var(--dim)]">Loading the run log...</p>
+          ) : runs.isError ? (
+            <div className="mt-2">
+              <MailErrorBox error={runs.error} onRetry={() => void runs.refetch()} />
+            </div>
+          ) : (runs.data?.runs ?? []).length === 0 ? (
+            <p className="mt-2 text-sm text-[var(--dim)]">No runs yet.</p>
+          ) : (
+            <ul className="mt-2 space-y-2">
+              {(runs.data?.runs ?? []).map((run) => (
+                <li key={run.id} className="rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] p-3 text-sm">
+                  <span className="font-bold text-[var(--text)]">{run.rule_name || "Automation"}</span>
+                  {run.application_ref ? <span className="text-[var(--dim)]">, {run.application_ref}</span> : null}
+                  {run.subject ? <span className="block text-[var(--dim)]">{run.subject}</span> : null}
+                  <span className="block text-xs text-[var(--dim)]">
+                    {run.sent_at ? fmtDateTime(run.sent_at) : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       ) : null}
     </div>
   );
