@@ -1,10 +1,11 @@
 // GiinAI feedback route: POST forwards a thumbs up or down.
 //
-// POST body: { session_id, rating, question, answer } where rating is
-// 5 for thumbs up and -1 for thumbs down. The app key never leaves
-// the server. A 429 or 503 from GiinAI becomes the friendly busy
-// message; other GiinAI errors become a generic error with no
-// upstream detail.
+// POST body: { session_id, rating, question, answer, comment? } where
+// rating is 5 for thumbs up and -1 for thumbs down. The comment is
+// optional and is forwarded to GiinAI when the frontend sends one.
+// The app key never leaves the server. A 429 or 503 from GiinAI
+// becomes the friendly busy message; other GiinAI errors become a
+// generic error with no upstream detail.
 
 import {
   giinAiConfigured,
@@ -30,6 +31,8 @@ export async function POST(req: Request): Promise<Response> {
     typeof b.question === "string" ? b.question.slice(0, 600) : "";
   const answer =
     typeof b.answer === "string" ? b.answer.slice(0, 8000) : "";
+  const comment =
+    typeof b.comment === "string" ? b.comment.trim().slice(0, 2000) : "";
   if (!sessionId || (rating !== 5 && rating !== -1) || !question || !answer) {
     return invalidBodyResponse();
   }
@@ -37,7 +40,13 @@ export async function POST(req: Request): Promise<Response> {
   try {
     upstream = await giinAiFetch("/api/v1/feedback", {
       method: "POST",
-      body: JSON.stringify({ session_id: sessionId, rating, question, answer }),
+      body: JSON.stringify({
+        session_id: sessionId,
+        rating,
+        question,
+        answer,
+        ...(comment ? { comment } : {}),
+      }),
     });
   } catch {
     return Response.json(

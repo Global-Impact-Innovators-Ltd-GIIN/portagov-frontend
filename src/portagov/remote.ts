@@ -1007,7 +1007,10 @@ async function giinAiFallback(args: any): Promise<any> {
     arrive; the returned answer is the full text. Throws when GiinAI
     cannot be reached or answers with an error and no tokens arrived.
     A partial answer (tokens arrived, then the stream failed) is
-    returned, not thrown, so the citizen still sees what arrived. */
+    returned, not thrown, so the citizen still sees what arrived.
+    Tool events are ignored: PortaGov has no services file, so GiinAI
+    never takes a tool action or returns a reference id. The sources
+    event arrives before done, and both are handled in that order. */
 async function giinAiChat(
   args: { question: string; context: string; profileId: string | number | null },
   onToken?: (text: string) => void,
@@ -1026,10 +1029,13 @@ async function giinAiChat(
       message: args.question,
       session_id: getGiinAiSessionId(args.profileId),
       stream: true,
+      // The current hash route included, so GiinAI knows which
+      // citizen page the question came from.
+      page_url: window.location.href,
       user_ref: args.profileId != null ? String(args.profileId) : undefined,
       user_context: args.context,
     }),
-    signal: AbortSignal.timeout(600_000),
+    signal: AbortSignal.timeout(900_000),
   });
   if (!res.ok || !res.body) {
     const data = await res.json().catch(() => null);
@@ -1039,6 +1045,25 @@ async function giinAiChat(
     ) as Error & { busy?: boolean; status?: number };
     err.status = res.status;
     err.busy = res.status === 429 || res.status === 503;
+    throw err;
+  }
+  // GiinAI only sends the non-streaming failure shape (HTTP 200 with
+  // error: true) when stream is false, and this call always streams,
+  // but guard it anyway: a JSON body here is never a stream of tokens,
+  // so treat an error body as a busy failure instead of returning an
+  // empty answer.
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    const data = await res.json().catch(() => null);
+    const busy =
+      (data && data.error === true) ||
+      (data && typeof data.error === "string" && data.error === GIINAI_BUSY_MESSAGE);
+    const err = new Error(
+      busy
+        ? GIINAI_BUSY_MESSAGE
+        : "The assistant could not answer just now. Please try again.",
+    ) as Error & { busy?: boolean };
+    err.busy = Boolean(busy);
     throw err;
   }
   const reader = res.body.getReader();
@@ -1068,10 +1093,19 @@ async function giinAiChat(
               text += evt.text;
               if (onToken) onToken(evt.text);
             } else if (evt.type === "sources" && Array.isArray(evt.sources)) {
-              sources = evt.sources.map((s: any) => ({
-                title: String(s.title ?? s.url ?? "Source"),
-                url: typeof s.url === "string" ? s.url : undefined,
-              }));
+              // GiinAI only sends sources scored 0.35 or above, and
+              // the sources event arrives before done. Keep the floor
+              // here too, so a lower-scored source is never shown even
+              // if the server ever sends one.
+              sources = evt.sources
+                .filter(
+                  (s: any) =>
+                    typeof s.score !== "number" || s.score >= 0.35,
+                )
+                .map((s: any) => ({
+                  title: String(s.title ?? s.url ?? "Source"),
+                  url: typeof s.url === "string" ? s.url : undefined,
+                }));
             } else if (evt.type === "done") {
               if (typeof evt.answer === "string" && evt.answer) text = evt.answer;
               if (typeof evt.session_id === "string" && evt.session_id) {
@@ -2063,6 +2097,9 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
         rating: args.rating,
         question: String(args.question ?? "").slice(0, 600),
         answer: String(args.answer ?? "").slice(0, 8000),
+        ...(typeof args.comment === "string" && args.comment.trim()
+          ? { comment: args.comment.trim().slice(0, 2000) }
+          : {}),
       }),
     });
     if (!res.ok) throw new Error("Your feedback could not be saved. Please try again.");

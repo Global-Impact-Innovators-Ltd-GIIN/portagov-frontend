@@ -6,7 +6,7 @@
 // GIINAI_URL so the service can move from the test machine to a cloud
 // domain without a code change.
 
-export const GIINAI_TIMEOUT_MS = 600_000;
+export const GIINAI_TIMEOUT_MS = 900_000;
 
 export const GIINAI_BUSY_MESSAGE = "GiinAI is busy, try again";
 
