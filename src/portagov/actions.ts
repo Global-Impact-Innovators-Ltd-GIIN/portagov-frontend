@@ -3831,6 +3831,7 @@ export const Actions = {
       "Finishes sign-in with the code: registers the device, warns when the device is new, and lets a password be set for accounts that do not have one yet.",
     request: z.object({
       profileId: z.number().int().positive(),
+      phone: z.string().trim().max(30).default(""),
       code: z.string().trim().min(6).max(6),
       deviceId: z.string().trim().min(4).max(80),
       deviceLabel: z.string().trim().max(120).default(""),

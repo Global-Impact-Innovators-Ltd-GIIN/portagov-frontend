@@ -144,6 +144,13 @@ function cachedProfile(): any | null {
   }
 }
 
+/* Phone of the most recent sign-in attempt (loginStart). The code step
+   must verify against THIS phone, not the cached profile: the cached
+   profile can belong to a different person signed in earlier on this
+   device (for example an admin signing in after a citizen), and the
+   backend issues the code for the attempted phone only. */
+let lastLoginPhone = "";
+
 function saveProfile(p: any): void {
   storeSet(PROFILE_KEY, JSON.stringify(p));
 }
@@ -871,6 +878,7 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       throw e;
     }
     if (res.two_factor) {
+      lastLoginPhone = args.phone || "";
       const profile = cachedProfile();
       return {
         result: "need_code",
@@ -888,12 +896,17 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
 
   async verifyLoginCode(args: any) {
     const profile = cachedProfile();
-    const phone = profile?.phone || "";
+    // Prefer the phone passed in for this attempt, then the phone of
+    // the most recent loginStart that asked for a code, and only then
+    // the cached profile phone. The cached profile may belong to a
+    // different person signed in earlier on this device.
+    const phone = args.phone || lastLoginPhone || profile?.phone || "";
     const res = await apiCall("/api/auth/login/verify", {
       method: "POST",
       auth: false,
       body: { phone, otp: args.code },
     });
+    lastLoginPhone = "";
     if (res.token) setToken(res.token);
     const updated = userToProfile(res.user, profile);
     saveProfile(updated);
