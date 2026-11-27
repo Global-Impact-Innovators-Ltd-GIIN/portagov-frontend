@@ -3328,6 +3328,23 @@ export const Actions = {
     },
   }),
 
+  deleteAnnouncement: defineAction({
+    description:
+      "Platform action: removes a notice from a ministry announcement board.",
+    request: z.object({
+      id: z.number().int().positive(),
+    }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.announcements)
+        .where(eq(schema.announcements.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
   sendChatMessage: defineAction({
     description:
       "Citizen sends a live chat message to a PortaGov officer from the Help page.",

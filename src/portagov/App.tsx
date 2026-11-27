@@ -7442,6 +7442,191 @@ function InstitutionPage() {
   );
 }
 
+/* ---------- console Announcements panel ----------
+   The super admin posts, lists and removes notices. A notice posted
+   here reaches every device through the backend; when the backend
+   does not answer, the notice is kept on this device only and the
+   panel says so. */
+function ConsoleAnnouncementsPanel() {
+  const queryClient = useQueryClient();
+  const list = useQuery({
+    queryKey: ["announcements", "all"],
+    queryFn: () => api.listAnnouncements({ ministry: "", limit: 50 }),
+  });
+  const [ministry, setMinistry] = useState("PortaGov");
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [urgent, setUrgent] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ["announcements"] });
+  };
+  const post = useMutation({
+    mutationFn: async () =>
+      (await api.postAnnouncement({
+        ministry,
+        title: title.trim(),
+        body: body.trim(),
+        urgent,
+      })) as { id: number; localOnly?: boolean },
+    onSuccess: (res) => {
+      setTitle("");
+      setBody("");
+      setUrgent(false);
+      setError("");
+      setNotice(
+        res.localOnly
+          ? "Saved on this device only. The backend did not answer, so this notice does not reach other devices yet."
+          : "Notice posted. It shows on the citizen home, the announcement board and the emergency banner.",
+      );
+      invalidate();
+    },
+    onError: (e: unknown) => {
+      setNotice("");
+      setError((e as Error)?.message || "The notice could not be posted. Try again.");
+    },
+  });
+  const remove = useMutation({
+    mutationFn: async (id: number) =>
+      (await api.deleteAnnouncement({ id })) as { ok: boolean; localOnly?: boolean },
+    onSuccess: (res) => {
+      setError("");
+      setNotice(
+        res.localOnly
+          ? "Removed from this device only. The backend did not answer, so it may still show on other devices."
+          : "Notice removed.",
+      );
+      invalidate();
+    },
+    onError: (e: unknown) => {
+      setNotice("");
+      setError((e as Error)?.message || "The notice could not be removed. Try again.");
+    },
+  });
+  const rows = list.data?.announcements ?? [];
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <h2 className="font-display text-lg font-bold text-[var(--text)]">Announcements</h2>
+      <p className="mt-1 text-sm text-[var(--dim)]">
+        Notices the whole country sees: the gold strip on the citizen home,
+        the announcement board and the emergency banner. Post once, it reaches
+        every device.
+      </p>
+      <form
+        className="mt-4 space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          setNotice("");
+          setError("");
+          post.mutate();
+        }}
+      >
+        <div>
+          <FieldLabel htmlFor="ann-ministry">From</FieldLabel>
+          <select
+            id="ann-ministry"
+            className={inputCls}
+            value={ministry}
+            onChange={(e) => setMinistry(e.target.value)}
+          >
+            <option value="PortaGov">PortaGov</option>
+            {MINISTRIES.map((m) => (
+              <option key={m.id} value={m.name}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <FieldLabel htmlFor="ann-title">Title</FieldLabel>
+          <input
+            id="ann-title"
+            className={inputCls}
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            required
+            minLength={3}
+            maxLength={160}
+          />
+        </div>
+        <div>
+          <FieldLabel htmlFor="ann-body">Notice</FieldLabel>
+          <textarea
+            id="ann-body"
+            className={inputCls}
+            rows={3}
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            required
+            minLength={5}
+            maxLength={1000}
+          />
+        </div>
+        <label className="flex items-center gap-2 text-sm font-semibold text-[var(--text)]">
+          <input
+            type="checkbox"
+            checked={urgent}
+            onChange={(e) => setUrgent(e.target.checked)}
+          />
+          Urgent, show it on the emergency banner too
+        </label>
+        <div>
+          <PrimaryButton type="submit" disabled={post.isPending}>
+            {post.isPending ? "Posting..." : "Post notice"}
+          </PrimaryButton>
+        </div>
+      </form>
+      {notice ? (
+        <p role="status" className="mt-3 rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
+          {notice}
+        </p>
+      ) : null}
+      {error ? (
+        <p role="alert" className="mt-3 rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+          {error}
+        </p>
+      ) : null}
+      <div className="mt-5 space-y-3">
+        {list.isPending ? (
+          <p className="text-sm text-[var(--dim)]">Loading notices...</p>
+        ) : rows.length === 0 ? (
+          <p className="text-sm text-[var(--dim)]">No notices yet.</p>
+        ) : (
+          rows.map((a: AnnouncementT) => (
+            <div key={a.id} className="rounded-lg bg-[var(--surface-alt)] p-3">
+              <p className="text-sm font-bold text-[var(--text)]">
+                {a.title}{" "}
+                <span className="font-semibold text-[var(--dim)]">
+                  {a.ministry}, {fmtDate(a.created_at)}
+                </span>
+                {a.urgent ? (
+                  <span className="ml-2 rounded-full px-2 py-0.5 text-xs font-bold text-white" style={{ backgroundColor: "#b91c1c" }}>
+                    Urgent
+                  </span>
+                ) : null}
+              </p>
+              <p className="mt-1 text-sm text-[var(--dim)]">{a.body}</p>
+              <div className="mt-2">
+                <GhostButton
+                  disabled={remove.isPending}
+                  onClick={() => {
+                    if (window.confirm(`Remove the notice "${a.title}"?`)) {
+                      remove.mutate(a.id);
+                    }
+                  }}
+                >
+                  Remove
+                </GhostButton>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ---------- PortaGov Console sections ----------
    The console is one page (#/reports) with sections in the address:
    #/reports is the dashboard, #/reports/queues is the queues section,
@@ -7459,6 +7644,7 @@ const CONSOLE_SECTIONS = [
   { key: "reports", label: "Reports", href: "#/reports/reports" },
   { key: "helpdesk", label: "Help desk", href: "#/reports/helpdesk" },
   { key: "mail", label: "Mail", href: "#/reports/mail" },
+  { key: "announcements", label: "Announcements", href: "#/reports/announcements" },
   { key: "system", label: "System", href: "#/reports/system" },
 ] as const;
 
@@ -8082,6 +8268,21 @@ function PlatformPage() {
             <p className="mt-1 text-sm text-[var(--dim)]">
               The platform mailbox is for Super Admins. Sign in as a Super
               Admin to read and send platform mail.
+            </p>
+          </div>
+        )
+      ) : null}
+      {section === "announcements" ? (
+        session?.role === "admin" ? (
+          <div className="mt-6">
+            <ConsoleAnnouncementsPanel />
+          </div>
+        ) : (
+          <div className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+            <h2 className="font-display text-lg font-bold text-[var(--text)]">Announcements</h2>
+            <p className="mt-1 text-sm text-[var(--dim)]">
+              Announcements are for Super Admins. Sign in as a Super Admin to
+              post, list and remove notices.
             </p>
           </div>
         )
@@ -20459,7 +20660,7 @@ function FeatureNoteStrip() {
   return (
     <div style={{ backgroundColor: "#d9a821" }} className="text-[#0a2a5e]">
       <p className="mx-auto max-w-6xl px-4 py-2 text-sm">
-        <strong>New on PortaGov:</strong> {latest.title}. {latest.body}
+        <strong>New on PortaGov:</strong> {latest.title}. {latest.body} ({fmtDate(latest.created_at)})
       </p>
     </div>
   );

@@ -2119,6 +2119,70 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     return { applications: applications.slice(0, args?.limit || 100) };
   },
 
+  /* Announcements: the backend is the shared store, so a notice
+     posted once reaches every device. The list is public; post and
+     delete need the admin staff token. A 401 or 403 is never papered
+     over with local data. A network failure, a 5xx, or a 404 for an
+     endpoint the backend has not deployed yet falls back to the
+     local store, and the caller is told with localOnly so the
+     console never presents a device-only notice as live. */
+  async listAnnouncements(args: any) {
+    const params = new URLSearchParams();
+    if (args?.ministry) params.set("ministry", String(args.ministry));
+    if (args?.limit) params.set("limit", String(args.limit));
+    const query = params.toString();
+    try {
+      const res = await apiCall(`/api/announcements${query ? `?${query}` : ""}`, { auth: false });
+      if (Array.isArray(res)) return { announcements: res };
+      return { announcements: res?.announcements ?? [] };
+    } catch (e: any) {
+      if (e?.status === 404 || e?.status >= 500 || e?.status === undefined) {
+        return (Actions as any).listAnnouncements(args);
+      }
+      throw e;
+    }
+  },
+
+  async postAnnouncement(args: any) {
+    try {
+      const res = await staffApiCall("/api/admin/announcements", {
+        method: "POST",
+        body: {
+          ministry: args.ministry,
+          title: args.title,
+          body: args.body,
+          urgent: Boolean(args.urgent),
+        },
+      });
+      return { id: Number(res?.id ?? 0) };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      // Endpoint not deployed yet, or the backend is unreachable:
+      // keep the notice on this device only, and say so.
+      if (e?.status === 404 || e?.status >= 500 || e?.status === undefined) {
+        const local = await (Actions as any).postAnnouncement(args);
+        return { id: local.id, localOnly: true };
+      }
+      throw e;
+    }
+  },
+
+  async deleteAnnouncement(args: any) {
+    try {
+      await staffApiCall(`/api/admin/announcements/${args.id}`, { method: "DELETE" });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      // Endpoint not deployed yet, or the backend is unreachable:
+      // remove it from this device only, and say so.
+      if (e?.status === 404 || e?.status >= 500 || e?.status === undefined) {
+        await (Actions as any).deleteAnnouncement(args);
+        return { ok: true, localOnly: true };
+      }
+      throw e;
+    }
+  },
+
   async updateApplicationStatus(args: any) {
     /* Frontend status word -> backend action. The desk picker speaks
        frontend words; the backend speaks actions. "In review" and
