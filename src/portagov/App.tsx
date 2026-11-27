@@ -10114,6 +10114,11 @@ const VOICE_STEPS: { title: string; text: string }[] = [
 
 function HelpPage({ profile }: { profile: ProfileT | null }) {
   const queryClient = useQueryClient();
+  // Retry any question saved on this device when both the backend and the
+  // local store failed earlier.
+  useEffect(() => {
+    void (api as any).flushPendingTickets({});
+  }, []);
   const [name, setName] = useState(profile?.full_name ?? "");
   const [phone, setPhone] = useState(profile?.phone ?? "");
   const [topic, setTopic] = useState("My application");
@@ -15552,6 +15557,9 @@ function MyTickets({ phone }: { phone: string }) {
               <p className="font-bold text-[var(--text)]">
                 Ticket {ticketNumber(t.id, t.created_at)}: {t.topic}
               </p>
+              {t.reference ? (
+                <p className="text-[var(--dim)]">Application {t.reference}</p>
+              ) : null}
               <p className="text-[var(--dim)]">{t.message}</p>
               <p className="mt-1 text-[var(--dim)]">
                 Status: {t.status}
@@ -17399,11 +17407,17 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
     onSuccess: (r, question) => {
       setMessages((prev) => [...prev, { from: "ai", text: r.answer }]);
       if (r.needs_ticket) {
-        setPendingRoute(r.route && r.route !== "None" ? r.route : "Help desk");
+        const route = r.route && r.route !== "None" ? r.route : "Help desk";
+        setPendingRoute(route);
         setPendingQuestion(question);
+        if (profile) {
+          // Signed in: capture the question at once as a ticket. Closing
+          // the panel must never lose it.
+          createTicket.mutate({ question, route });
+        }
       }
     },
-    onError: () => {
+    onError: (_e, question) => {
       setMessages((prev) => [
         ...prev,
         {
@@ -17412,19 +17426,26 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
         },
       ]);
       setPendingRoute("Help desk");
+      setPendingQuestion(question);
+      if (profile) {
+        // The answer path itself failed. Capture the question at once, so
+        // it is not lost if the panel is closed.
+        createTicket.mutate({ question, route: "Help desk" });
+      }
     },
   });
-  const relatedApp = () => {
+  // The application this question is about, when the citizen names its
+  // tracking number. No match means no link: guessing the first
+  // application would attach the ticket to the wrong application.
+  const relatedAppFor = (question: string) => {
     const myApps = apps.data?.applications ?? [];
-    return (
-      myApps.find((a) =>
-        pendingQuestion.toUpperCase().includes(a.reference.toUpperCase()),
-      ) ?? myApps[0]
+    return myApps.find((a) =>
+      question.toUpperCase().includes(a.reference.toUpperCase()),
     );
   };
   const createTicket = useMutation({
-    mutationFn: async () => {
-      const related = relatedApp();
+    mutationFn: async (v: { question: string; route: string }) => {
+      const related = relatedAppFor(v.question);
       const syncNote = related
         ? `\n\n[Synced to application ${related.reference} (${related.service_name} at ${related.institution}, status ${related.status}). Keep every reply on this same application and tracking number, ${related.reference}.]`
         : "";
@@ -17432,17 +17453,37 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
         profileId: profile?.id ?? null,
         name: profile?.full_name ?? guestName,
         phone: profile?.phone ?? guestPhone,
-        topic: pendingRoute,
-        message: `${pendingQuestion}\n\n[Passed by the PortaGov assistant to: ${pendingRoute}. The assistant could not answer this fully. Citizen is signed in as ${profile?.full_name ?? "a guest"}.]${syncNote}`,
+        topic: v.route,
+        message: `${v.question}\n\n[Passed by the PortaGov assistant to: ${v.route}. The assistant could not answer this fully. Citizen is signed in as ${profile?.full_name ?? "a guest"}.]${syncNote}`,
+        applicationId: related?.id ?? null,
+        source: "assistant",
       });
     },
-    onSuccess: (r) => {
-      const related = relatedApp();
+    onSuccess: (r, v) => {
+      const related = relatedAppFor(v.question);
       setTicketMsg(
-        `Done. Your ticket is ${ticketNumber(r.id, new Date().toISOString())}, routed to ${pendingRoute}.${related ? ` It is synced to your application ${related.reference}, so the reply stays on that same tracking number.` : ""} A real person will answer, promised within one working day, and the reply lands in your messages and on the Help page, under the same history. Nobody will ask you the same thing twice.`,
+        `Done. Your ticket is ${ticketNumber(r.id, new Date().toISOString())}, routed to ${v.route}.${related ? ` It is synced to your application ${related.reference}, so the reply stays on that same tracking number.` : ""} A real person will answer, promised within one working day, and the reply lands in your messages and on the Help page, under the same history. Nobody will ask you the same thing twice.`,
       );
       setPendingRoute("");
       setPendingQuestion("");
+    },
+    onError: (e) => {
+      const msg = e instanceof Error ? e.message : "";
+      if (msg.includes("saved on this device")) {
+        // The question is queued on this device and will be sent when the
+        // connection is back. Nothing more to do here.
+        setTicketMsg(
+          "Your question is saved on this device and will reach the Help desk as soon as the connection is back. A real person will still answer you.",
+        );
+        setPendingRoute("");
+        setPendingQuestion("");
+        return;
+      }
+      setTicketMsg(`Your ticket could not be made: ${msg || "please try again."}`);
+      if (profile) {
+        setPendingRoute("");
+        setPendingQuestion("");
+      }
     },
   });
   const simplify = useMutation({
@@ -17477,6 +17518,11 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
     const el = scrollRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight });
   }, [messages, ask.isPending, pendingRoute, ticketMsg]);
+  // Retry any question saved on this device when both the backend and the
+  // local store failed earlier.
+  useEffect(() => {
+    if (open) void (api as any).flushPendingTickets({});
+  }, [open ]);
   return (
     <>
       <button
@@ -17528,24 +17574,25 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
             {ask.isPending ? (
               <p className="text-sm text-[var(--dim)]">Thinking...</p>
             ) : null}
-            {pendingRoute ? (
+            {pendingRoute && !profile ? (
               <div className="rounded-xl bg-[var(--gold-soft)] p-3 text-sm">
                 <p className="font-semibold text-[var(--warn)]">
                   This one needs a person. The right team is: {pendingRoute}.
                 </p>
-                {!profile ? (
-                  <div className="mt-2 space-y-2">
-                    <input aria-label="Your name for the ticket" {...FIELDS.submitHelpRequest.name} className={inputCls} value={guestName}
-                      onChange={(e) => setGuestName(e.target.value)} placeholder="Your full name" />
-                    <input aria-label="Your phone for the ticket" {...FIELDS.submitHelpRequest.phone} className={inputCls} value={guestPhone}
-                      onChange={(e) => setGuestPhone(e.target.value)} placeholder="Your phone number" />
-                  </div>
-                ) : null}
+                <p className="mt-1 text-[var(--dim)]">
+                  Give your name and phone, so a real person can answer you.
+                </p>
+                <div className="mt-2 space-y-2">
+                  <input aria-label="Your name for the ticket" {...FIELDS.submitHelpRequest.name} className={inputCls} value={guestName}
+                    onChange={(e) => setGuestName(e.target.value)} placeholder="Your full name" />
+                  <input aria-label="Your phone for the ticket" {...FIELDS.submitHelpRequest.phone} className={inputCls} value={guestPhone}
+                    onChange={(e) => setGuestPhone(e.target.value)} placeholder="Your phone number" />
+                </div>
                 <div className="mt-2">
                   <PrimaryButton
                     onClick={() => {
-                      if (!profile && (guestName.trim().length < 2 || guestPhone.trim().length < 7)) return;
-                      createTicket.mutate();
+                      if (guestName.trim().length < 2 || guestPhone.trim().length < 7) return;
+                      createTicket.mutate({ question: pendingQuestion, route: pendingRoute });
                     }}
                     disabled={createTicket.isPending}
                   >
@@ -17553,6 +17600,11 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
                   </PrimaryButton>
                 </div>
               </div>
+            ) : null}
+            {pendingRoute && profile && createTicket.isPending ? (
+              <p className="text-sm text-[var(--dim)]">
+                Saving your question as a ticket for {pendingRoute}. A real person will answer you.
+              </p>
             ) : null}
             {ticketMsg ? (
               <p className="rounded-xl bg-[var(--surface-alt)] p-3 text-sm font-semibold text-[var(--text)]">
@@ -17826,6 +17878,9 @@ function HelpDeskPanel({ staffName }: { staffName?: string }) {
                 {ticketNumber(t.id, t.created_at)}: {t.topic}, from {t.name} ({t.phone})
                 {isLate ? <span className="ml-2 rounded px-2 py-0.5 text-xs text-white" style={{ backgroundColor: "#b3261e" }}>WAITING TOO LONG</span> : null}
               </p>
+              {t.reference ? (
+                <p className="text-[var(--dim)]">Application {t.reference}</p>
+              ) : null}
               <p className="text-[var(--dim)]">{t.message}</p>
               <p className="mt-1 text-[var(--dim)]">
                 Status: {t.status}
