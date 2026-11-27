@@ -123,6 +123,26 @@ function useOfficerSession(): [
     void (api as any).staffSignOut({}).catch(() => undefined);
     setSession(null);
   };
+  /* An admin or officer who signed in through the citizen sign-in
+     already holds a staff session: adopt it on mount instead of
+     asking for a second sign-in on the console's own form. The
+     adoption lives in remote getStaffSession: it checks the role,
+     so a plain citizen is never adopted. */
+  useEffect(() => {
+    if (session) return;
+    let live = true;
+    void (api as any)
+      .getStaffSession({})
+      .then((r: any) => {
+        if (live && r?.staff) setSessionState(r.staff);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+    // Only on mount: the session state itself is the guard.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   return [session, setSession, signOut];
 }
 
@@ -6996,9 +7016,11 @@ function TrackPage({ profile }: { profile: ProfileT | null }) {
               billing={app.billing_number}
               transaction={
                 trackPayment?.transaction_ref ||
-                (app.billing_status === "Paid" || app.amount_paid > 0
-                  ? "Paid, number not loaded yet"
-                  : undefined)
+                (trackPayments.isPending
+                  ? "Loading..."
+                  : app.billing_status === "Paid" || app.amount_paid > 0
+                    ? "Paid, number not loaded yet"
+                    : undefined)
               }
               amountPaid={app.amount_paid}
               payerPhone={trackPayment?.payer_phone}
@@ -7038,6 +7060,16 @@ const INSTITUTION_STATUSES = [
   "More information needed",
 ] as const;
 
+/* The raw backend status on a live staff row (in_review, approved,
+   ready_for_collection): the frontend words alone cannot tell
+   approved apart from ready_for_collection, both read "Ready for
+   collection", and the backend only allows ready from approved and
+   complete from ready_for_collection. Local demo rows carry none,
+   and for those every option stays available, as before. */
+function backendStatusOf(app: ApplicationT): string {
+  return String((app as any).backend_status || "");
+}
+
 function InstitutionRow({ app }: { app: ApplicationT }) {
   const queryClient = useQueryClient();
   const flag = useFlags();
@@ -7062,6 +7094,44 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
   );
   const [note, setNote] = useState("");
   const [saved, setSaved] = useState(false);
+  /* The backend state machine, not the dropdown, decides what an
+     officer may do next: approve only from in_review (it issues the
+     certificate), ready only from approved, complete only from
+     ready_for_collection. Options the backend would refuse are
+     disabled, with the reason on the option itself, so the desk
+     never offers a move that silently fails. The current value
+     always stays selectable, so the row can show where the
+     application is. */
+  const backendStatus = backendStatusOf(app);
+  const statusAllowed = (s: string): boolean => {
+    if (s === app.status) return true;
+    if (!backendStatus) return true;
+    if (s === "Ready for collection") return backendStatus === "approved";
+    if (s === "Completed") return backendStatus === "ready_for_collection";
+    if (s === "Appointment set") return backendStatus === "in_review";
+    if (s === "More information needed")
+      return backendStatus === "in_review" || backendStatus === "submitted";
+    return backendStatus === "submitted";
+  };
+  const statusHint = (s: string): string => {
+    if (statusAllowed(s)) return "";
+    if (s === "Ready for collection") return "Approve the application first";
+    if (s === "Completed") return "Mark it ready for collection first";
+    if (s === "Appointment set") return "Only while the application is in review";
+    return "Not available at this step";
+  };
+  const canApprove = !backendStatus || backendStatus === "in_review";
+  /* The row keeps its own picked status, but when the live queue
+     reports a new status (after an approve, a ready, or another
+     officer's change) the picker follows it, so a reload never
+     shows a stale choice. */
+  useEffect(() => {
+    setStatus(
+      INSTITUTION_STATUSES.includes(app.status as (typeof INSTITUTION_STATUSES)[number])
+        ? app.status
+        : "Received by institution",
+    );
+  }, [app.status]);
   const update = useMutation({
     mutationFn: async () =>
       await api.updateApplicationStatus({
@@ -7080,6 +7150,22 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
       void queryClient.invalidateQueries({ queryKey: ["applications"] });
     },
   });
+  const approve = useMutation({
+    mutationFn: async () =>
+      await (api as any).approveApplication({ id: app.id, statusNote: note }),
+    onSuccess: () => {
+      setSaved(true);
+      void queryClient.invalidateQueries({ queryKey: ["institution-apps"] });
+      void queryClient.invalidateQueries({ queryKey: ["all-apps"] });
+      void queryClient.invalidateQueries({ queryKey: ["applications"] });
+    },
+  });
+  const rowError =
+    update.error instanceof Error
+      ? update.error.message
+      : approve.error instanceof Error
+        ? approve.error.message
+        : "";
   const details = parseDetails(app.details);
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
@@ -7119,7 +7205,9 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
           <select id={`inst-status-${app.id}`} {...FIELDS.updateApplicationStatus.status} className={inputCls} value={status}
             onChange={(e) => setStatus(e.target.value)}>
             {INSTITUTION_STATUSES.map((s) => (
-              <option key={s} value={s}>{s}</option>
+              <option key={s} value={s} disabled={!statusAllowed(s)} title={statusHint(s) || undefined}>
+                {s}{statusHint(s) ? ` (${statusHint(s)})` : ""}
+              </option>
             ))}
           </select>
         </div>
@@ -7129,10 +7217,29 @@ function InstitutionRow({ app }: { app: ApplicationT }) {
             onChange={(e) => setNote(e.target.value)}
             placeholder="For example: come with your old passport on Tuesday" />
         </div>
-        <PrimaryButton onClick={() => update.mutate()} disabled={update.isPending}>
-          {update.isPending ? "Saving..." : saved ? "Saved" : "Update citizen"}
-        </PrimaryButton>
+        <div className="flex flex-wrap gap-2">
+          {canApprove ? (
+            <PrimaryButton onClick={() => approve.mutate()} disabled={approve.isPending || update.isPending}>
+              {approve.isPending ? "Approving..." : "Approve application"}
+            </PrimaryButton>
+          ) : null}
+          <PrimaryButton onClick={() => update.mutate()} disabled={update.isPending || approve.isPending}>
+            {update.isPending ? "Saving..." : saved ? "Saved" : "Update citizen"}
+          </PrimaryButton>
+        </div>
       </div>
+      {canApprove ? (
+        <p className="mt-2 text-sm text-[var(--dim)]">
+          Approve checks the application and issues the certificate. After
+          approval, mark it ready for collection, then completed when the
+          citizen collects it.
+        </p>
+      ) : null}
+      {rowError ? (
+        <p role="alert" className="mt-2 rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+          {rowError}
+        </p>
+      ) : null}
       <div className="mt-2">
         <LiberianReplyChips onPick={setNote} />
       </div>
@@ -9177,7 +9284,11 @@ function ApplicationExtras({
             label="Transaction number"
             value={
               latestPayment?.transaction_ref ||
-              (paid ? "Paid, number not loaded yet" : "Not paid yet")
+              (payments.isPending
+                ? "Loading..."
+                : paid
+                  ? "Paid, number not loaded yet"
+                  : "Not paid yet")
             }
             dimValue={!latestPayment}
           />
@@ -9626,7 +9737,9 @@ function ThreadPanel({
         and keeps it safe.
       </p>
       <div className="mt-3 space-y-2">
-        {thread.length > 0 ? (
+        {msgs.isPending ? (
+          <p className="text-sm text-[var(--dim)]">Loading messages...</p>
+        ) : thread.length > 0 ? (
           thread.map((m: MessageT) => (
             <div
               key={m.id}
