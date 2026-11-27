@@ -3141,6 +3141,7 @@ function LoginForm({
       const d = deviceInfo();
       return await api.verifyLoginCode({
         profileId,
+        phone: phone.trim(),
         code: code.trim(),
         deviceId: d.deviceId,
         deviceLabel: d.label,
