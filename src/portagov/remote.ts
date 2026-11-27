@@ -488,7 +488,7 @@ function toFrontendApplication(b: any, extra?: any): any {
     applicant_name: b.applicant?.full_name || saved.applicant_name || "",
     service_id: CODE_TO_FRONTEND[b.service?.code] || b.service?.code || saved.service_id || "",
     service_name: b.service?.name || saved.service_name || "",
-    institution: b.service?.institution?.name || saved.institution || "",
+    institution: institutionName(b.service?.institution) || saved.institution || "",
     status,
     released,
     on_behalf_of: saved.on_behalf_of || "",
@@ -693,6 +693,18 @@ function staffRows(res: any, key?: string): any[] {
   return [];
 }
 
+/** The backend sends an institution in two shapes: Application.to_dict
+    sends service.institution as a plain string ("Ministry of Health"),
+    while Service.to_dict sends it as an object ({name, ...}). Read
+    both, or every live staff row ends up with institution "" and no
+    desk filter ever matches it (verified live 2026-11-27: the MOH
+    desk showed 0 waiting for a released application). */
+function institutionName(v: any): string {
+  if (typeof v === "string") return v;
+  if (v && typeof v === "object") return String(v.name || "");
+  return "";
+}
+
 /** Normalise one backend staff application into the frontend
     ApplicationT shape, using the ONE shared status mapping. The
     backend row may be the citizen shape (service/applicant objects)
@@ -716,8 +728,14 @@ function toStaffApplication(b: any): any {
     applicant_name: String(applicant.full_name || b.applicant_name || ""),
     service_id: CODE_TO_FRONTEND[svc.code] || svc.code || String(b.service_id || b.service_code || ""),
     service_name: String(svc.name || b.service_name || ""),
-    institution: String(svc.institution?.name || b.institution || b.institution_name || ""),
+    institution: institutionName(svc.institution) || institutionName(b.institution) || "",
     status,
+    /* The raw backend status, so the desk can gate its controls on
+       the real state machine (approve only from in_review, ready
+       only from approved, complete only from ready_for_collection):
+       the frontend words alone cannot tell approved apart from
+       ready_for_collection, both read "Ready for collection". */
+    backend_status: String(b.status || ""),
     released: Boolean(released),
     on_behalf_of: String(b.beneficiary?.name || b.on_behalf_of || ""),
     priority: String(b.priority || "Standard"),
@@ -1784,7 +1802,32 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
      listOnboardedInstitutions are the three functions to wire. */
 
   async getStaffSession(_args: any) {
-    return { staff: readStaffSession() };
+    const existing = readStaffSession();
+    if (existing) return { staff: existing };
+    /* An admin or officer who signed in through the citizen sign-in
+       already holds a valid token for their role: the backend issues
+       one JWT per login, and the staff endpoints accept it. Adopt
+       that session for the desks instead of making them sign in a
+       second time on the console's own form (verified live
+       2026-11-27: the console stayed on demo data until the second
+       sign-in). A citizen token is refused here, exactly like the
+       staff sign-in form refuses a citizen account. Adopting is
+       safe: staff sign-out only clears the local staff key, and the
+       backend has no single-session logout to revoke the token. */
+    const citizenToken = getToken();
+    if (!citizenToken || getStaffToken()) return { staff: null };
+    try {
+      const me = await apiCall("/api/auth/me", {});
+      const role = String(me?.role || "");
+      if (!(STAFF_ROLES as readonly string[]).includes(role)) return { staff: null };
+      setStaffToken(citizenToken);
+      const staff = sessionFromUser(me);
+      saveStaffSession(staff);
+      storeSet("portagov-officer", staff.name);
+      return { staff };
+    } catch {
+      return { staff: null };
+    }
   },
 
   async staffSignIn(args: any) {
@@ -1886,16 +1929,39 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     };
     const action = actionMap[args.status];
     if (!action || !getStaffToken()) return (Actions as any).updateApplicationStatus(args);
-    try {
-      await staffApiCall(`/api/staff/applications/${args.id}/action`, {
-        method: "POST",
-        body: { action, note: args.statusNote || "", message: args.statusNote || "" },
+    /* Signed in: a failed live status change is a real failure, and
+       the desk shows the backend's reason. A 409 means the backend
+       state machine refused the move (for example Ready from
+       in_review, which needs Approve first, or Complete from
+       in_review, which needs Ready first). Falling back to the local
+       store used to show "Saved" and then revert on reload, because
+       the queue itself comes from the backend (verified live
+       2026-11-27 on LR-2611-3FF42F). Never do that again. */
+    await staffApiCall(`/api/staff/applications/${args.id}/action`, {
+      method: "POST",
+      body: { action, note: args.statusNote || "", message: args.statusNote || "" },
+    });
+    return { ok: true };
+  },
+
+  async approveApplication(args: any) {
+    /* The desk Approve button: the backend approve action issues
+       the certificate. It only works from in_review at the final
+       workflow stage; anything else is a 409 with the reason, shown
+       on the desk, never a silent local write. Without a staff
+       session this is the local demo desk, so approve there is the
+       local status move to Ready for collection. */
+    if (!getStaffToken()) {
+      return (Actions as any).updateApplicationStatus({
+        ...args,
+        status: "Ready for collection",
       });
-      return { ok: true };
-    } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
-      return (Actions as any).updateApplicationStatus(args);
     }
+    await staffApiCall(`/api/staff/applications/${args.id}/action`, {
+      method: "POST",
+      body: { action: "approve", note: args.statusNote || "", message: args.statusNote || "" },
+    });
+    return { ok: true };
   },
 
   async confirmReceipt(args: any) {
@@ -1911,7 +1977,7 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       });
       return { ok: true };
     } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      if (isAuthError(e) || (e?.status >= 400 && e?.status < 500)) throw e;
       return (Actions as any).confirmReceipt(args);
     }
   },
@@ -1929,7 +1995,7 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       });
       return { ok: true };
     } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      if (isAuthError(e) || (e?.status >= 400 && e?.status < 500)) throw e;
       return (Actions as any).requestMoreInfo(args);
     }
   },
@@ -1943,7 +2009,7 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       });
       return { ok: true };
     } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      if (isAuthError(e) || (e?.status >= 400 && e?.status < 500)) throw e;
       return (Actions as any).sendInstitutionMessage(args);
     }
   },
@@ -2084,17 +2150,51 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
           .map(([label, count]) => ({ label, count }))
           .sort((a, b) => b.count - a.count);
       };
-      const arr = (v: any) =>
-        Array.isArray(v)
-          ? v
-              .map((r: any) => ({ label: String(r.label ?? r.name ?? ""), count: Number(r.count ?? r.value ?? 0) }))
-              .filter((r: any) => r.label)
-          : [];
+      const arr = (v: any): { label: string; count: number }[] => {
+        if (Array.isArray(v)) {
+          return v
+            .map((r: any) => ({ label: String(r.label ?? r.name ?? ""), count: Number(r.count ?? r.value ?? 0) }))
+            .filter((r: any) => r.label);
+        }
+        /* /api/admin/stats sends by_status as a dict, not an array:
+           {"in_review": 2, "completed": 1}. Turn each key into a row,
+           in the frontend words the citizen and the desk see, and
+           merge keys that map to the same words (approved and
+           ready_for_collection both read "Ready for collection"). */
+        if (v && typeof v === "object") {
+          const merged = new Map<string, number>();
+          for (const [label, count] of Object.entries(v)) {
+            const words = mapBackendStatus(label);
+            merged.set(words, (merged.get(words) ?? 0) + (Number(count) || 0));
+          }
+          return [...merged.entries()]
+            .map(([label, count]) => ({ label, count }))
+            .filter((r) => r.label && r.count > 0)
+            .sort((a, b) => b.count - a.count);
+        }
+        return [];
+      };
       let byInstitution = arr(s.by_institution);
       let byStatus = arr(s.by_status);
       let byChannel = arr(s.by_channel);
       let byService = arr(s.by_service);
       let totalApplications = Number(s.total_applications ?? s.applications ?? s.total ?? 0);
+      let totalPayments = Number(s.total_payments ?? s.payments ?? 0);
+      /* /api/admin/stats reports no payment total at all, so the
+         console heading read "0 payments recorded" under a live list
+         showing 8 (verified live 2026-11-27). Count the live
+         platform payments instead. There is no staff/admin
+         appointments list endpoint on the backend, so the
+         appointments total still comes from stats (0) until one
+         exists; that gap is named in the PR, not papered over. */
+      if (!totalPayments) {
+        try {
+          const res = await staffApiCall("/api/staff/payments", {});
+          totalPayments = staffRows(res, "items").length;
+        } catch {
+          // Keep the stats value rather than failing the report.
+        }
+      }
       // If the stats reply carries no breakdowns, tally them from the
       // live admin queue instead of showing empty tables.
       if (!byInstitution.length || !byStatus.length || !byChannel.length || !byService.length) {
@@ -2112,7 +2212,7 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       return {
         total_applications: totalApplications,
         total_profiles: Number(s.total_profiles ?? s.users ?? s.citizens ?? 0),
-        total_payments: Number(s.total_payments ?? s.payments ?? 0),
+        total_payments: totalPayments,
         total_appointments: Number(s.total_appointments ?? s.appointments ?? 0),
         by_status: byStatus,
         by_institution: byInstitution,
@@ -2150,6 +2250,48 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       if (isAuthError(e)) throw e;
       return (Actions as any).listAuditLog(args);
     }
+  },
+
+  async getDailySummary(_args: any) {
+    if (!getStaffToken()) return (Actions as any).getDailySummary({});
+    /* Live Morning summary for the console: tallied from the live
+       admin queue and the live platform payments, not the local demo
+       store, which always read 0 in a fresh browser (verified live
+       2026-11-27). Open tickets still live in the local help desk;
+       there is no backend ticket count, so that card keeps the local
+       count. Signed in and the live queue fails: throw, never show
+       seed counts. */
+    const apps = await fetchAdminApplications();
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const dayMs = 24 * 3600 * 1000;
+    let paymentsToday = 0;
+    try {
+      const res = await staffApiCall("/api/staff/payments", {});
+      paymentsToday = staffRows(res, "items").filter(
+        (p: any) => new Date(p.created_at || 0) >= start,
+      ).length;
+    } catch {
+      paymentsToday = 0;
+    }
+    const local = await (Actions as any).getDailySummary({}).catch(() => null);
+    return {
+      date_label: start.toLocaleDateString("en-GB", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      }),
+      applications_today: apps.filter((a: any) => new Date(a.created_at) >= start).length,
+      released_total: apps.filter((a: any) => a.released).length,
+      held_total: apps.filter((a: any) => !a.released).length,
+      stuck_over_24h: apps.filter(
+        (a: any) => !a.released && Date.now() - new Date(a.created_at).getTime() > dayMs,
+      ).length,
+      open_tickets: Number(local?.open_tickets ?? 0),
+      payments_today: paymentsToday,
+      completed_total: apps.filter((a: any) => a.status === "Completed").length,
+    };
   },
 
   async getInstitutionDailySummary(args: any) {
@@ -2221,7 +2363,7 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
       });
       return { ok: true };
     } catch (e: any) {
-      if (isAuthError(e) || e?.status === 400 || e?.status === 422) throw e;
+      if (isAuthError(e) || (e?.status >= 400 && e?.status < 500)) throw e;
       return (Actions as any).addStaff(args);
     }
   },
