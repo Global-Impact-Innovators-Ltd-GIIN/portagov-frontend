@@ -23,7 +23,12 @@ const csp = [
   "frame-src 'self' blob:",
   "object-src 'self' blob:",
   "font-src 'self' data:",
-  `connect-src 'self' ${api}`,
+  /* blob: and data: are needed here: the wallet viewer turns a saved
+     file's data: URL into a blob: URL, and fetch(data:) was silently
+     blocked by connect-src before, so no blob: URL was ever made and
+     the PDF preview sat on "Preparing preview..." forever. Both are
+     local to the citizen's own browser, not new outside origins. */
+  `connect-src 'self' blob: data: ${api}`,
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",

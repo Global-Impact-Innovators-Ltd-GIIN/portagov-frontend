@@ -416,6 +416,14 @@ function waitLabel(iso: string): string {
   return `${days} day${days === 1 ? "" : "s"}`;
 }
 
+/** A count with the right singular or plural word, so the site never
+    says "1 services" or "2 service". One shared helper for every count
+    on the site: services, documents, applications, appointments,
+    payments, messages, days, hours, minutes, records and tables. */
+function countLabel(n: number, singular: string): string {
+  return `${n} ${singular}${n === 1 ? "" : "s"}`;
+}
+
 /** Real sharpness check for a photo, run in the browser before submit.
     The image is shrunk to a small size and the variance of its Laplacian
     is measured: a sharp photo has strong edges and a high variance, a
@@ -634,13 +642,14 @@ function dateFieldError(
 
 /* ---------- shared UI ---------- */
 
-function Chip({ children, tone }: { children: ReactNode; tone?: "gold" | "plain" }) {
+function Chip({ children, tone, className }: { children: ReactNode; tone?: "gold" | "plain"; className?: string }) {
   return (
     <span
       className={
-        tone === "gold"
+        (tone === "gold"
           ? "inline-block rounded-full bg-[var(--gold-soft)] px-2.5 py-1 text-xs font-semibold text-[var(--warn)]"
-          : "inline-block rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-2.5 py-1 text-xs font-semibold text-[var(--dim)]"
+          : "inline-block rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-2.5 py-1 text-xs font-semibold text-[var(--dim)]") +
+        (className ? ` ${className}` : "")
       }
     >
       {children}
@@ -1150,7 +1159,7 @@ function SignedInHome({ profile }: { profile: ProfileT }) {
   } else if (soonDoc) {
     next = {
       title: `Your ${soonDoc.doc.title} expires soon`,
-      detail: `It expires on ${fmtDate(soonDoc.doc.expires_on)}, in ${soonDoc.days} days. Renew it in good time, then update it in your wallet.`,
+      detail: `It expires on ${fmtDate(soonDoc.doc.expires_on)}, in ${countLabel(soonDoc.days, "day")}. Renew it in good time, then update it in your wallet.`,
       href: "#/wallet",
       label: "Update it in my wallet",
     };
@@ -1271,10 +1280,10 @@ function SignedInHome({ profile }: { profile: ProfileT }) {
                       <span className="block text-[var(--dim)]">
                         Expires {fmtDate(doc.expires_on)}
                         {days < 0
-                          ? `, expired ${Math.abs(days)} days ago`
+                          ? `, expired ${countLabel(Math.abs(days), "day")} ago`
                           : days === 0
                             ? ", expires today"
-                            : `, ${days} days left`}
+                            : `, ${countLabel(days, "day")} left`}
                       </span>
                     </li>
                   ))}
@@ -1311,6 +1320,7 @@ function HomePage({
   goApply: (service: Service) => void;
   lowData?: boolean;
 }) {
+  const [flippedWhat, setFlippedWhat] = useState("");
   return (
     <div>
       <EmergencyBanner />
@@ -1423,15 +1433,62 @@ function HomePage({
               t: "Checked by PortaGov first",
               d: "PortaGov holds and reviews each application before releasing it to the institution, so incomplete applications are caught early and your progress is tracked at every step.",
             },
-          ].map((c) => (
-            <div
-              key={c.t}
-              className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
-            >
-              <h3 className="font-display text-lg font-bold text-[var(--text)]">{c.t}</h3>
-              <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">{c.d}</p>
-            </div>
-          ))}
+          ].map((c) => {
+            const flipped = flippedWhat === c.t;
+            const toggle = () => setFlippedWhat(flipped ? "" : c.t);
+            /* Tap the card to flip it; the button inside is the
+               keyboard control, exactly like the embassy flip cards. */
+            return (
+              <div
+                key={c.t}
+                className="h-56 cursor-pointer [perspective:1200px]"
+                onClick={toggle}
+              >
+                <div
+                  className="relative h-full w-full transition-transform duration-500 [transform-style:preserve-3d] motion-reduce:transition-none"
+                  style={{ transform: flipped ? "rotateY(180deg)" : "rotateY(0deg)" }}
+                >
+                  {/* Front: only the short title. */}
+                  <div className="absolute inset-0 flex flex-col justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 [backface-visibility:hidden] [-webkit-backface-visibility:hidden]">
+                    <h3 className="font-display text-lg font-bold leading-snug text-[var(--text)]">{c.t}</h3>
+                    <button
+                      type="button"
+                      aria-expanded={flipped}
+                      aria-label={`Flip the card for ${c.t} to read more`}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        toggle();
+                      }}
+                      className="mt-4 self-start rounded-full border border-[var(--border)] px-3 py-1.5 text-sm font-semibold text-[var(--accent)]"
+                    >
+                      Tap the card to flip it and read more
+                    </button>
+                  </div>
+                  {/* Back: the full detail, nothing deleted. */}
+                  <div className="absolute inset-0 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface-alt)] p-5 [backface-visibility:hidden] [-webkit-backface-visibility:hidden] [transform:rotateY(180deg)]">
+                    <div className="flex items-start justify-between gap-3">
+                      <h3 className="font-display text-base font-bold text-[var(--text)]">{c.t}</h3>
+                      <button
+                        type="button"
+                        aria-label={`Flip the card for ${c.t} back to the front`}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          toggle();
+                        }}
+                        className="shrink-0 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--accent)]"
+                      >
+                        Flip back
+                      </button>
+                    </div>
+                    <p className="mt-3 text-sm leading-relaxed text-[var(--dim)]">{c.d}</p>
+                    <p className="mt-3 text-sm font-semibold text-[var(--accent)]">
+                      Tap the card again to flip it back to the front.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </section>
 
@@ -1447,10 +1504,10 @@ function HomePage({
               className="block rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
             >
               <div className="flex items-start justify-between gap-3">
-                <h3 className="font-display text-lg font-bold leading-snug text-[var(--text)]">
+                <h3 className="min-w-0 font-display text-lg font-bold leading-snug text-[var(--text)]">
                   {m.name}
                 </h3>
-                <Chip>{servicesForMinistry(m.id).length} services</Chip>
+                <Chip className="shrink-0 whitespace-nowrap">{countLabel(servicesForMinistry(m.id).length, "service")}</Chip>
               </div>
               <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">{m.blurb}</p>
               <p className="mt-3 text-sm font-bold" style={{ color: "var(--accent)" }}>
@@ -2914,7 +2971,7 @@ function LoginForm({
         setStep("code");
       } else if (r.result === "locked") {
         setError(
-          `This account is locked for about ${r.minutes_left} minutes because of too many wrong passwords. Wait, then try again. Locking keeps thieves out.`,
+          `This account is locked for about ${countLabel(r.minutes_left, "minute")} because of too many wrong passwords. Wait, then try again. Locking keeps thieves out.`,
         );
       } else if (r.result === "bad_credentials") {
         setError(
@@ -3034,7 +3091,7 @@ function LoginForm({
       </div>
       <div>
         <FieldLabel htmlFor="li-password">Your password</FieldLabel>
-        <input id="li-password" {...FIELDS.loginStart.password} type="password" className={inputCls} value={password}
+        <input id="li-password" {...FIELDS.loginStart.password} required={false} type="password" className={inputCls} value={password}
           onChange={(e) => setPassword(e.target.value)} autoComplete="current-password"
           placeholder="Leave empty only if an officer made your account and you have no password yet" />
       </div>
@@ -5190,6 +5247,31 @@ function dataUrlSize(url: string): number | null {
   return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
 }
 
+/** Turn a data: URL into a Blob without a network fetch. The viewer
+    used to fetch() the data: URL, but the site's Content-Security-Policy
+    connect-src did not allow data:, so that fetch was blocked silently,
+    no blob: URL was ever made, and the preview sat on "Preparing
+    preview..." forever while Download still worked and a new tab opened
+    blank (Chrome blocks top-level navigation to data: URLs). Decoding
+    the base64 here needs no fetch at all. Non-base64 data: URLs return
+    null and fall back to fetch, which the CSP now allows. */
+function dataUrlToBlob(dataUrl: string): Blob | null {
+  const marker = ";base64,";
+  const at = dataUrl.indexOf(marker);
+  if (at < 0) return null;
+  const type = dataUrl.slice(5, at);
+  const b64 = dataUrl.slice(at + marker.length).replace(/\s/g, "");
+  if (!b64) return null;
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: type || "application/pdf" });
+  } catch {
+    return null;
+  }
+}
+
 function viewerDocFromSaved(d: DocumentT): ViewerDoc {
   return {
     title: d.title || d.doc_type,
@@ -5234,6 +5316,7 @@ function DocumentViewer({
      browser's PDF viewer accepts. Blob: URLs already work as they
      are, and are left alone. */
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [blobFailed, setBlobFailed] = useState(false);
   /* A PDF frame that never loads is a blocked frame: Chrome does
      not fire load for a frame it blocks, so after a few seconds
      without a load the viewer shows its own fallback instead of
@@ -5244,24 +5327,36 @@ function DocumentViewer({
   const docUrl = doc?.url ?? "";
 
   useEffect(() => {
+    const created: { url: string | null } = { url: null };
     let cancelled = false;
-    let created: string | null = null;
     setBlobUrl(null);
+    setBlobFailed(false);
     if (docUrl.startsWith("data:")) {
-      void fetch(docUrl)
-        .then((r) => r.blob())
-        .then((b) => {
-          if (cancelled) return;
-          created = URL.createObjectURL(b);
-          setBlobUrl(created);
-        })
-        .catch(() => {
-          /* Keep the data: URL as a fallback: Download still works. */
-        });
+      /* Decode the base64 here, in the page, with no fetch: the CSP
+         connect-src used to block fetch(data:), which failed silently
+         and left the preview on "Preparing preview..." forever. */
+      const blob = dataUrlToBlob(docUrl);
+      if (blob) {
+        created.url = URL.createObjectURL(blob);
+        setBlobUrl(created.url);
+      } else {
+        /* Not a base64 data: URL: fetch it instead. The CSP now
+           allows data: and blob: in connect-src. */
+        void fetch(docUrl)
+          .then((r) => r.blob())
+          .then((b) => {
+            if (cancelled) return;
+            created.url = URL.createObjectURL(b);
+            setBlobUrl(created.url);
+          })
+          .catch(() => {
+            if (!cancelled) setBlobFailed(true);
+          });
+      }
     }
     return () => {
       cancelled = true;
-      if (created) URL.revokeObjectURL(created);
+      if (created.url) URL.revokeObjectURL(created.url);
     };
   }, [docUrl]);
 
@@ -5285,12 +5380,10 @@ function DocumentViewer({
      below because hooks cannot run after it. */
   useEffect(() => {
     if (doc?.contentType !== "application/pdf") return;
-    if (!displayUrl.startsWith("blob:") && !displayUrl.startsWith("http"))
-      return;
-    if (pdfLoaded || pdfFailed) return;
+    if (pdfLoaded || pdfFailed || blobFailed) return;
     const t = window.setTimeout(() => setPdfFailed(true), 6000);
     return () => window.clearTimeout(t);
-  }, [doc?.contentType, displayUrl, pdfLoaded, pdfFailed]);
+  }, [doc?.contentType, displayUrl, pdfLoaded, pdfFailed, blobFailed]);
 
   useEffect(() => {
     if (!doc) return;
@@ -5321,6 +5414,12 @@ function DocumentViewer({
     (displayUrl.startsWith("blob:") || displayUrl.startsWith("http"))
       ? displayUrl
       : "";
+  /* Only a blob: (or http(s):) address may be opened in a new tab:
+     Chrome blocks top-level navigation to a data: URL and opens a
+     blank tab instead. Until a blob: URL is ready the link has no
+     address and does nothing, instead of opening blank. */
+  const openUrl =
+    blobUrl ?? (docUrl.startsWith("http") ? docUrl : "");
   const canZoom = isImage || isPdf;
   const zoomLabel = fit
     ? "Fit to screen"
@@ -5470,7 +5569,7 @@ function DocumentViewer({
                     : { width: `${zoom * 100}%`, height: `${62 * zoom}vh` }
                 }
               >
-                {pdfFailed ? (
+                {pdfFailed || blobFailed ? (
                   <div className="flex h-full w-full flex-col items-center justify-center rounded-lg border border-[var(--border)] bg-white p-5 text-center">
                     <p className="font-display text-lg font-bold text-[var(--text)]">
                       This PDF could not be shown here
@@ -5490,7 +5589,7 @@ function DocumentViewer({
                         Download the file
                       </a>
                       <a
-                        href={displayUrl}
+                        href={openUrl || undefined}
                         target="_blank"
                         rel="noreferrer"
                         className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-bold text-[var(--text)]"
@@ -5517,7 +5616,7 @@ function DocumentViewer({
               <p className="mt-2 text-center text-sm text-[var(--dim)]">
                 If the PDF does not show here, use Download above, or{" "}
                 <a
-                  href={displayUrl}
+                  href={openUrl || undefined}
                   target="_blank"
                   rel="noreferrer"
                   className="font-semibold underline"
@@ -5550,7 +5649,7 @@ function DocumentViewer({
                   Download the file
                 </a>
                 <a
-                  href={displayUrl}
+                  href={openUrl || undefined}
                   target="_blank"
                   rel="noreferrer"
                   className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-bold text-[var(--text)]"
@@ -5894,9 +5993,7 @@ function WalletPage({ profile }: { profile: ProfileT }) {
      wrongly said "3 of 10 documents saved". "Still missing" counts
      the standard types not yet saved. */
   const savedCount = liveDocs.length;
-  const standardMissing = DOC_TYPES.filter(
-    (t) => !savedByType.has(t),
-  ).length;
+  const missingCount = Math.max(0, DOC_TYPES.length - savedCount);
   const stagedCount = Object.keys(staged).length;
   const warnedDocs = Object.entries(staged).flatMap(([docType, s]) =>
     checkStagedDoc(docType, s).map((warning) => ({ docType, warning })),
@@ -6063,9 +6160,9 @@ function WalletPage({ profile }: { profile: ProfileT }) {
           <p className="mt-5 font-display text-lg font-bold text-[var(--text)]" role="status">
             {savedCount <= DOC_TYPES.length
               ? `${savedCount} of ${DOC_TYPES.length} documents saved`
-              : `${savedCount} documents saved`}
-            {standardMissing > 0
-              ? `, ${standardMissing} still missing`
+              : `${countLabel(savedCount, "document")} saved`}
+            {missingCount > 0
+              ? `, ${missingCount} still missing`
               : ""}
           </p>
           <div className="mt-3 space-y-3">
@@ -7317,8 +7414,8 @@ function PlatformPage() {
             Payments across the platform
           </h2>
           <p className="mt-1 text-sm text-[var(--dim)]">
-            {report.data?.total_payments ?? 0} payments recorded,{" "}
-            {report.data?.total_appointments ?? 0} appointments booked.
+            {countLabel(report.data?.total_payments ?? 0, "payment")} recorded,{" "}
+            {countLabel(report.data?.total_appointments ?? 0, "appointment")} booked.
           </p>
           <div className="mt-3 space-y-2">
             {(payments.data?.payments ?? []).slice(0, 8).map((p: PaymentT) => (
@@ -8972,10 +9069,10 @@ function ExpiryReminders({ profile }: { profile: ProfileT }) {
               <p className="text-sm text-[var(--text)]">
                 <strong>{doc.title}</strong> ({doc.doc_type}){" "}
                 {days < 0
-                  ? `expired on ${fmtDate(doc.expires_on)}, ${Math.abs(days)} days ago`
+                  ? `expired on ${fmtDate(doc.expires_on)}, ${countLabel(Math.abs(days), "day")} ago`
                   : days === 0
                     ? `expires today, ${fmtDate(doc.expires_on)}`
-                    : `expires in ${days} days, on ${fmtDate(doc.expires_on)}`}
+                    : `expires in ${countLabel(days, "day")}, on ${fmtDate(doc.expires_on)}`}
                 . <Chip tone="gold">{tier}</Chip>
               </p>
               {renewal ? (
@@ -10489,7 +10586,7 @@ function PlatformExtras() {
                 <strong>{r.institution}:</strong> {r.submitted_week} new this
                 week, {r.completed_week} completed this week, {r.total} total,{" "}
                 {r.avg_hours != null
-                  ? `average ${r.avg_hours} hours to complete`
+                  ? `average ${countLabel(r.avg_hours, "hour")} to complete`
                   : "no completions yet to time"}
                 .
               </p>
@@ -10860,7 +10957,7 @@ function ChatInbox() {
           >
             <strong className="text-[var(--text)]">{t.name || t.phone}</strong>{" "}
             <span className="text-[var(--dim)]">
-              {t.phone}, {t.count} messages. Last: {t.last_body}
+              {t.phone}, {countLabel(t.count, "message")}. Last: {t.last_body}
             </span>
           </button>
         ))}
@@ -11077,7 +11174,7 @@ function ExpiryWalletList({ profile }: { profile: ProfileT }) {
                 <strong>{d.title}</strong> ({d.doc_type}), expires {fmtDate(d.expires_on)}
               </span>
               <Chip tone={days <= 30 ? "gold" : "plain"}>
-                {days < 0 ? `Expired ${Math.abs(days)} days ago` : `${days} days left`}
+                {days < 0 ? `Expired ${countLabel(Math.abs(days), "day")} ago` : `${countLabel(days, "day")} left`}
               </Chip>
             </li>
           );
@@ -12086,8 +12183,8 @@ function PublicDashboardPage() {
                   <div key={i.institution} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
                     <p className="font-display font-bold text-[var(--text)]">{i.institution}</p>
                     <p className="text-sm text-[var(--dim)]">
-                      {i.applications} applications, {i.completed} completed
-                      {i.completed > 0 ? `, average ${i.avg_days} days` : ""}
+                      {countLabel(i.applications, "application")}, {i.completed} completed
+                      {i.completed > 0 ? `, average ${countLabel(i.avg_days, "day")}` : ""}
                     </p>
                   </div>
                 ))
@@ -12991,9 +13088,9 @@ function InstitutionReports({ institution }: { institution: string }) {
       </div>
       {mine ? (
         <p className="mt-2 text-sm text-[var(--dim)]">
-          {mine.applications} applications received, {mine.completed} completed
+          {countLabel(mine.applications, "application")} received, {mine.completed} completed
           {mine.completed > 0
-            ? `, average processing time ${mine.avg_days} days from application to completion`
+            ? `, average processing time ${countLabel(mine.avg_days, "day")} from application to completion`
             : ""}
           . The platform's weekly government report carries the full picture
           for every ministry.
@@ -13495,8 +13592,8 @@ function LeaderboardSection() {
               {i + 1}. {c.county}
             </span>
             <span className="text-[var(--dim)]">
-              {c.applications} applications, {c.completed} completed
-              {c.completed > 0 ? `, average ${c.avg_days} days` : ""}
+              {countLabel(c.applications, "application")}, {c.completed} completed
+              {c.completed > 0 ? `, average ${countLabel(c.avg_days, "day")}` : ""}
             </span>
           </div>
         ))}
@@ -13622,7 +13719,7 @@ function RealTiming({ serviceId }: { serviceId: string }) {
       {mine && mine.completed > 0 ? (
         <>
           Real time from finished applications: people who completed this
-          service waited about <strong className="text-[var(--text)]">{mine.avg_days} days</strong> on
+          service waited about <strong className="text-[var(--text)]">{countLabel(mine.avg_days, "day")}</strong> on
           average, across {mine.completed} completed application
           {mine.completed === 1 ? "" : "s"}. The catalogue estimate is{" "}
           {d.processingTime}.
@@ -13787,7 +13884,7 @@ function PlatformHealth() {
               "Release queue",
               d.held === 0,
               d.held > 0,
-              `${d.held} applications held by PortaGov right now, release mode is ${d.release_mode}.`,
+              `${countLabel(d.held, "application")} held by PortaGov right now, release mode is ${d.release_mode}.`,
             )}
             {row(
               "Citizen help",
@@ -13806,7 +13903,7 @@ function PlatformHealth() {
         </p>
         <p className="mt-1 text-sm text-[var(--dim)]">
           {backup.data?.checked_at
-            ? `Last check ${fmtDateTime(backup.data.checked_at)}: ${backup.data.total_rows} records read back across ${backup.data.tables.length} tables, all readable. The check runs every day on its own, and you can run it now.`
+            ? `Last check ${fmtDateTime(backup.data.checked_at)}: ${countLabel(backup.data.total_rows, "record")} read back across ${countLabel(backup.data.tables.length, "table")}, all readable. The check runs every day on its own, and you can run it now.`
             : "No check has run yet. The check runs every day on its own; run the first one now."}
         </p>
         <div className="mt-2">
@@ -16263,7 +16360,7 @@ function OnboardingStudioPage() {
                 <Chip tone={i.status === "Live" ? "gold" : "plain"}>{i.status}</Chip>
               </div>
               <p className="mt-1 text-sm text-[var(--dim)]">
-                {i.services_count} services built. Contact: {i.contact_name || "not set"}
+                {countLabel(i.services_count, "service")} built. Contact: {i.contact_name || "not set"}
                 {i.contact_email ? `, ${i.contact_email}` : ""}.
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
@@ -16397,7 +16494,7 @@ function OnboardingApprovals() {
         ) : null}
         {others.map((i) => (
           <p key={i.id} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-            {i.name}: {i.status}, {i.services_count} services.{" "}
+            {i.name}: {i.status}, {countLabel(i.services_count, "service")}.{" "}
             <a href={`#/institution/${i.slug}`} className="font-semibold underline">Open portal</a>
           </p>
         ))}
@@ -17179,7 +17276,7 @@ function HelpDeskPanel({ staffName }: { staffName?: string }) {
                     : waitHrs >= 4
                       ? `Waiting ${waitHrs} hours, keep it moving`
                       : waitHrs >= 1
-                        ? `Waiting ${waitHrs} hour, on time`
+                        ? `Waiting ${countLabel(waitHrs, "hour")}, on time`
                         : "Just arrived, on time"}
                 </span>
               ) : null}
@@ -18064,7 +18161,7 @@ function GovReportsPanel() {
     a.click();
     URL.revokeObjectURL(url);
     setExportMsg(
-      `Exported ${r.rows} applications. This export was written in the audit log under ${name}, private data ${includePrivate ? "included with permission" : "excluded"}.`,
+      `Exported ${countLabel(r.rows, "application")}. This export was written in the audit log under ${name}, private data ${includePrivate ? "included with permission" : "excluded"}.`,
     );
   };
   return (
@@ -18886,9 +18983,8 @@ function SlowestAlertsPanel() {
       <div className="mt-3 space-y-2">
         {list.map((a) => (
           <p key={a.service_name} className="rounded-lg p-3 text-sm font-semibold text-white" style={{ backgroundColor: "#b3261e" }} role="alert">
-            {a.service_name} at {a.institution}: averaging {a.avg_days} days
-            against a promise of {a.promised_days} days, across {a.completed}{" "}
-            completed applications. This ministry has been flagged.
+            {a.service_name} at {a.institution}: averaging {countLabel(a.avg_days, "day")}
+            against a promise of {countLabel(a.promised_days, "day")}, across {countLabel(a.completed, "completed application")}. This ministry has been flagged.
           </p>
         ))}
         {!alerts.isPending && list.length === 0 ? (
