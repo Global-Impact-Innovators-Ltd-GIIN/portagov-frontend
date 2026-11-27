@@ -888,6 +888,56 @@ async function writeReleaseMode(mode: "automatic" | "manual"): Promise<boolean> 
 
 /* ---------- remote overrides: same names and shapes as Actions ---------- */
 
+/** Backend ticket rows carry the linked application and tracking number;
+    local rows do not. Normalise both to one shape so the panels can show
+    the reference whenever it is there. */
+function normalizeTicketRow(t: any): any {
+  return {
+    ...t,
+    application_id: t.application_id ?? null,
+    reference: t.reference ?? "",
+    source: t.source ?? "help_page",
+    replies: t.replies ?? [],
+  };
+}
+
+/* ---------- questions saved on this device when nothing else worked ----------
+   When a ticket cannot be created on the backend or in the local store,
+   the question is kept here (at most the last 20) and retried later, so
+   it is never silently dropped. */
+const PENDING_TICKETS_KEY = "portagov-pending-tickets-v1";
+
+type PendingTicket = {
+  name: string;
+  phone: string;
+  topic: string;
+  message: string;
+  application_id: number | null;
+  source: string;
+  saved_at: string;
+};
+
+function readPendingTickets(): PendingTicket[] {
+  try {
+    const raw = storeGet(PENDING_TICKETS_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function queuePendingTicket(payload: Omit<PendingTicket, "saved_at">): void {
+  try {
+    const list = readPendingTickets();
+    list.push({ ...payload, saved_at: new Date().toISOString() });
+    storeSet(PENDING_TICKETS_KEY, JSON.stringify(list.slice(-20)));
+  } catch {
+    // If even the queue cannot be written, there is nowhere left to keep
+    // the question; the caller still tells the citizen it was not sent.
+  }
+}
+
 export const remote: Record<string, (args: any) => Promise<any>> = {
   async registerAccount(args: any) {
     const res = await apiCall("/api/auth/register", {
@@ -1794,11 +1844,148 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
   async askAssistant(args: any) {
     try {
       const res = await apiCall("/api/assistant", { method: "POST", auth: false, body: { q: args.question } });
-      if (res && res.answer) return { answer: res.answer, route: "None", needs_ticket: false };
-      return { answer: "", route: "Help desk", needs_ticket: true };
+      if (res && res.answer) {
+        // The backend says whether the question matched anything. When it
+        // did not match, the question is unanswered and must become a ticket.
+        const matched = res.matched !== false;
+        return { answer: res.answer, route: "None", needs_ticket: !matched, matched };
+      }
+      return { answer: "", route: "Help desk", needs_ticket: true, matched: false };
     } catch {
+      // The answer path itself failed (the AI is down). The local preset
+      // answers still try; when they cannot answer either, the question
+      // comes back as a ticket, so it is captured, never lost.
       return (Actions as any).askAssistant(args);
     }
+  },
+
+  /* ---------- help desk tickets: backend first, local store only as fallback ----------
+     The backend ticket store is the source of truth. A ticket is created on
+     the backend whenever it can be reached. The local store is only a
+     fallback when the backend cannot be reached at all (dropped connection,
+     5xx, or an endpoint the backend has not deployed yet, 404). A 401/403
+     is never papered over with local data: it means the sign-in is wrong
+     or the role may not use that endpoint, and the caller must see it.
+     A 400 is also rethrown: the ticket itself is wrong (short message,
+     bad phone), and the citizen must see the reason, not a quiet local copy. */
+
+  async submitHelpRequest(args: any) {
+    const payload = {
+      name: args.name,
+      phone: args.phone,
+      topic: args.topic,
+      message: args.message,
+      application_id: args.applicationId ?? null,
+      source: args.source || "help_page",
+    };
+    try {
+      const res = await apiCall("/api/tickets", { method: "POST", body: payload });
+      return { id: res.id };
+    } catch (e: any) {
+      if (isAuthError(e) || e?.status === 400) throw e;
+      try {
+        return await (Actions as any).submitHelpRequest(args);
+      } catch {
+        // Even the local save failed: keep the question on this device and
+        // retry it later. Never silently drop it.
+        queuePendingTicket(payload);
+        throw new Error("Your question is saved on this device and will be sent as soon as the connection is back. A real person will still answer you.");
+      }
+    }
+  },
+
+  async listHelpRequestsByPhone(args: any) {
+    if (getToken()) {
+      try {
+        const res = await apiCall("/api/tickets/mine", {});
+        return { requests: (res.requests || []).map(normalizeTicketRow) };
+      } catch (e: any) {
+        if (isAuthError(e)) throw e;
+        // Backend unreachable: fall through to the local store below.
+      }
+    }
+    return (Actions as any).listHelpRequestsByPhone(args);
+  },
+
+  async listHelpRequests(args: any) {
+    const limit = args?.limit || 50;
+    const path = `/api/staff/tickets?limit=${limit}`;
+    try {
+      const res = getStaffToken()
+        ? await staffApiCall(path, {})
+        : await apiCall(path, {});
+      return { requests: (res.requests || []).map(normalizeTicketRow) };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).listHelpRequests(args);
+    }
+  },
+
+  async replyHelpRequest(args: any) {
+    const path = `/api/staff/tickets/${args.id}/reply`;
+    try {
+      if (getStaffToken()) await staffApiCall(path, { method: "POST", body: { reply: args.reply } });
+      else await apiCall(path, { method: "POST", body: { reply: args.reply } });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).replyHelpRequest(args);
+    }
+  },
+
+  async assignHelpRequest(args: any) {
+    const path = `/api/staff/tickets/${args.id}/assign`;
+    try {
+      if (getStaffToken()) await staffApiCall(path, { method: "POST", body: { officer_name: args.officerName } });
+      else await apiCall(path, { method: "POST", body: { officer_name: args.officerName } });
+      return { ok: true };
+    } catch (e: any) {
+      if (isAuthError(e)) throw e;
+      return (Actions as any).assignHelpRequest(args);
+    }
+  },
+
+  /** Retries questions saved on this device when both the backend and the
+      local store failed. Anything still unsent stays queued. */
+  async flushPendingTickets(_args: any) {
+    const pending = readPendingTickets();
+    if (pending.length === 0) return { sent: 0, remaining: 0 };
+    const remaining: PendingTicket[] = [];
+    let sent = 0;
+    for (const t of pending) {
+      let done = false;
+      try {
+        await apiCall("/api/tickets", {
+          method: "POST",
+          body: {
+            name: t.name,
+            phone: t.phone,
+            topic: t.topic,
+            message: t.message,
+            application_id: t.application_id,
+            source: t.source,
+          },
+        });
+        done = true;
+      } catch {
+        try {
+          await (Actions as any).submitHelpRequest({
+            profileId: null,
+            name: t.name,
+            phone: t.phone,
+            topic: t.topic,
+            message: t.message,
+          });
+          done = true;
+        } catch {
+          remaining.push(t);
+        }
+      }
+      if (done) sent += 1;
+    }
+    if (remaining.length === 0) storeRemove(PENDING_TICKETS_KEY);
+    else storeSet(PENDING_TICKETS_KEY, JSON.stringify(remaining));
+    return { sent, remaining: remaining.length };
   },
 
   /* ---------- staff, institution and platform desks (live backend) ----------

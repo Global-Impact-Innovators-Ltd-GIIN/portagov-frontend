@@ -2381,6 +2381,11 @@ export const Actions = {
       phone: z.string().trim().min(7).max(20),
       topic: z.string().trim().min(2).max(80),
       message: z.string().trim().min(5).max(1000),
+      // Only the backend ticket store keeps these in their own columns;
+      // the local store has no columns for them, so the local handler
+      // ignores them and the tracking number stays in the message text.
+      applicationId: z.number().int().positive().nullable().default(null),
+      source: z.string().trim().max(20).default("help_page"),
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
@@ -2418,6 +2423,9 @@ export const Actions = {
           assigned_to: z.string(),
           answered_at: z.string(),
           created_at: z.string(),
+          application_id: z.number().nullable().optional(),
+          reference: z.string().optional(),
+          source: z.string().optional(),
         }),
       ),
     }),
@@ -2440,6 +2448,9 @@ export const Actions = {
           assigned_to: r.assignedTo,
           answered_at: r.answeredAt ? r.answeredAt.toISOString() : "",
           created_at: r.createdAt.toISOString(),
+          application_id: null,
+          reference: "",
+          source: "help_page",
         })),
       };
     },
@@ -2461,6 +2472,9 @@ export const Actions = {
           assigned_to: z.string(),
           answered_at: z.string(),
           created_at: z.string(),
+          application_id: z.number().nullable().optional(),
+          reference: z.string().optional(),
+          source: z.string().optional(),
         }),
       ),
     }),
@@ -2483,6 +2497,9 @@ export const Actions = {
           assigned_to: r.assignedTo,
           answered_at: r.answeredAt ? r.answeredAt.toISOString() : "",
           created_at: r.createdAt.toISOString(),
+          application_id: null,
+          reference: "",
+          source: "help_page",
         })),
       };
     },
