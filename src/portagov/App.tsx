@@ -4742,6 +4742,26 @@ function LinkedNumbers({
   );
 }
 
+/** The latest payment for one application, from the payments list.
+    Prefer a confirmed payment; a payment recorded under any other
+    status still counts, so the transaction number never reads "Not
+    paid yet" on one part of the page while the billing status on the
+    same page says paid. Match by reference as well as by id: an
+    application found by public tracking can carry id 0. */
+function latestPaymentFor(
+  payments: PaymentT[] | undefined,
+  app: { id: number; reference: string },
+): PaymentT | undefined {
+  const mine = (payments ?? []).filter(
+    (p: PaymentT) => p.application_id === app.id || p.application_ref === app.reference,
+  );
+  const byNewest = (list: PaymentT[]) =>
+    list.sort((a: PaymentT, b: PaymentT) => b.created_at.localeCompare(a.created_at))[0];
+  return (
+    byNewest(mine.filter((p: PaymentT) => p.status === "Confirmed")) ?? byNewest(mine)
+  );
+}
+
 function ApplicationDetailPage({
   id,
   profile,
@@ -6886,12 +6906,9 @@ function TrackPage({ profile }: { profile: ProfileT | null }) {
   const trackPayments = useQuery({
     queryKey: ["payments"],
     queryFn: () => api.listPayments({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
-  const trackPayment = app
-    ? (trackPayments.data?.payments ?? [])
-        .filter((pay: PaymentT) => pay.application_id === app.id && pay.status === "Confirmed")
-        .sort((a: PaymentT, b: PaymentT) => b.created_at.localeCompare(a.created_at))[0]
-    : undefined;
+  const trackPayment = app ? latestPaymentFor(trackPayments.data?.payments, app) : undefined;
   if (!profile) {
     return (
       <div className="mx-auto max-w-2xl px-4 py-8">
@@ -6977,7 +6994,12 @@ function TrackPage({ profile }: { profile: ProfileT | null }) {
             <LinkedNumbers
               tracking={app.reference}
               billing={app.billing_number}
-              transaction={trackPayment?.transaction_ref}
+              transaction={
+                trackPayment?.transaction_ref ||
+                (app.billing_status === "Paid" || app.amount_paid > 0
+                  ? "Paid, number not loaded yet"
+                  : undefined)
+              }
               amountPaid={app.amount_paid}
               payerPhone={trackPayment?.payer_phone}
             />
@@ -7354,6 +7376,17 @@ function PlatformRow({ app }: { app: ApplicationT }) {
           )}
         </div>
       </div>
+      {release.isError || recall.isError || askInfo.isError ? (
+        <p role="alert" className="mt-3 rounded-lg bg-[var(--gold-soft)] p-3 text-sm font-semibold text-[var(--warn)]">
+          {release.error instanceof Error
+            ? release.error.message
+            : recall.error instanceof Error
+              ? recall.error.message
+              : askInfo.error instanceof Error
+                ? askInfo.error.message
+                : "That did not work. Try again."}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -7381,10 +7414,25 @@ function PlatformPage() {
     refetchInterval: LIVE_POLL_MS,
   });
   const payments = useQuery({
-    queryKey: ["payments"],
-    queryFn: () => api.listPayments({ limit: 100 }),
+    queryKey: ["platform-payments"],
+    queryFn: () => (api as any).listPlatformPayments({ limit: 100 }),
     refetchInterval: LIVE_POLL_MS,
   });
+  /* Signed in, the console is live or it says so: a failed live
+     call is a plain error with a retry, never silent demo data. */
+  const liveError = mode.isError || report.isError || apps.isError || payments.isError;
+  const liveErrorMessage =
+    (mode.error instanceof Error && mode.error.message) ||
+    (report.error instanceof Error && report.error.message) ||
+    (apps.error instanceof Error && apps.error.message) ||
+    (payments.error instanceof Error && payments.error.message) ||
+    "The live console could not be reached.";
+  const retryLive = () => {
+    void mode.refetch();
+    void report.refetch();
+    void apps.refetch();
+    void payments.refetch();
+  };
   const setMode = useMutation({
     mutationFn: async (m: "automatic" | "manual") =>
       await api.setReleaseMode({ mode: m }),
@@ -7496,6 +7544,20 @@ function PlatformPage() {
           </button>
         </div>
       )}
+      {liveError ? (
+        <div role="alert" className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--gold-soft)] p-5">
+          <p className="font-display text-lg font-bold text-[var(--text)]">
+            The live console could not be reached
+          </p>
+          <p className="mt-1 text-sm text-[var(--dim)]">
+            {liveErrorMessage} The numbers and queues below may be out of
+            date. No demo data is shown in their place.
+          </p>
+          <div className="mt-3">
+            <PrimaryButton onClick={retryLive}>Try again</PrimaryButton>
+          </div>
+        </div>
+      ) : null}
       <div>
         <DailySummaryPanel />
       </div>
@@ -7505,9 +7567,11 @@ function PlatformPage() {
           <div className="max-w-xl">
             <h2 className="font-display text-xl font-bold">Release mode</h2>
             <p className="mt-1 text-sm leading-relaxed text-white/85">
-              {isAuto
-                ? "Automatic release is ON. Every new application is sent straight to its institution the moment a citizen submits it."
-                : "Automatic release is OFF (manual). PortaGov holds every application and a person here must approve and release each one before the institution can see it."}
+              {mode.isError
+                ? "The release mode could not be read. Try again below; the switch stays off until the live setting loads."
+                : isAuto
+                  ? "Automatic release is ON. Every new application is sent straight to its institution the moment a citizen submits it."
+                  : "Automatic release is OFF (manual). PortaGov holds every application and a person here must approve and release each one before the institution can see it."}
             </p>
           </div>
           <button
@@ -7515,7 +7579,7 @@ function PlatformPage() {
             role="switch"
             aria-checked={isAuto}
             aria-label="Automatic release"
-            disabled={setMode.isPending || mode.isPending}
+            disabled={setMode.isPending || mode.isPending || mode.isError}
             onClick={() => setMode.mutate(isAuto ? "manual" : "automatic")}
             className="flex items-center gap-3 rounded-full border border-white/40 px-4 py-2"
           >
@@ -7536,14 +7600,20 @@ function PlatformPage() {
           also carries its own release control, so the council can release or
           recall one application whatever the global rule says.
         </p>
+        {setMode.isError ? (
+          <p role="alert" className="mt-3 text-sm font-semibold text-white">
+            The release mode could not be changed.{" "}
+            {setMode.error instanceof Error ? setMode.error.message : "Try again."}
+          </p>
+        ) : null}
       </div>
 
       <div className="mt-6 grid gap-3 sm:grid-cols-4">
         {[
-          ["Applications", report.data?.total_applications ?? 0],
-          ["Held by PortaGov", held.length],
-          ["Released", released.length],
-          ["Citizen profiles", report.data?.total_profiles ?? 0],
+          ["Applications", report.isError ? "–" : report.data?.total_applications ?? 0],
+          ["Held by PortaGov", apps.isError ? "–" : held.length],
+          ["Released", apps.isError ? "–" : released.length],
+          ["Citizen profiles", report.isError ? "–" : report.data?.total_profiles ?? 0],
         ].map(([label, value]) => (
           <div key={label} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 text-center">
             <p className="font-display text-3xl font-extrabold text-[var(--text)]">{value}</p>
@@ -7554,11 +7624,21 @@ function PlatformPage() {
 
       <div className="mt-8">
         <SectionTitle sub="Applications waiting on PortaGov. Release each one to its institution, or ask the citizen for more information first.">
-          Review queue: held by PortaGov ({held.length})
+          Review queue: held by PortaGov ({apps.isError ? "–" : held.length}){" "}
+          {!session ? <Chip tone="plain">Demo data</Chip> : null}
         </SectionTitle>
         <div className="space-y-3">
           {apps.isPending ? (
             <p className="text-[var(--dim)]">Loading the queue...</p>
+          ) : apps.isError ? (
+            <div role="alert" className="rounded-xl border border-[var(--border)] bg-[var(--gold-soft)] p-5">
+              <p className="text-sm font-semibold text-[var(--text)]">
+                The live queue could not be loaded. {liveErrorMessage}
+              </p>
+              <div className="mt-3">
+                <PrimaryButton onClick={() => void apps.refetch()}>Try again</PrimaryButton>
+              </div>
+            </div>
           ) : held.length > 0 ? (
             held.map((a: ApplicationT) => <PlatformRow key={a.id} app={a} />)
           ) : (
@@ -7574,10 +7654,20 @@ function PlatformPage() {
 
       <div className="mt-8">
         <SectionTitle sub="Every application on the platform, with its own release control. Recalling one removes it from the institution's desk until it is released again.">
-          All applications ({all.length})
+          All applications ({apps.isError ? "–" : all.length}){" "}
+          {!session ? <Chip tone="plain">Demo data</Chip> : null}
         </SectionTitle>
         <div className="space-y-3">
-          {all.length > 0 ? (
+          {apps.isError ? (
+            <div role="alert" className="rounded-xl border border-[var(--border)] bg-[var(--gold-soft)] p-5">
+              <p className="text-sm font-semibold text-[var(--text)]">
+                The live list could not be loaded. {liveErrorMessage}
+              </p>
+              <div className="mt-3">
+                <PrimaryButton onClick={() => void apps.refetch()}>Try again</PrimaryButton>
+              </div>
+            </div>
+          ) : all.length > 0 ? (
             all.map((a: ApplicationT) => <PlatformRow key={a.id} app={a} />)
           ) : (
             <p className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--dim)]">
@@ -7590,7 +7680,14 @@ function PlatformPage() {
       <div className="mt-8 grid gap-5 md:grid-cols-2">
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
           <h2 className="font-display text-lg font-bold text-[var(--text)]">Government report</h2>
-          {report.data ? (
+          {report.isError ? (
+            <p role="alert" className="mt-2 text-sm font-semibold text-[var(--warn)]">
+              The live report could not be loaded. {liveErrorMessage}{" "}
+              <button type="button" className="underline" onClick={() => void report.refetch()}>
+                Try again
+              </button>
+            </p>
+          ) : report.data ? (
             <div className="mt-3 space-y-4 text-sm">
               <div>
                 <p className="font-bold text-[var(--text)]">By institution</p>
@@ -7671,19 +7768,31 @@ function PlatformPage() {
             Payments across the platform
           </h2>
           <p className="mt-1 text-sm text-[var(--dim)]">
-            {countLabel(report.data?.total_payments ?? 0, "payment")} recorded,{" "}
-            {countLabel(report.data?.total_appointments ?? 0, "appointment")} booked.
+            {report.isError
+              ? "Payment totals could not be loaded."
+              : `${countLabel(report.data?.total_payments ?? 0, "payment")} recorded, ${countLabel(report.data?.total_appointments ?? 0, "appointment")} booked.`}
           </p>
           <div className="mt-3 space-y-2">
-            {(payments.data?.payments ?? []).slice(0, 8).map((p: PaymentT) => (
-              <p key={p.id} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
-                <strong>{p.method}</strong>, {p.application_ref}, ref{" "}
-                {p.transaction_ref}, {p.status}, {fmtDate(p.created_at)}.
+            {payments.isError ? (
+              <p role="alert" className="text-sm font-semibold text-[var(--warn)]">
+                The live payments could not be loaded. {liveErrorMessage}{" "}
+                <button type="button" className="underline" onClick={() => void payments.refetch()}>
+                  Try again
+                </button>
               </p>
-            ))}
-            {(payments.data?.payments ?? []).length === 0 ? (
-              <p className="text-sm text-[var(--dim)]">No payments recorded yet.</p>
-            ) : null}
+            ) : (
+              <>
+                {(payments.data?.payments ?? []).slice(0, 8).map((p: PaymentT) => (
+                  <p key={p.id} className="rounded-lg bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]">
+                    <strong>{p.method}</strong>, {p.application_ref}, ref{" "}
+                    {p.transaction_ref}, {p.status}, {fmtDate(p.created_at)}.
+                  </p>
+                ))}
+                {(payments.data?.payments ?? []).length === 0 ? (
+                  <p className="text-sm text-[var(--dim)]">No payments recorded yet.</p>
+                ) : null}
+              </>
+            )}
           </div>
           <div className="mt-4">
             <GhostButton
@@ -8042,6 +8151,9 @@ export function App() {
     setProfile(null);
     setSecurityAlert("");
     storage.remove("portagov-phone");
+    // Forget the cached profile on this device, so the next sign-in
+    // never shows the previous person's details on the account page.
+    void (api as any).clearCachedProfile({}).catch(() => undefined);
     nav("#/");
   };
   /* Sign out everywhere, in one tap: the account record marks every
@@ -8992,14 +9104,19 @@ function ApplicationExtras({
     queryFn: () => api.listMyComplaints({ profileId: profile.id }),
   });
   /* The latest confirmed payment for this application, so the
-     transaction number in Your numbers below is the real one. */
+     transaction number in Your numbers below is the real one. The
+     list is polled live, like the application itself, so the row
+     cannot sit on a stale empty cache while the billing status
+     below already says paid. */
   const payments = useQuery({
     queryKey: ["payments"],
     queryFn: () => api.listPayments({ limit: 100 }),
+    refetchInterval: LIVE_POLL_MS,
   });
-  const latestPayment = (payments.data?.payments ?? [])
-    .filter((pay: PaymentT) => pay.application_id === app.id && pay.status === "Confirmed")
-    .sort((a: PaymentT, b: PaymentT) => b.created_at.localeCompare(a.created_at))[0];
+  const latestPayment = latestPaymentFor(payments.data?.payments, app);
+  /* One paid state for the whole box: the transaction row, the
+     amount paid, and the billing chip below must never disagree. */
+  const paid = app.billing_status === "Paid" || app.amount_paid > 0 || !!latestPayment;
   const [kind, setKind] = useState<"Complaint" | "Appeal">("Complaint");
   const [reason, setReason] = useState("");
   const [caseDone, setCaseDone] = useState(false);
@@ -9058,7 +9175,10 @@ function ApplicationExtras({
           <LinkedNumbersRow label="Billing number" value={app.billing_number} />
           <LinkedNumbersRow
             label="Transaction number"
-            value={latestPayment?.transaction_ref || "Not paid yet"}
+            value={
+              latestPayment?.transaction_ref ||
+              (paid ? "Paid, number not loaded yet" : "Not paid yet")
+            }
             dimValue={!latestPayment}
           />
           {latestPayment ? (
@@ -9091,10 +9211,8 @@ function ApplicationExtras({
           <div className="flex justify-between gap-4">
             <dt className="text-[var(--dim)]">Billing status</dt>
             <dd>
-              <Chip tone={app.billing_status === "Paid" ? "gold" : "plain"}>
-                {app.billing_status === "Paid"
-                  ? "Billing number confirmed paid"
-                  : "Not confirmed paid yet"}
+              <Chip tone={paid ? "gold" : "plain"}>
+                {paid ? "Billing number confirmed paid" : "Not confirmed paid yet"}
               </Chip>
             </dd>
           </div>
