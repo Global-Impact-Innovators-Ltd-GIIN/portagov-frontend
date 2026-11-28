@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type InputHTMLAttributes, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, bindQueryClient, type ApiResponse } from "./api";
-import { readStaffSession, STAFF_SESSION_KEY, type StaffSession as OfficerSession } from "./remote";
+import { getGiinAiSessionId, GIINAI_BUSY_MESSAGE, readStaffSession, STAFF_SESSION_KEY, type StaffSession as OfficerSession } from "./remote";
 import { actionFields } from "./fields";
 import { Actions } from "./actions";
 import {
@@ -17808,7 +17808,98 @@ function pageHelpFor(route: Route): { title: string; lines: string[] } {
 
 /* ---------- PortaGov AI assistant (floating, on citizen pages) ---------- */
 
-type ChatMsg = { from: "ai" | "citizen" | "system"; text: string };
+type ChatMsg = {
+  from: "ai" | "citizen" | "system";
+  text: string;
+  sources?: { title: string; url?: string }[];
+  streaming?: boolean;
+};
+
+/* Small safe markdown renderer for GiinAI answers. It builds React
+   elements from the text, so no HTML from an answer is ever injected
+   into the page. Supported: bold, italic, inline code, safe http(s)
+   links, headings, bullet and numbered lists, paragraphs. A marker
+   with no closing partner is shown as plain text. No new dependency. */
+function renderInlineMd(text: string, keyPrefix: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  const re = /(\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let n = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    const token = m[0];
+    if (token.startsWith("**")) {
+      out.push(<strong key={`${keyPrefix}-${n++}`}>{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith("*")) {
+      out.push(<em key={`${keyPrefix}-${n++}`}>{token.slice(1, -1)}</em>);
+    } else if (token.startsWith("`")) {
+      out.push(<code key={`${keyPrefix}-${n++}`}>{token.slice(1, -1)}</code>);
+    } else {
+      const link = /^\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)$/.exec(token);
+      if (link) {
+        out.push(
+          <a key={`${keyPrefix}-${n++}`} href={link[2]} target="_blank" rel="noreferrer" className="underline">
+            {link[1]}
+          </a>,
+        );
+      } else {
+        out.push(token);
+      }
+    }
+    last = m.index + token.length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+function renderAssistantMd(text: string): ReactNode {
+  const blocks = text.split(/\n\s*\n/);
+  return (
+    <>
+      {blocks.map((block, bi) => {
+        const lines = block.split("\n").map((l) => l.trim()).filter(Boolean);
+        if (lines.length === 0) return null;
+        if (lines.length === 1 && lines[0].startsWith("#")) {
+          const level = lines[0].startsWith("##") ? "text-base" : "text-lg";
+          return (
+            <p key={bi} className={`font-bold ${level}`}>
+              {renderInlineMd(lines[0].replace(/^#+\s*/, ""), `h${bi}`)}
+            </p>
+          );
+        }
+        if (lines.every((l) => /^[-*]\s+/.test(l))) {
+          return (
+            <ul key={bi} className="list-disc space-y-1 pl-5">
+              {lines.map((l, li) => (
+                <li key={li}>{renderInlineMd(l.replace(/^[-*]\s+/, ""), `b${bi}-${li}`)}</li>
+              ))}
+            </ul>
+          );
+        }
+        if (lines.every((l) => /^\d+[.)]\s+/.test(l))) {
+          return (
+            <ol key={bi} className="list-decimal space-y-1 pl-5">
+              {lines.map((l, li) => (
+                <li key={li}>{renderInlineMd(l.replace(/^\d+[.)]\s+/, ""), `n${bi}-${li}`)}</li>
+              ))}
+            </ol>
+          );
+        }
+        return (
+          <p key={bi}>
+            {lines.map((l, li) => (
+              <span key={li}>
+                {li > 0 ? <br /> : null}
+                {renderInlineMd(l, `p${bi}-${li}`)}
+              </span>
+            ))}
+          </p>
+        );
+      })}
+    </>
+  );
+}
 
 type KbArticle = { id: number; topic: string; question: string; answer: string; added_by: string };
 
@@ -17849,13 +17940,16 @@ function assistantContext(question: string, profile: ProfileT | null, apps: Appl
   ].join("\n\n");
 }
 
+const ASSISTANT_GREETING =
+  "Hello, I am the PortaGov assistant. Ask me about any service, its documents, fee, or time, or about your own application. If I cannot answer, I will pass your question to the right person and make a ticket for you.";
+
 function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: Route }) {
   const help = pageHelpFor(route);
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMsg[]>([
     {
       from: "ai",
-      text: "Hello, I am the PortaGov assistant. Ask me about any service, its documents, fee, or time, or about your own application. If I cannot answer, I will pass your question to the right person and make a ticket for you.",
+      text: ASSISTANT_GREETING,
     },
   ]);
   const [input, setInput] = useState("");
@@ -17864,6 +17958,13 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
   const [guestName, setGuestName] = useState("");
   const [guestPhone, setGuestPhone] = useState("");
   const [ticketMsg, setTicketMsg] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const hadPartialAnswerRef = useRef(false);
+  const [feedbackGiven, setFeedbackGiven] = useState<Record<number, number>>({});
+  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  const [giinAiSessionId, setGiinAiSessionId] = useState<string | null>(() =>
+    getGiinAiSessionId(profile?.id ?? null),
+  );
   const apps = useQuery({
     queryKey: ["applications", profile?.id ?? 0],
     queryFn: () => api.listApplications({ profileId: profile?.id ?? 0 }),
@@ -17875,16 +17976,53 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
     enabled: open,
   });
   const ask = useMutation({
-    mutationFn: async (question: string) =>
-      await api.askAssistant({
-        question,
-        context: [
-          `The citizen is on this page: ${help.title}. ${help.lines.join(" ")}`,
-          assistantContext(question, profile, apps.data?.applications ?? [], kb.data?.articles ?? []),
-        ].join("\n\n"),
-      }),
+    mutationFn: async (question: string) => {
+      // GiinAI streams tokens into the empty AI message added by send().
+      // If GiinAI fails, askAssistantStream falls back to the old
+      // assistant and local answers and hands that answer over as one
+      // chunk, so the citizen still gets an answer.
+      const context = [
+        `The citizen is on this page: ${help.title}. ${help.lines.join(" ")}`,
+        assistantContext(question, profile, apps.data?.applications ?? [], kb.data?.articles ?? []),
+      ].join("\n\n");
+      return await (api as any).askAssistantStream(
+        { question, context, profileId: profile?.id ?? null },
+        (token: string) => {
+          setStreaming(true);
+          hadPartialAnswerRef.current = true;
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last && last.from === "ai" && last.streaming) {
+              next[next.length - 1] = { ...last, text: last.text + token };
+            }
+            return next;
+          });
+        },
+      );
+    },
     onSuccess: (r, question) => {
-      setMessages((prev) => [...prev, { from: "ai", text: r.answer }]);
+      setStreaming(false);
+      if (r.sessionId) setGiinAiSessionId(r.sessionId);
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.from === "ai" && last.streaming) {
+          next[next.length - 1] = {
+            ...last,
+            streaming: false,
+            text: last.text || r.answer,
+            sources: r.sources && r.sources.length > 0 ? r.sources : undefined,
+          };
+        } else if (r.answer) {
+          next.push({
+            from: "ai",
+            text: r.answer,
+            sources: r.sources && r.sources.length > 0 ? r.sources : undefined,
+          });
+        }
+        return next;
+      });
       if (r.needs_ticket) {
         const route = r.route && r.route !== "None" ? r.route : "Help desk";
         setPendingRoute(route);
@@ -17896,12 +18034,32 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
         }
       }
     },
-    onError: (_e, question) => {
+    onError: (e, question) => {
+      setStreaming(false);
+      const busy = e instanceof Error && e.message.includes(GIINAI_BUSY_MESSAGE);
+      const hadPartialAnswer = hadPartialAnswerRef.current;
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.from === "ai" && last.streaming) {
+          if (last.text) {
+            // Tokens arrived before the stream failed: keep the partial
+            // answer and do not add an error message or a ticket.
+            next[next.length - 1] = { ...last, streaming: false };
+          } else {
+            next.pop();
+          }
+        }
+        return next;
+      });
+      if (hadPartialAnswer) return;
       setMessages((prev) => [
         ...prev,
         {
           from: "ai",
-          text: "I could not reach my knowledge just now. I can still pass your question to the Help desk as a ticket, so a real person answers you.",
+          text: busy
+            ? "GiinAI is busy, try again in a moment. I can still pass your question to the Help desk as a ticket, so a real person answers you."
+            : "I could not reach my knowledge just now. I can still pass your question to the Help desk as a ticket, so a real person answers you.",
         },
       ]);
       setPendingRoute("Help desk");
@@ -17986,11 +18144,48 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
   });
   const send = (text: string) => {
     const question = text.trim();
-    if (!question) return;
-    setMessages((prev) => [...prev, { from: "citizen", text: question }]);
+    if (!question || ask.isPending) return;
+    hadPartialAnswerRef.current = false;
+    setMessages((prev) => [
+      ...prev,
+      { from: "citizen", text: question },
+      { from: "ai", text: "", streaming: true },
+    ]);
     setInput("");
     setTicketMsg("");
     ask.mutate(question);
+  };
+  const giveFeedback = (index: number, rating: number) => {
+    const msg = messages[index];
+    const question = [...messages]
+      .slice(0, index)
+      .reverse()
+      .find((m) => m.from === "citizen");
+    const sessionId = giinAiSessionId ?? getGiinAiSessionId(profile?.id ?? null);
+    if (!msg || !msg.text || !question || !sessionId) return;
+    setFeedbackGiven((prev) => ({ ...prev, [index]: rating }));
+    void (api as any)
+      .sendGiinAiFeedback({
+        sessionId,
+        rating,
+        question: question.text,
+        answer: msg.text,
+      })
+      .catch(() => {
+        setFeedbackGiven((prev) => {
+          const next = { ...prev };
+          delete next[index];
+          return next;
+        });
+      });
+  };
+  const forgetConversation = () => {
+    void (api as any).forgetGiinAiSession({ profileId: profile?.id ?? null });
+    setGiinAiSessionId(null);
+    setFeedbackGiven({});
+    setExpanded({});
+    setMessages([{ from: "ai", text: ASSISTANT_GREETING }]);
+    setTicketMsg("");
   };
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -18021,9 +18216,22 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
         <div className="fixed bottom-36 right-4 z-50 flex max-h-[85vh] w-[min(92vw,380px)] flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-2xl md:bottom-24" role="dialog" aria-label="PortaGov assistant chat">
           <div className="flex items-center justify-between rounded-t-2xl px-4 py-3 text-white" style={{ backgroundColor: "#0a2a5e" }}>
             <p className="font-display font-extrabold">PortaGov assistant</p>
-            <button type="button" onClick={() => setOpen(false)} aria-label="Close the assistant" className="rounded-full px-2 py-1 font-bold">
-              Close
-            </button>
+            <div className="flex items-center gap-1">
+              {messages.length > 1 || giinAiSessionId ? (
+                <button
+                  type="button"
+                  onClick={forgetConversation}
+                  aria-label="Forget this conversation"
+                  title="Forget this conversation"
+                  className="rounded-full px-2 py-1 text-sm font-bold"
+                >
+                  Forget chat
+                </button>
+              ) : null}
+              <button type="button" onClick={() => setOpen(false)} aria-label="Close the assistant" className="rounded-full px-2 py-1 font-bold">
+                Close
+              </button>
+            </div>
           </div>
           <div ref={scrollRef} className="min-h-[30vh] flex-1 space-y-2 overflow-y-auto p-3">
             <div className="rounded-xl bg-[var(--surface-alt)] p-3">
@@ -18037,21 +18245,92 @@ function AssistantPanel({ profile, route }: { profile: ProfileT | null; route: R
                 Ask below in plain words. If the assistant cannot answer, it passes your question to a real person.
               </p>
             </div>
-            {messages.map((m, i) => (
-              <div
-                key={i}
-                className={
-                  m.from === "citizen"
-                    ? "ml-8 rounded-xl p-3 text-sm text-white"
-                    : "mr-8 rounded-xl bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]"
-                }
-                style={m.from === "citizen" ? { backgroundColor: "#0a2a5e" } : undefined}
-              >
-                {m.text}
-              </div>
-            ))}
-            {ask.isPending ? (
+            {messages.map((m, i) => {
+              if (m.from === "ai" && m.streaming && !m.text) return null;
+              const long = m.from === "ai" && m.text.length > 400;
+              const cut = m.text.slice(0, 400);
+              const shown =
+                long && !expanded[i]
+                  ? cut.slice(0, cut.lastIndexOf(" ") > 0 ? cut.lastIndexOf(" ") : 400)
+                  : m.text;
+              return (
+                <div
+                  key={i}
+                  className={
+                    m.from === "citizen"
+                      ? "ml-8 rounded-xl p-3 text-sm text-white"
+                      : "mr-8 rounded-xl bg-[var(--surface-alt)] p-3 text-sm text-[var(--text)]"
+                  }
+                  style={m.from === "citizen" ? { backgroundColor: "#0a2a5e" } : undefined}
+                >
+                  {m.from === "ai" ? (
+                    <div className="space-y-2">{renderAssistantMd(shown)}</div>
+                  ) : (
+                    m.text
+                  )}
+                  {long ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setExpanded((prev) => ({ ...prev, [i]: !prev[i] }))
+                      }
+                      className="mt-1 text-xs font-bold underline"
+                    >
+                      {expanded[i] ? "Show less" : "Show more"}
+                    </button>
+                  ) : null}
+                  {m.from === "ai" && m.sources && m.sources.length > 0 ? (
+                    <div className="mt-2 text-xs text-[var(--dim)]">
+                      <p className="font-bold">Sources</p>
+                      <ul className="list-disc pl-4">
+                        {m.sources.map((s, si) => (
+                          <li key={si}>
+                            {s.url ? (
+                              <a href={s.url} target="_blank" rel="noreferrer" className="underline">
+                                {s.title}
+                              </a>
+                            ) : (
+                              s.title
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                  {m.from === "ai" && m.text && !m.streaming ? (
+                    <div className="mt-2 flex items-center gap-2">
+                      <span className="text-xs text-[var(--dim)]">Was this helpful?</span>
+                      <button
+                        type="button"
+                        aria-label="Yes, this answer was helpful"
+                        disabled={feedbackGiven[i] !== undefined}
+                        onClick={() => giveFeedback(i, 5)}
+                        className="rounded-full border border-[var(--border)] px-2 py-0.5 text-xs font-bold"
+                      >
+                        Yes
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="No, this answer was not helpful"
+                        disabled={feedbackGiven[i] !== undefined}
+                        onClick={() => giveFeedback(i, -1)}
+                        className="rounded-full border border-[var(--border)] px-2 py-0.5 text-xs font-bold"
+                      >
+                        No
+                      </button>
+                      {feedbackGiven[i] !== undefined ? (
+                        <span className="text-xs text-[var(--dim)]">Thanks for your feedback.</span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+            {ask.isPending && !streaming ? (
               <p className="text-sm text-[var(--dim)]">Thinking...</p>
+            ) : null}
+            {ask.isPending && streaming ? (
+              <p className="text-sm text-[var(--dim)]">Writing...</p>
             ) : null}
             {pendingRoute && !profile ? (
               <div className="rounded-xl bg-[var(--gold-soft)] p-3 text-sm">

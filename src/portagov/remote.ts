@@ -938,6 +938,207 @@ function queuePendingTicket(payload: Omit<PendingTicket, "saved_at">): void {
   }
 }
 
+/* ---------- GiinAI session storage and streaming chat ----------
+   The GiinAI session id lives in localStorage under
+   portagov-giinai-session-v1 as one map, keyed by the signed-in
+   profile id (or "guest"), so one person's conversation never leaks
+   onto another person's account on the same device. */
+
+export const GIINAI_BUSY_MESSAGE = "GiinAI is busy, try again";
+
+const GIINAI_SESSION_KEY = "portagov-giinai-session-v1";
+
+function giinAiSessionMap(): Record<string, string> {
+  try {
+    const raw = storeGet(GIINAI_SESSION_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function getGiinAiSessionId(
+  profileId: string | number | null,
+): string | null {
+  return giinAiSessionMap()[String(profileId ?? "guest")] ?? null;
+}
+
+export function saveGiinAiSessionId(
+  profileId: string | number | null,
+  sessionId: string,
+): void {
+  try {
+    const map = giinAiSessionMap();
+    map[String(profileId ?? "guest")] = sessionId;
+    storeSet(GIINAI_SESSION_KEY, JSON.stringify(map));
+  } catch {
+    // A session that cannot be stored simply starts fresh next time.
+  }
+}
+
+export function clearGiinAiSessionId(
+  profileId: string | number | null,
+): void {
+  try {
+    const map = giinAiSessionMap();
+    delete map[String(profileId ?? "guest")];
+    storeSet(GIINAI_SESSION_KEY, JSON.stringify(map));
+  } catch {
+    // Nothing stored means nothing to clear.
+  }
+}
+
+export type GiinAiSource = { title: string; url?: string };
+
+function isGiinAiBusy(e: unknown): boolean {
+  return (
+    (e as { busy?: boolean } | null)?.busy === true ||
+    (e instanceof Error && e.message === GIINAI_BUSY_MESSAGE)
+  );
+}
+
+/** The old backend assistant plus local answers, kept as the offline
+    fallback when the GiinAI route fails. */
+async function giinAiFallback(args: any): Promise<any> {
+  return (remote as any).askAssistantOld(args);
+}
+
+/** Stream one GiinAI chat answer. Tokens go to onToken as they
+    arrive; the returned answer is the full text. Throws when GiinAI
+    cannot be reached or answers with an error and no tokens arrived.
+    A partial answer (tokens arrived, then the stream failed) is
+    returned, not thrown, so the citizen still sees what arrived.
+    Tool events are ignored: PortaGov has no services file, so GiinAI
+    never takes a tool action or returns a reference id. The sources
+    event arrives before done, and both are handled in that order. */
+async function giinAiChat(
+  args: { question: string; context: string; profileId: string | number | null },
+  onToken?: (text: string) => void,
+): Promise<{
+  answer: string;
+  route: string;
+  needs_ticket: boolean;
+  matched: boolean;
+  sources: GiinAiSource[];
+  sessionId: string | null;
+}> {
+  const res = await fetch("/api/giinai/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message: args.question,
+      session_id: getGiinAiSessionId(args.profileId),
+      stream: true,
+      // The current hash route included, so GiinAI knows which
+      // citizen page the question came from.
+      page_url: window.location.href,
+      user_ref: args.profileId != null ? String(args.profileId) : undefined,
+      user_context: args.context,
+    }),
+    signal: AbortSignal.timeout(900_000),
+  });
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => null);
+    const err = new Error(
+      (data && typeof data.error === "string" && data.error) ||
+        "The assistant could not answer just now. Please try again.",
+    ) as Error & { busy?: boolean; status?: number };
+    err.status = res.status;
+    err.busy = res.status === 429 || res.status === 503;
+    throw err;
+  }
+  // GiinAI only sends the non-streaming failure shape (HTTP 200 with
+  // error: true) when stream is false, and this call always streams,
+  // but guard it anyway: a JSON body here is never a stream of tokens,
+  // so treat an error body as a busy failure instead of returning an
+  // empty answer.
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    const data = await res.json().catch(() => null);
+    const busy =
+      (data && data.error === true) ||
+      (data && typeof data.error === "string" && data.error === GIINAI_BUSY_MESSAGE);
+    const err = new Error(
+      busy
+        ? GIINAI_BUSY_MESSAGE
+        : "The assistant could not answer just now. Please try again.",
+    ) as Error & { busy?: boolean };
+    err.busy = Boolean(busy);
+    throw err;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let sessionId: string | null = getGiinAiSessionId(args.profileId);
+  let sources: GiinAiSource[] = [];
+  let sawError = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx = buffer.indexOf("\n");
+    while (idx >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+      if (line.startsWith("data:")) {
+        const payload = line.slice(5).trim();
+        if (payload && payload !== "[DONE]") {
+          try {
+            const evt = JSON.parse(payload);
+            if (evt.type === "start" && evt.session_id) {
+              sessionId = String(evt.session_id);
+              saveGiinAiSessionId(args.profileId, sessionId);
+            } else if (evt.type === "token" && typeof evt.text === "string") {
+              text += evt.text;
+              if (onToken) onToken(evt.text);
+            } else if (evt.type === "sources" && Array.isArray(evt.sources)) {
+              // GiinAI only sends sources scored 0.35 or above, and
+              // the sources event arrives before done. Keep the floor
+              // here too, so a lower-scored source is never shown even
+              // if the server ever sends one.
+              sources = evt.sources
+                .filter(
+                  (s: any) =>
+                    typeof s.score !== "number" || s.score >= 0.35,
+                )
+                .map((s: any) => ({
+                  title: String(s.title ?? s.url ?? "Source"),
+                  url: typeof s.url === "string" ? s.url : undefined,
+                }));
+            } else if (evt.type === "done") {
+              if (typeof evt.answer === "string" && evt.answer) text = evt.answer;
+              if (typeof evt.session_id === "string" && evt.session_id) {
+                const doneSessionId = evt.session_id;
+                sessionId = doneSessionId;
+                saveGiinAiSessionId(args.profileId, doneSessionId);
+              }
+            } else if (evt.type === "error") {
+              sawError = true;
+            }
+          } catch {
+            // One bad event never kills the whole answer.
+          }
+        }
+      }
+      idx = buffer.indexOf("\n");
+    }
+  }
+  if (sawError && !text) {
+    const err = new Error(GIINAI_BUSY_MESSAGE) as Error & { busy?: boolean };
+    err.busy = true;
+    throw err;
+  }
+  return {
+    answer: text,
+    route: "None",
+    needs_ticket: false,
+    matched: true,
+    sources,
+    sessionId,
+  };
+}
+
 export const remote: Record<string, (args: any) => Promise<any>> = {
   async registerAccount(args: any) {
     const res = await apiCall("/api/auth/register", {
@@ -1841,7 +2042,110 @@ export const remote: Record<string, (args: any) => Promise<any>> = {
     }
   },
 
+  /* ---------- GiinAI chat assistant: streaming, session, feedback ----------
+     The citizen assistant talks to GiinAI through the same-origin
+     Next.js routes in src/app/api/giinai/*, so the app key stays on
+     the server and never reaches the browser. The GiinAI answer
+     streams back as server-sent events and tokens are handed to the
+     caller as they arrive. When the GiinAI route fails, the old
+     backend assistant and then the local preset answers are still
+     tried, so a question is never lost. */
+
+  async askAssistantStream(args: any, onToken?: (text: string) => void) {
+    const question = String(args.question ?? "").slice(0, 600);
+    const context = String(args.context ?? "").slice(0, 6000);
+    const profileId = args.profileId ?? null;
+    try {
+      return await giinAiChat({ question, context, profileId }, onToken);
+    } catch (e) {
+      // GiinAI failed: fall back the same way askAssistant does, and
+      // hand the fallback answer to the caller as one chunk, so the
+      // panel still shows an answer instead of an empty message.
+      try {
+        const fallback = await giinAiFallback(args);
+        if (onToken && fallback.answer) onToken(fallback.answer);
+        return fallback;
+      } catch {
+        if (isGiinAiBusy(e)) throw e;
+        throw e;
+      }
+    }
+  },
+
   async askAssistant(args: any) {
+    const question = String(args.question ?? "").slice(0, 600);
+    const context = String(args.context ?? "").slice(0, 6000);
+    const profileId = args.profileId ?? null;
+    try {
+      return await giinAiChat({ question, context, profileId });
+    } catch (e) {
+      try {
+        return await giinAiFallback(args);
+      } catch {
+        if (isGiinAiBusy(e)) throw e;
+        throw e;
+      }
+    }
+  },
+
+  async sendGiinAiFeedback(args: any) {
+    const res = await fetch("/api/giinai/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: args.sessionId,
+        rating: args.rating,
+        question: String(args.question ?? "").slice(0, 600),
+        answer: String(args.answer ?? "").slice(0, 8000),
+        ...(typeof args.comment === "string" && args.comment.trim()
+          ? { comment: args.comment.trim().slice(0, 2000) }
+          : {}),
+      }),
+    });
+    if (!res.ok) throw new Error("Your feedback could not be saved. Please try again.");
+    return res.json();
+  },
+
+  async runGiinAiTask(args: any) {
+    const res = await fetch("/api/giinai/tasks/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: args.instruction,
+        input: args.input ?? {},
+        use_knowledge: args.useKnowledge !== false,
+        ...(args.outputSchema !== undefined
+          ? { output_schema: args.outputSchema }
+          : {}),
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw new Error(
+        (data && data.error) || "The task could not run. Please try again.",
+      );
+    }
+    return data;
+  },
+
+  async forgetGiinAiSession(args: any) {
+    const profileId = args.profileId ?? null;
+    const sessionId = getGiinAiSessionId(profileId);
+    clearGiinAiSessionId(profileId);
+    if (!sessionId) return { ok: true, forgotten: false };
+    try {
+      await fetch(
+        `/api/giinai/chat?session_id=${encodeURIComponent(sessionId)}`,
+        { method: "DELETE" },
+      );
+    } catch {
+      // The stored id is already cleared, so the conversation is
+      // forgotten on this device even if the server call failed.
+    }
+    return { ok: true, forgotten: true };
+  },
+
+  async askAssistantOld(args: any) {
     try {
       const res = await apiCall("/api/assistant", { method: "POST", auth: false, body: { q: args.question } });
       if (res && res.answer) {
